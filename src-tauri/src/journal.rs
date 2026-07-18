@@ -20,14 +20,20 @@ impl Journal {
         &self, task_id: &str, migration_id: &str, op: &str,
         src: &str, dst: &str, tmp: &str, old_path: &str,
     ) -> AppResult<()> {
-        // 同源/同目标路径锁
-        for entry in self.read_all()? {
-            if entry.final_mark.is_none() {
-                if entry.src.eq_ignore_ascii_case(src) || entry.dst.eq_ignore_ascii_case(dst) {
-                    return Err(AppError::Conflict(format!(
-                        "路径已被运行中任务 {} 占用: {}", entry.task_id, entry.src
-                    )));
-                }
+        // 同源/同目标路径锁：只看每个任务的最新状态（与 recover_pending 一致）
+        let all = self.read_all()?;
+        let mut latest: std::collections::HashMap<String, JournalEntry> = Default::default();
+        for e in &all {
+            match &e.final_mark {
+                Some(_) => { latest.remove(&e.task_id); }
+                None => { latest.insert(e.task_id.clone(), e.clone()); }
+            }
+        }
+        for entry in latest.values() {
+            if entry.src.eq_ignore_ascii_case(src) || entry.dst.eq_ignore_ascii_case(dst) {
+                return Err(AppError::Conflict(format!(
+                    "路径已被运行中任务 {} 占用: {}", entry.task_id, entry.src
+                )));
             }
         }
         self.append(&JournalEntry {
