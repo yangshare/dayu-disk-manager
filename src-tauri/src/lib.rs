@@ -5,6 +5,8 @@ pub mod file_ops;
 pub mod journal;
 pub mod history;
 pub mod scanner;
+pub mod safety;
+pub mod process_probe;
 
 #[cfg(windows)]
 pub mod win32;
