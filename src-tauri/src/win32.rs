@@ -11,9 +11,9 @@ pub fn to_long_path(p: &str) -> String {
         // UNC 路径：\\server\share -> \\?\UNC\server\share
         return format!(r"\\?\UNC\{}", rest);
     }
-    // 磁盘根（如 C:\）需加尾随反斜杠，使 \\?\C:\ 变为 \\?\C:\\
+    // 磁盘根（如 C:\）标准 \\?\ 长路径形式为 \\?\C:\（单尾随反斜杠）
     if trimmed.len() == 3 && trimmed.as_bytes().get(1) == Some(&b':') && trimmed.ends_with('\\') {
-        return format!(r"\\?\{}\", trimmed);
+        return format!(r"\\?\{}", trimmed);
     }
     format!(r"\\?\{}", trimmed)
 }
@@ -119,7 +119,10 @@ pub fn locked_processes(path: &Path) -> AppResult<Option<Vec<String>>> {
             let mut buf = [RM_PROCESS_INFO::default(); 64];
             let rc2 = RmGetList(handle, &mut nprocs_needed, &mut nprocs, Some(buf.as_mut_ptr()), &mut reason);
             if rc2 == ERROR_ACCESS_DENIED {
-                // Restart Manager 对目录路径返回 ACCESS_DENIED，视为无占用
+                // Restart Manager 只对文件路径有效，对目录路径 RmGetList 会返回
+                // ERROR_ACCESS_DENIED（Win32 已知限制，目录可能含万级文件无法下钻）。
+                // 因此本函数对目录路径无效——此处保留 Ok(None) 语义（不改签名/行为）。
+                // 目录级占用检测应由上层（safety，T9）用预设进程名（match_processes）实现。
                 Ok(None)
             } else if rc2.is_err() {
                 Err(AppError::Win32(format!("RmGetList 失败: code={}", rc2.0)))
@@ -177,7 +180,7 @@ mod tests {
 
     #[test]
     fn long_path_presapes_drive_root() {
-        assert_eq!(to_long_path("C:\\"), r"\\?\C:\\");
+        assert_eq!(to_long_path("C:\\"), r"\\?\C:\");
     }
 
     #[test]
@@ -194,6 +197,14 @@ mod tests {
         assert!(!serial.is_empty());
         // CI 上可能非 NTFS，is_ntfs 只断言不 panic
         let _ = is_ntfs;
+    }
+
+    #[test]
+    fn volume_info_on_drive_root_succeeds() {
+        // 验证磁盘根经 to_long_path 转为 \\?\C:\（单尾随反斜杠）后，
+        // GetVolumeInformationW 能成功返回——确认不再因双斜杠被 Win32 API 拒绝。
+        let (serial, _is_ntfs) = volume_info(Path::new("C:\\")).unwrap();
+        assert!(!serial.is_empty(), "volume_info on C:\\ returned empty serial");
     }
 
     #[test]
