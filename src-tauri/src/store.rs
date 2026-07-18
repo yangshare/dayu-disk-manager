@@ -34,9 +34,10 @@ impl Store {
     }
 
     fn load_config_bak_or_default(&self) -> AppResult<Config> {
-        if self.config_bak().exists() {
-            if let Ok(bak) = fs::read(self.config_bak()) {
-                if let Ok(cfg) = serde_json::from_slice::<Config>(&bak) {
+        let bak = self.config_bak();
+        if bak.exists() {
+            if let Ok(bak_bytes) = fs::read(&bak) {
+                if let Ok(cfg) = serde_json::from_slice::<Config>(&bak_bytes) {
                     return Ok(ensure_presets(cfg));
                 }
             }
@@ -56,7 +57,7 @@ impl Store {
         }
     }
 
-    pub fn save_migrations(&self, ms: &Vec<Migration>) -> AppResult<()> {
+    pub fn save_migrations(&self, ms: &[Migration]) -> AppResult<()> {
         atomic_write_json(&self.mig_path(), &self.mig_tmp(), &self.mig_bak(), ms)
     }
 
@@ -78,7 +79,7 @@ impl Store {
 }
 
 /// 临时文件 -> flush/sync -> 备份旧文件为 .bak -> 原子 rename 覆盖。
-fn atomic_write_json<T: serde::Serialize>(
+fn atomic_write_json<T: ?Sized + serde::Serialize>(
     path: &Path,
     tmp: &Path,
     bak: &Path,
