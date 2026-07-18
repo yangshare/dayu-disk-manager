@@ -261,7 +261,9 @@ pub fn restore(
     // 清理 target（走回收站，失败降级）
     emit(stage::CLEANING, 95, "清理目标数据");
     match ops.to_recycle_bin(&target) {
-        Ok(()) => {}
+        Ok(()) => {
+            journal.mark_stage(&format!("restore-{}", mig.id), "restore_target_recycled")?;
+        }
         Err(_) => {
             let mut m = mig.clone();
             m.status = MigrationStatus::TargetPendingDelete;
@@ -354,6 +356,8 @@ mod tests {
         manifest_ok: bool,
         junction_fails: bool,
         rename_ok: bool,
+        /// 记录每次 create_junction 的 (link, target) 实参，便于断言重建被调用。
+        create_junction_calls: std::cell::RefCell<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
     }
     impl FileOps for MockOps {
         fn copy_tree(&self, _s: &Path, _d: &Path, _p: &dyn Fn(u8)) -> AppResult<()> {
@@ -372,7 +376,8 @@ mod tests {
         fn remove_tree(&self, _p: &Path) -> AppResult<()> { Ok(()) }
         fn is_reparse_point(&self, _p: &Path) -> bool { false }
         fn dir_exists(&self, _p: &Path) -> bool { true }
-        fn create_junction(&self, _l: &Path, _t: &Path) -> AppResult<()> {
+        fn create_junction(&self, l: &Path, t: &Path) -> AppResult<()> {
+            self.create_junction_calls.borrow_mut().push((l.to_path_buf(), t.to_path_buf()));
             if self.junction_fails { Err(crate::error::AppError::Junction("mock junction fail".into())) }
             else { Ok(()) }
         }
@@ -384,7 +389,7 @@ mod tests {
     fn migrate_rolls_back_when_copy_fails_keeps_source() {
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "c");
-        let ops = MockOps { copy_ok: false, manifest_ok: true, junction_fails: false, rename_ok: true };
+        let ops = MockOps { copy_ok: false, manifest_ok: true, junction_fails: false, rename_ok: true, create_junction_calls: RefCell::new(vec![]) };
         let cancel = AtomicBool::new(false);
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         assert!(res.is_err());
@@ -397,7 +402,7 @@ mod tests {
     fn migrate_aborts_when_manifest_mismatch_keeps_tmp() {
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "m");
-        let ops = MockOps { copy_ok: true, manifest_ok: false, junction_fails: false, rename_ok: true };
+        let ops = MockOps { copy_ok: true, manifest_ok: false, junction_fails: false, rename_ok: true, create_junction_calls: RefCell::new(vec![]) };
         let cancel = AtomicBool::new(false);
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         assert!(res.is_err());
@@ -409,7 +414,7 @@ mod tests {
     fn migrate_cancellation_cleans_tmp_and_logs_canceled() {
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "x");
-        let ops = MockOps { copy_ok: true, manifest_ok: true, junction_fails: false, rename_ok: true };
+        let ops = MockOps { copy_ok: true, manifest_ok: true, junction_fails: false, rename_ok: true, create_junction_calls: RefCell::new(vec![]) };
         let cancel = AtomicBool::new(true); // 复制前已取消
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         assert!(res.is_err());
@@ -468,11 +473,16 @@ mod tests {
     fn restore_switch_fail_rebuilds_junction() {
         let (_dir, store, journal, history, mig) = restore_fixture("3");
         let src: std::path::PathBuf = mig.source.clone().into();
+        let target: std::path::PathBuf = mig.target.clone().into();
         // mock：切换阶段（remove_junction 之后 rename）失败，期望重建 junction
-        let ops = MockOps { copy_ok: true, manifest_ok: true, junction_fails: false, rename_ok: false };
+        let ops = MockOps { copy_ok: true, manifest_ok: true, junction_fails: false, rename_ok: false, create_junction_calls: RefCell::new(vec![]) };
         let cancel = AtomicBool::new(false);
         let res = restore(&ops, &store, &journal, &history, &mig, &|_| {}, &cancel);
         assert!(res.is_err());
-        assert!(ops.junction_resolves(&src), "切换失败时应重建 junction 保入口");
+        // 真实验证：create_junction 被调用一次（重建 junction 保入口）
+        let calls = ops.create_junction_calls.borrow();
+        assert_eq!(calls.len(), 1, "切换失败时应调用 create_junction 重建 junction");
+        assert_eq!(calls[0].0, src, "重建 junction 的 link 应为 src");
+        assert_eq!(calls[0].1, target, "重建 junction 的 target 应为 mig.target");
     }
 }
