@@ -7,6 +7,7 @@ pub mod history;
 pub mod scanner;
 pub mod safety;
 pub mod process_probe;
+pub mod migrator;
 
 #[cfg(windows)]
 pub mod win32;

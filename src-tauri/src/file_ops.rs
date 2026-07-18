@@ -48,6 +48,15 @@ pub trait FileOps {
 
     /// 目录是否存在且可读。
     fn dir_exists(&self, path: &Path) -> bool;
+
+    /// 创建目录联接：link 指向 target。
+    fn create_junction(&self, link: &Path, target: &Path) -> AppResult<()>;
+
+    /// 删除 junction（只删链接壳，不删目标）。
+    fn remove_junction(&self, link: &Path) -> AppResult<()>;
+
+    /// 校验 junction 是否解析到有效目标。
+    fn junction_resolves(&self, link: &Path) -> bool;
 }
 
 pub struct RealFileOps;
@@ -182,6 +191,18 @@ impl FileOps for RealFileOps {
 
     fn dir_exists(&self, path: &Path) -> bool {
         path.is_dir()
+    }
+
+    fn create_junction(&self, link: &Path, target: &Path) -> AppResult<()> {
+        crate::junction::create(link, target)
+    }
+
+    fn remove_junction(&self, link: &Path) -> AppResult<()> {
+        crate::junction::remove(link)
+    }
+
+    fn junction_resolves(&self, link: &Path) -> bool {
+        crate::junction::verify(link)
     }
 }
 
