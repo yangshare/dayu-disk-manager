@@ -63,7 +63,6 @@ pub fn migrate(
         journal.cancel(&plan.task_id)?;
         return Err(AppError::Cancelled);
     }
-    let _src_size = crate::scanner::dir_size(&plan.src);
     if let Err(e) = ops.copy_tree(&plan.src, &plan.tmp, &|p| emit(stage::COPYING, p, "复制中")) {
         let _ = ops.remove_tree(&plan.tmp);
         journal.fail(&plan.task_id, "复制失败")?;

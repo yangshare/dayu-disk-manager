@@ -84,11 +84,14 @@ pub async fn start_restore(
         .ok_or_else(|| crate::error::AppError::Store("迁移记录不存在".into()))?;
     let app2 = app.clone();
     let cancel = Arc::new(AtomicBool::new(false));
-    migrator::restore(
+    *state.cancel_token.lock().unwrap() = Some(cancel.clone());
+    let result = migrator::restore(
         &RealFileOps, &state.store, &state.journal, &state.history, &mig,
         &move |e: ProgressEvent| { let _ = app2.emit("dayu://progress", e); },
         &cancel,
-    )?;
+    );
+    *state.cancel_token.lock().unwrap() = None;
+    result?;
     Ok(true)
 }
 

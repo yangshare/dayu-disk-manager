@@ -48,7 +48,7 @@ pub fn expand_env(p: &str) -> String {
     out
 }
 
-/// 路径是否匹配某 preset（路径包含任一展开后的 match_paths 即命中）。
+/// 路径是否匹配某 preset（路径与任一展开后的 match_paths 严格相等（大小写不敏感）即命中）。
 pub fn matches_preset(actual_path: &str, preset: &Preset) -> bool {
     let norm_actual = normalize(actual_path);
     preset.match_paths.iter().any(|tmpl| {
@@ -64,7 +64,10 @@ fn normalize(p: &str) -> String {
 /// 扫描 root 下一层目录，返回大于阈值或命中预设的项。
 pub fn scan(root: &Path, cfg: &Config) -> Vec<ScanItem> {
     let min_bytes = cfg.scan.min_size_mb * 1024 * 1024;
-    let exclude: Vec<String> = cfg.scan.exclude_paths.iter().map(|p| normalize(p)).collect();
+    let exclude: Vec<String> = cfg.scan.exclude_paths.iter()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| normalize(p))
+        .collect();
     let mut items = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(cur) = stack.pop() {
