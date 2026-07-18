@@ -142,7 +142,6 @@ junction = "1"
 trash = "5"
 windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
-    "Win32_Storage_Volume",
     "Win32_Foundation",
     "Win32_System_RestartManager",
     "Win32_Security",

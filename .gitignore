@@ -142,7 +142,12 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+
 # IDE
 .idea/
 .codegraph/
 .claude/
+.superpowers/
