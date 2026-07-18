@@ -1,4 +1,6 @@
 use crate::error::AppResult;
+#[cfg(not(windows))]
+use crate::error::AppError;
 use crate::models::{Config, Migration, MigrationStatus, PrecheckReport, Preset};
 use crate::scanner::matches_preset;
 use std::path::Path;
@@ -17,6 +19,8 @@ pub trait SystemProbe {
 
 /// 生产实现，包装 win32 + process_probe。
 pub struct Win32Probe;
+
+#[cfg(windows)]
 impl SystemProbe for Win32Probe {
     fn volume_info(&self, p: &Path) -> AppResult<(String, bool)> {
         crate::win32::volume_info(p)
@@ -29,6 +33,22 @@ impl SystemProbe for Win32Probe {
     }
     fn running_processes(&self) -> AppResult<Vec<String>> {
         crate::process_probe::running_process_names()
+    }
+}
+
+#[cfg(not(windows))]
+impl SystemProbe for Win32Probe {
+    fn volume_info(&self, _p: &Path) -> AppResult<(String, bool)> {
+        Err(AppError::Win32("仅支持 Windows".into()))
+    }
+    fn disk_free(&self, _p: &Path) -> AppResult<u64> {
+        Err(AppError::Win32("仅支持 Windows".into()))
+    }
+    fn locked_processes(&self, _p: &Path) -> AppResult<Option<Vec<String>>> {
+        Ok(None)
+    }
+    fn running_processes(&self) -> AppResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -138,9 +158,10 @@ pub fn precheck(
                         .iter()
                         .filter(|probe_proc| {
                             let p = probe_proc.to_lowercase();
-                            running_lower.iter().any(|r| {
-                                r == &p || r.contains(&p) || p.contains(r.as_str())
-                            })
+                            // 精确相等（忽略大小写）。运行中名已小写去.exe，
+                            // 预设 match_processes 约定为不带扩展名的小写名，
+                            // 用 contains 会误报（如 "wechat" 命中 "wechatdevtools"）。
+                            running_lower.iter().any(|r| r.eq_ignore_ascii_case(&p))
                         })
                         .cloned()
                         .collect();
@@ -358,7 +379,7 @@ mod tests {
             ntfs: true,
             serial: "CCCC".into(),
             locked: None,
-            running: vec!["WeChat.exe".into()], // 含 .exe 后缀，大小写不同
+            running: vec!["wechat".into()], // 按契约：小写、去 .exe 后缀
         };
         let mut cfg = cfg;
         cfg.repository = "D:/Migrated".into();
