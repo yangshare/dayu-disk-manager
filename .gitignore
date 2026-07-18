@@ -151,3 +151,6 @@ src-tauri/gen/
 .codegraph/
 .claude/
 .superpowers/
+
+# pnpm 运行时产物
+pnpm-workspace.yaml
