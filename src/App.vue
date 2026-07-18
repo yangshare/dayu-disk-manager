@@ -1,17 +1,25 @@
 <script setup lang="ts">
-// T1 脚手架占位；后续任务（T13）将替换为侧边导航 + RouterView 布局。
+import { RouterView, RouterLink } from 'vue-router'
 </script>
 
 <template>
-  <main class="placeholder">
-    <h1>大禹磁盘管理器</h1>
-    <p>脚手架就绪，等待后续任务填充。</p>
-  </main>
+  <div class="layout">
+    <nav class="sidebar">
+      <h1>大禹磁盘管理器</h1>
+      <RouterLink to="/scan">扫描分析</RouterLink>
+      <RouterLink to="/migrate">迁移</RouterLink>
+      <RouterLink to="/links">软链接管理</RouterLink>
+      <RouterLink to="/history">操作历史</RouterLink>
+      <RouterLink to="/settings">设置</RouterLink>
+    </nav>
+    <main class="content"><RouterView /></main>
+  </div>
 </template>
 
-<style scoped>
-.placeholder {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  padding: 24px;
-}
+<style>
+.layout { display: flex; height: 100vh; }
+.sidebar { width: 200px; padding: 16px; background: #f4f4f5; display: flex; flex-direction: column; gap: 8px; }
+.sidebar a { text-decoration: none; color: #333; padding: 8px; border-radius: 4px; }
+.sidebar a.router-link-active { background: #3b82f6; color: #fff; }
+.content { flex: 1; padding: 24px; overflow: auto; }
 </style>
