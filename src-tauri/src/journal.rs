@@ -189,4 +189,20 @@ mod tests {
         j.fail("t1", "磁盘满").unwrap();
         assert!(j.recover_pending().unwrap().is_empty());
     }
+
+    #[test]
+    fn begin_allows_restore_after_migrate_completes() {
+        // 回归：migrate 完成后，同一 journal 上 begin restore（同源）不应被路径锁误拒。
+        // 旧 begin() 遍历全部历史条目，已完成 migrate 任务的中间 final_mark=None 条目
+        // （src 相同）会让随后的 restore begin 误判为路径占用而拒绝。
+        // 修复后 begin() 按 task_id 聚合只看最新状态（与 recover_pending 一致），故此用例应通过。
+        let j = fresh();
+        // migrate 任务走完到 complete
+        j.begin("t-mig", "m1", "migrate", "C:/src", "D:/data", "D:/data.tmp", "C:/src.old").unwrap();
+        j.mark_stage("t-mig", "copied").unwrap();
+        j.complete("t-mig").unwrap();
+        // 同源发起 restore：begin 必须成功（migrate 已完成，路径已释放）
+        let res = j.begin("t-rst", "m1", "restore", "C:/src", "D:/data", "D:/data.tmp", "C:/src.old");
+        assert!(res.is_ok(), "migrate 完成后同 journal begin restore 不应被路径锁误拒: {:?}", res.err());
+    }
 }
