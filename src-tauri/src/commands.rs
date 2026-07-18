@@ -102,7 +102,7 @@ pub fn list_links(state: State<AppState>) -> AppResult<Vec<crate::app_state::Lin
         LinkItem {
             id: m.id.clone(), source: m.source.clone(), target: m.target.clone(),
             preset: m.preset.clone(), created_at: m.created_at.clone(),
-            status: format!("{:?}", m.status).to_lowercase(),
+            status: serde_json::to_string(&m.status).unwrap_or_default().trim_matches('"').into(),
             valid, broken: !target_exists,
         }
     }).collect())

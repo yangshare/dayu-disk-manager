@@ -76,4 +76,17 @@ mod tests {
         let d = recover_pending_decisions(&[entry("restore_copied", "m3")]);
         assert!(d[0].2.contains("还原"));
     }
+
+    #[test]
+    fn status_serializes_snake_case() {
+        use crate::models::MigrationStatus;
+        let s = serde_json::to_string(&MigrationStatus::OldPendingDelete).unwrap();
+        assert_eq!(s, "\"old_pending_delete\"");
+        // trim_matches 后即前端 LinkItem.status 期望的字面量
+        assert_eq!(s.trim_matches('"'), "old_pending_delete");
+        // 顺带验证其它变体也走 snake_case
+        assert_eq!(serde_json::to_string(&MigrationStatus::Active).unwrap(), "\"active\"");
+        assert_eq!(serde_json::to_string(&MigrationStatus::TargetPendingDelete).unwrap(), "\"target_pending_delete\"");
+        assert_eq!(serde_json::to_string(&MigrationStatus::PendingManualConfirm).unwrap(), "\"pending_manual_confirm\"");
+    }
 }
