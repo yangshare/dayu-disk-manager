@@ -1,6 +1,7 @@
 pub mod error;
 pub mod models;
 pub mod store;
+pub mod file_ops;
 
 #[cfg(windows)]
 pub mod win32;
