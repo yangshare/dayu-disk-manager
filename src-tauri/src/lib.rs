@@ -4,6 +4,7 @@ pub mod store;
 pub mod file_ops;
 pub mod journal;
 pub mod history;
+pub mod scanner;
 
 #[cfg(windows)]
 pub mod win32;
