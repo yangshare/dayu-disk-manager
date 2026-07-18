@@ -15,6 +15,8 @@ pub mod stage {
     pub const CREATING_JUNCTION: &str = "creating_junction";
     pub const RECORDING: &str = "recording";
     pub const CLEANING: &str = "cleaning";
+    pub const REMOVING_JUNCTION: &str = "removing_junction";
+    pub const SWITCHING: &str = "switching";
 }
 
 pub struct MigratePlan {
@@ -189,6 +191,108 @@ pub fn migrate(
     Ok(migration)
 }
 
+pub fn restore(
+    ops: &dyn FileOps,
+    store: &Store,
+    journal: &Journal,
+    history: &History,
+    mig: &Migration,
+    on_progress: &dyn Fn(ProgressEvent),
+    cancel: &AtomicBool,
+) -> AppResult<()> {
+    use crate::error::AppError;
+    let now = || chrono::Utc::now().to_rfc3339();
+    let emit = |s: &str, p: u8, m: &str| on_progress(ProgressEvent {
+        task_id: format!("restore-{}", mig.id), stage: s.into(), percent: p, message: m.into(),
+    });
+    let src: std::path::PathBuf = mig.source.clone().into();
+    let target: std::path::PathBuf = mig.target.clone().into();
+    let restore_tmp = src.with_extension(format!("dayu-restore-{}", mig.id));
+
+    journal.begin(&format!("restore-{}", mig.id), &mig.id, "restore",
+        &mig.source, &mig.target, &restore_tmp.to_string_lossy(), &mig.old_path)?;
+
+    // 校验 junction 仍指向有效 target
+    if !ops.junction_resolves(&src) {
+        journal.fail(&format!("restore-{}", mig.id), "junction 失效")?;
+        return Err(AppError::Junction("junction 已失效，无法还原".into()));
+    }
+
+    emit(stage::COPYING, 0, "复制回源盘临时目录");
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        journal.cancel(&format!("restore-{}", mig.id))?;
+        return Err(AppError::Cancelled);
+    }
+    if let Err(e) = ops.copy_tree(&target, &restore_tmp, &|_| {}) {
+        let _ = ops.remove_tree(&restore_tmp);
+        journal.fail(&format!("restore-{}", mig.id), "还原复制失败")?;
+        return Err(e);
+    }
+
+    emit(stage::VERIFYING, 50, "校验 manifest");
+    let m1 = ops.manifest(&target)?;
+    let m2 = ops.manifest(&restore_tmp)?;
+    if !ops.diff_manifests(&m1, &m2).is_empty() {
+        let _ = ops.remove_tree(&restore_tmp);
+        journal.fail(&format!("restore-{}", mig.id), "manifest 不一致")?;
+        return Err(AppError::Migrate("还原校验不一致".into()));
+    }
+    journal.mark_stage(&format!("restore-{}", mig.id), "restore_copied")?;
+    journal.mark_stage(&format!("restore-{}", mig.id), "restore_manifest_ok")?;
+
+    // 删 junction -> restore_tmp 原子改名回 src
+    emit(stage::REMOVING_JUNCTION, 70, "删除 junction");
+    if let Err(e) = ops.remove_junction(&src) {
+        let _ = ops.remove_tree(&restore_tmp);
+        journal.fail(&format!("restore-{}", mig.id), "删 junction 失败")?;
+        return Err(e);
+    }
+    journal.mark_stage(&format!("restore-{}", mig.id), "junction_removed")?;
+
+    emit(stage::SWITCHING, 85, "切换为普通目录");
+    if let Err(e) = ops.rename(&restore_tmp, &src) {
+        // 切换失败：优先重建 junction 指回 target，保入口
+        let _ = ops.create_junction(&src, &target);
+        journal.fail(&format!("restore-{}", mig.id), "切换失败，已重建 junction")?;
+        return Err(e);
+    }
+    journal.mark_stage(&format!("restore-{}", mig.id), "restore_switched")?;
+
+    // 清理 target（走回收站，失败降级）
+    emit(stage::CLEANING, 95, "清理目标数据");
+    match ops.to_recycle_bin(&target) {
+        Ok(()) => {}
+        Err(_) => {
+            let mut m = mig.clone();
+            m.status = MigrationStatus::TargetPendingDelete;
+            let _ = store.upsert_migration(m);
+        }
+    }
+
+    store.remove_migration(&mig.id)?;
+    history.append(&HistoryEntry {
+        op: "restore".into(), id: mig.id.clone(),
+        src: mig.source.clone(), dst: mig.target.clone(),
+        result: "ok".into(), time: now(), duration_sec: 0,
+    })?;
+    journal.complete(&format!("restore-{}", mig.id))?;
+    emit(stage::CLEANING, 100, "还原完成");
+    Ok(())
+}
+
+/// 断开链接：删 junction 但保留 target 数据（原路径将不可用，调用方需二次确认）。
+pub fn break_link(ops: &dyn FileOps, store: &Store, history: &History, mig: &Migration) -> AppResult<()> {
+    let src: std::path::PathBuf = mig.source.clone().into();
+    ops.remove_junction(&src)?;
+    store.remove_migration(&mig.id)?;
+    history.append(&HistoryEntry {
+        op: "break_link".into(), id: mig.id.clone(),
+        src: mig.source.clone(), dst: mig.target.clone(),
+        result: "ok".into(), time: chrono::Utc::now().to_rfc3339(), duration_sec: 0,
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +414,65 @@ mod tests {
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         assert!(res.is_err());
         assert!(store.load_migrations().unwrap().is_empty());
+    }
+
+    fn restore_fixture(id: &str) -> (TempDir, Store, Journal, History, Migration) {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path().join("data")).unwrap();
+        let journal = Journal::new(dir.path().join("journal.jsonl")).unwrap();
+        let history = History::new(dir.path().join("history.jsonl")).unwrap();
+        let target = dir.path().join("repo/m/data");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("a.txt"), b"hello").unwrap();
+        let src = dir.path().join("src");
+        crate::junction::create(&src, &target).unwrap();
+        let mig = Migration {
+            id: format!("m-{id}"), schema_version: 1,
+            source: src.to_string_lossy().into(),
+            target: target.to_string_lossy().into(),
+            old_path: String::new(), preset: None,
+            created_at: "2026-07-18T00:00:00Z".into(),
+            status: MigrationStatus::Active,
+            source_volume_serial: "C".into(), target_volume_serial: "D".into(),
+            recycle_bin_ref: String::new(), pending_cleanup: None,
+        };
+        store.upsert_migration(mig.clone()).unwrap();
+        (dir, store, journal, history, mig)
+    }
+
+    #[test]
+    fn restore_success_recovers_dir_and_removes_link() {
+        let (_dir, store, journal, history, mig) = restore_fixture("1");
+        let src: std::path::PathBuf = mig.source.clone().into();
+        let cancel = AtomicBool::new(false);
+        restore(&RealFileOps, &store, &journal, &history, &mig, &|_| {}, &cancel).unwrap();
+        assert!(!crate::junction::exists(&src), "junction 应已删除");
+        assert!(src.join("a.txt").exists(), "源应恢复为普通目录");
+        assert!(store.load_migrations().unwrap().iter().all(|x| x.id != "m-1"), "记录应移除");
+        let r = history.list(Some("restore"), None).unwrap();
+        assert!(r.iter().any(|h| h.id == "m-1" && h.result == "ok"));
+    }
+
+    #[test]
+    fn restore_aborts_when_junction_invalid() {
+        let (_dir, store, journal, history, mig) = restore_fixture("2");
+        // 删掉 target 使 junction 失效
+        let target: std::path::PathBuf = mig.target.clone().into();
+        std::fs::remove_dir_all(&target).unwrap();
+        let cancel = AtomicBool::new(false);
+        let res = restore(&RealFileOps, &store, &journal, &history, &mig, &|_| {}, &cancel);
+        assert!(res.is_err(), "junction 失效时应中止");
+    }
+
+    #[test]
+    fn restore_switch_fail_rebuilds_junction() {
+        let (_dir, store, journal, history, mig) = restore_fixture("3");
+        let src: std::path::PathBuf = mig.source.clone().into();
+        // mock：切换阶段（remove_junction 之后 rename）失败，期望重建 junction
+        let ops = MockOps { copy_ok: true, manifest_ok: true, junction_fails: false, rename_ok: false };
+        let cancel = AtomicBool::new(false);
+        let res = restore(&ops, &store, &journal, &history, &mig, &|_| {}, &cancel);
+        assert!(res.is_err());
+        assert!(ops.junction_resolves(&src), "切换失败时应重建 junction 保入口");
     }
 }
