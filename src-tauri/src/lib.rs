@@ -3,6 +3,7 @@ pub mod models;
 pub mod store;
 pub mod file_ops;
 pub mod journal;
+pub mod history;
 
 #[cfg(windows)]
 pub mod win32;
