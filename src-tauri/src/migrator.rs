@@ -1,8 +1,8 @@
 use crate::error::AppResult;
-use crate::file_ops::FileOps;
+use crate::file_ops::{CopyPhase, CopyProgress, FileOps};
 use crate::history::History;
 use crate::journal::Journal;
-use crate::models::{HistoryEntry, Migration, MigrationStatus, ProgressEvent};
+use crate::models::{HistoryEntry, Migration, MigrationStatus, ProgressEvent, TransferProgress};
 use crate::store::Store;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -17,6 +17,41 @@ pub mod stage {
     pub const CLEANING: &str = "cleaning";
     pub const REMOVING_JUNCTION: &str = "removing_junction";
     pub const SWITCHING: &str = "switching";
+}
+
+fn transfer_event(
+    task_id: &str,
+    stage: &str,
+    range: (u8, u8),
+    progress: &CopyProgress,
+    preparing_message: &str,
+    copying_message: &str,
+) -> ProgressEvent {
+    let message = match progress.phase {
+        CopyPhase::Preparing => preparing_message,
+        CopyPhase::Copying => copying_message,
+    };
+    let percent = match progress.phase {
+        CopyPhase::Preparing => range.0,
+        CopyPhase::Copying => {
+            let span = range.1.saturating_sub(range.0) as u16;
+            range.0.saturating_add(((progress.percent() as u16 * span) / 100) as u8)
+        }
+    };
+    let mut event = ProgressEvent::new(task_id, stage, percent, message);
+    event.transfer = Some(TransferProgress {
+        phase: match progress.phase {
+            CopyPhase::Preparing => "preparing",
+            CopyPhase::Copying => "copying",
+        }.into(),
+        completed_bytes: progress.completed_bytes,
+        total_bytes: progress.total_bytes,
+        completed_files: progress.completed_files,
+        total_files: progress.total_files,
+        current_path: progress.current_path.as_ref()
+            .map(|path| path.to_string_lossy().replace('/', "\\")),
+    });
+    event
 }
 
 pub struct MigratePlan {
@@ -43,9 +78,7 @@ pub fn migrate(
     use crate::error::AppError;
     let now = || chrono::Utc::now().to_rfc3339();
     let emit = |stage: &str, pct: u8, msg: &str| {
-        on_progress(ProgressEvent {
-            task_id: plan.task_id.clone(), stage: stage.into(), percent: pct, message: msg.into(),
-        });
+        on_progress(ProgressEvent::new(&plan.task_id, stage, pct, msg));
     };
 
     journal.begin(
@@ -57,15 +90,31 @@ pub fn migrate(
     )?;
 
     // 阶段 a：复制
-    emit(stage::COPYING, 0, "复制到临时目录");
+    emit(stage::COPYING, 0, "准备复制到临时目录");
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = ops.remove_tree(&plan.tmp);
         journal.cancel(&plan.task_id)?;
         return Err(AppError::Cancelled);
     }
-    if let Err(e) = ops.copy_tree(&plan.src, &plan.tmp, &|p| emit(stage::COPYING, p, "复制中")) {
+    if let Err(e) = ops.copy_tree(
+        &plan.src,
+        &plan.tmp,
+        &|progress| on_progress(transfer_event(
+            &plan.task_id,
+            stage::COPYING,
+            (0, 60),
+            progress,
+            "正在统计待复制内容",
+            "正在复制到迁移仓库",
+        )),
+        &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
         let _ = ops.remove_tree(&plan.tmp);
-        journal.fail(&plan.task_id, "复制失败")?;
+        if matches!(e, AppError::Cancelled) {
+            journal.cancel(&plan.task_id)?;
+        } else {
+            journal.fail(&plan.task_id, "复制失败")?;
+        }
         return Err(e);
     }
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -99,11 +148,28 @@ pub fn migrate(
     journal.mark_stage(&plan.task_id, "source_renamed")?;
 
     // 增量同步：old_path -> tmp（捕捉复制期间变化）
-    emit(stage::SYNCING, 80, "增量同步");
-    if let Err(e) = ops.copy_tree(&plan.old_path, &plan.tmp, &|_| {}) {
+    emit(stage::SYNCING, 80, "准备同步复制期间的变化");
+    if let Err(e) = ops.copy_tree(
+        &plan.old_path,
+        &plan.tmp,
+        &|progress| on_progress(transfer_event(
+            &plan.task_id,
+            stage::SYNCING,
+            (80, 90),
+            progress,
+            "正在检查复制期间的变化",
+            "正在同步复制期间的变化",
+        )),
+        &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
         // 回滚：改回原名
         let _ = ops.rename(&plan.old_path, &plan.src);
-        journal.fail(&plan.task_id, "增量同步失败")?;
+        if matches!(e, AppError::Cancelled) {
+            let _ = ops.remove_tree(&plan.tmp);
+            journal.cancel(&plan.task_id)?;
+        } else {
+            journal.fail(&plan.task_id, "增量同步失败")?;
+        }
         return Err(e);
     }
     let m3 = ops.manifest(&plan.old_path)?;
@@ -201,9 +267,10 @@ pub fn restore(
 ) -> AppResult<()> {
     use crate::error::AppError;
     let now = || chrono::Utc::now().to_rfc3339();
-    let emit = |s: &str, p: u8, m: &str| on_progress(ProgressEvent {
-        task_id: format!("restore-{}", mig.id), stage: s.into(), percent: p, message: m.into(),
-    });
+    let task_id = format!("restore-{}", mig.id);
+    let emit = |s: &str, p: u8, m: &str| {
+        on_progress(ProgressEvent::new(&task_id, s, p, m));
+    };
     let src: std::path::PathBuf = mig.source.clone().into();
     let target: std::path::PathBuf = mig.target.clone().into();
     let restore_tmp = src.with_extension(format!("dayu-restore-{}", mig.id));
@@ -222,9 +289,25 @@ pub fn restore(
         journal.cancel(&format!("restore-{}", mig.id))?;
         return Err(AppError::Cancelled);
     }
-    if let Err(e) = ops.copy_tree(&target, &restore_tmp, &|_| {}) {
+    if let Err(e) = ops.copy_tree(
+        &target,
+        &restore_tmp,
+        &|progress| on_progress(transfer_event(
+            &task_id,
+            stage::COPYING,
+            (0, 50),
+            progress,
+            "正在统计待还原内容",
+            "正在复制回原磁盘",
+        )),
+        &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
         let _ = ops.remove_tree(&restore_tmp);
-        journal.fail(&format!("restore-{}", mig.id), "还原复制失败")?;
+        if matches!(e, AppError::Cancelled) {
+            journal.cancel(&task_id)?;
+        } else {
+            journal.fail(&task_id, "还原复制失败")?;
+        }
         return Err(e);
     }
 
@@ -347,6 +430,16 @@ mod tests {
         let migrated = history.list(Some("migrate"), None).unwrap();
         assert!(migrated.iter().any(|h| h.id == "m-1" && h.result == "ok"));
         assert!(journal.recover_pending().unwrap().is_empty(), "任务应已完成");
+        let events = events.into_inner();
+        let copied = events.iter().find(|event| {
+            event.stage == stage::COPYING
+                && event.transfer.as_ref().is_some_and(|progress| progress.phase == "copying")
+        }).expect("复制阶段应包含结构化传输进度");
+        let transfer = copied.transfer.as_ref().unwrap();
+        assert_eq!(transfer.total_bytes, Some(5));
+        assert_eq!(transfer.total_files, Some(1));
+        assert!(copied.percent <= 60, "复制阶段只占迁移总进度的前 60%");
+        assert_eq!(events.last().unwrap().percent, 100);
     }
 
     /// 可编程 mock：复制/校验成功，但建链可注入失败。
@@ -359,7 +452,13 @@ mod tests {
         create_junction_calls: std::cell::RefCell<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
     }
     impl FileOps for MockOps {
-        fn copy_tree(&self, _s: &Path, _d: &Path, _p: &dyn Fn(u8)) -> AppResult<()> {
+        fn copy_tree(
+            &self,
+            _s: &Path,
+            _d: &Path,
+            _p: &dyn Fn(&crate::file_ops::CopyProgress),
+            _cancel: &dyn Fn() -> bool,
+        ) -> AppResult<()> {
             if self.copy_ok { Ok(()) } else { Err(crate::error::AppError::Migrate("copy fail".into())) }
         }
         fn manifest(&self, _s: &Path) -> AppResult<Manifest> {

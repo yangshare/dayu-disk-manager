@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Store {
     pub data_dir: PathBuf,
 }

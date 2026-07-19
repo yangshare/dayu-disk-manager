@@ -79,6 +79,14 @@ export interface ProgressEvent {
   stage: string
   percent: number
   message: string
+  transfer?: {
+    phase: 'preparing' | 'copying'
+    completedBytes: number
+    totalBytes?: number
+    completedFiles: number
+    totalFiles?: number
+    currentPath?: string
+  }
 }
 
 export interface ScanProgressEvent {

@@ -9,9 +9,11 @@ export const useMigrateStore = defineStore('migrate', () => {
   const prechecking = ref(false)
   const error = ref<string | null>(null)
   const running = ref(false)
+  const cancelling = ref(false)
   const progress = ref<ProgressEvent | null>(null)
   const result = ref<{ ok: boolean; message: string } | null>(null)
   let unlisten: (() => void) | null = null
+  let activeTaskId: string | null = null
 
   async function precheck(src: string) {
     prechecking.value = true
@@ -22,25 +24,46 @@ export const useMigrateStore = defineStore('migrate', () => {
     finally { prechecking.value = false }
   }
 
-  async function initListener() {
-    if (!unlisten) unlisten = await onProgress((e) => { progress.value = e })
+  async function initListener(taskId: string) {
+    unlisten?.()
+    activeTaskId = taskId
+    unlisten = await onProgress((event) => {
+      if (event.taskId === activeTaskId) progress.value = event
+    })
   }
 
   async function run(migrationId: string, src: string, presetId: string | null) {
-    await initListener()
-    running.value = true; result.value = null
+    if (running.value) return
+    running.value = true
+    cancelling.value = false
+    progress.value = null
+    result.value = null
     try {
+      await initListener(`task-${migrationId}`)
       await ipc.startMigrate(migrationId, src, presetId)
       result.value = { ok: true, message: '迁移完成' }
     } catch (e) {
       result.value = { ok: false, message: String(e) }
     } finally {
       running.value = false
+      cancelling.value = false
     }
   }
 
-  function cancel() { ipc.cancelMigrate() }
+  async function cancel() {
+    if (!running.value || cancelling.value) return
+    cancelling.value = true
+    try { await ipc.cancelMigrate() }
+    catch (e) {
+      result.value = { ok: false, message: String(e) }
+      cancelling.value = false
+    }
+  }
 
-  function cleanup() { unlisten?.(); unlisten = null }
-  return { report, prechecking, error, running, progress, result, precheck, run, cancel, cleanup }
+  function cleanup() {
+    activeTaskId = null
+    unlisten?.()
+    unlisten = null
+  }
+  return { report, prechecking, error, running, cancelling, progress, result, precheck, run, cancel, cleanup }
 })

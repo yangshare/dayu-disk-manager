@@ -123,15 +123,36 @@ pub async fn start_migrate(
         source_volume_serial: src_serial, target_volume_serial: tgt_serial,
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    *state.cancel_token.lock().unwrap() = Some(cancel.clone());
+    let cancel_slot = state.cancel_token.clone();
+    {
+        let mut active = cancel_slot.lock().unwrap();
+        if active.is_some() {
+            return Err(crate::error::AppError::Conflict("已有迁移或还原任务正在运行".into()));
+        }
+        *active = Some(cancel.clone());
+    }
     let app2 = app.clone();
-    let result = migrator::migrate(
-        &RealFileOps, &state.store, &state.journal, &state.history, &plan,
-        &move |e: ProgressEvent| { let _ = app2.emit("dayu://progress", e); },
-        &cancel,
-    );
-    *state.cancel_token.lock().unwrap() = None;
-    result
+    let task_cancel = cancel.clone();
+    let store = state.store.clone();
+    let journal = state.journal.clone();
+    let history = state.history.clone();
+    let task_result = tauri::async_runtime::spawn_blocking(move || {
+        migrator::migrate(
+            &RealFileOps, &store, &journal, &history, &plan,
+            &move |e: ProgressEvent| { let _ = app2.emit("dayu://progress", e); },
+            &task_cancel,
+        )
+    })
+    .await
+    .map_err(|e| crate::error::AppError::Store(format!("迁移任务失败: {e}")));
+
+    {
+        let mut active = cancel_slot.lock().unwrap();
+        if active.as_ref().is_some_and(|current| Arc::ptr_eq(current, &cancel)) {
+            *active = None;
+        }
+    }
+    task_result?
 }
 
 #[tauri::command]
@@ -152,14 +173,35 @@ pub async fn start_restore(
         .ok_or_else(|| crate::error::AppError::Store("迁移记录不存在".into()))?;
     let app2 = app.clone();
     let cancel = Arc::new(AtomicBool::new(false));
-    *state.cancel_token.lock().unwrap() = Some(cancel.clone());
-    let result = migrator::restore(
-        &RealFileOps, &state.store, &state.journal, &state.history, &mig,
-        &move |e: ProgressEvent| { let _ = app2.emit("dayu://progress", e); },
-        &cancel,
-    );
-    *state.cancel_token.lock().unwrap() = None;
-    result?;
+    let cancel_slot = state.cancel_token.clone();
+    {
+        let mut active = cancel_slot.lock().unwrap();
+        if active.is_some() {
+            return Err(crate::error::AppError::Conflict("已有迁移或还原任务正在运行".into()));
+        }
+        *active = Some(cancel.clone());
+    }
+    let task_cancel = cancel.clone();
+    let store = state.store.clone();
+    let journal = state.journal.clone();
+    let history = state.history.clone();
+    let task_result = tauri::async_runtime::spawn_blocking(move || {
+        migrator::restore(
+            &RealFileOps, &store, &journal, &history, &mig,
+            &move |e: ProgressEvent| { let _ = app2.emit("dayu://progress", e); },
+            &task_cancel,
+        )
+    })
+    .await
+    .map_err(|e| crate::error::AppError::Store(format!("还原任务失败: {e}")));
+
+    {
+        let mut active = cancel_slot.lock().unwrap();
+        if active.as_ref().is_some_and(|current| Arc::ptr_eq(current, &cancel)) {
+            *active = None;
+        }
+    }
+    task_result??;
     Ok(true)
 }
 

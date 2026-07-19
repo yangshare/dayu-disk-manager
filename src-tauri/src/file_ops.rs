@@ -1,6 +1,36 @@
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyPhase {
+    Preparing,
+    Copying,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyProgress {
+    pub phase: CopyPhase,
+    pub completed_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub completed_files: u64,
+    pub total_files: Option<u64>,
+    pub current_path: Option<PathBuf>,
+}
+
+impl CopyProgress {
+    pub fn percent(&self) -> u8 {
+        if let Some(total) = self.total_bytes.filter(|total| *total > 0) {
+            return ((self.completed_bytes.saturating_mul(100) / total).min(100)) as u8;
+        }
+        if let Some(total) = self.total_files.filter(|total| *total > 0) {
+            return ((self.completed_files.saturating_mul(100) / total).min(100)) as u8;
+        }
+        if self.phase == CopyPhase::Copying { 100 } else { 0 }
+    }
+}
 
 /// 一条 manifest 记录：相对路径、类型、字节数、mtime、attributes。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -23,10 +53,16 @@ pub struct Manifest {
 }
 
 /// 文件操作抽象。生产用 RealFileOps，测试用 mock 实现。
-/// on_progress(percent: 0..=100) 在复制期间被回调。
+/// 复制期间持续回调准备/传输详情，并通过 should_cancel 支持及时取消。
 pub trait FileOps {
     /// 递归复制 src 目录到 dst。dst 不存在则创建。不跟随 src 内部 reparse point。
-    fn copy_tree(&self, src: &Path, dst: &Path, on_progress: &dyn Fn(u8)) -> AppResult<()>;
+    fn copy_tree(
+        &self,
+        src: &Path,
+        dst: &Path,
+        on_progress: &dyn Fn(&CopyProgress),
+        should_cancel: &dyn Fn() -> bool,
+    ) -> AppResult<()>;
 
     /// 生成 src 目录的 manifest（不含 src 自身的 reparse point 内部，但含直接子项）。
     fn manifest(&self, src: &Path) -> AppResult<Manifest>;
@@ -61,11 +97,84 @@ pub trait FileOps {
 
 pub struct RealFileOps;
 
+impl RealFileOps {
+    fn measure_tree(
+        &self,
+        src: &Path,
+        on_progress: &dyn Fn(&CopyProgress),
+        should_cancel: &dyn Fn() -> bool,
+    ) -> AppResult<(u64, u64)> {
+        let mut stack = vec![src.to_path_buf()];
+        let mut total_bytes = 0u64;
+        let mut total_files = 0u64;
+        let mut last_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+
+        while let Some(current) = stack.pop() {
+            if should_cancel() {
+                return Err(AppError::Cancelled);
+            }
+            if !current.exists() {
+                continue;
+            }
+            if self.is_reparse_point(&current) && current != src {
+                continue;
+            }
+            if current.is_dir() {
+                for entry in std::fs::read_dir(&current)? {
+                    stack.push(entry?.path());
+                }
+            } else {
+                total_bytes = total_bytes.saturating_add(std::fs::metadata(&current)?.len());
+                total_files += 1;
+            }
+
+            if last_emit.elapsed() >= Duration::from_millis(200) {
+                on_progress(&CopyProgress {
+                    phase: CopyPhase::Preparing,
+                    completed_bytes: total_bytes,
+                    total_bytes: None,
+                    completed_files: total_files,
+                    total_files: None,
+                    current_path: Some(relative_display_path(src, &current)),
+                });
+                last_emit = Instant::now();
+            }
+        }
+
+        on_progress(&CopyProgress {
+            phase: CopyPhase::Preparing,
+            completed_bytes: total_bytes,
+            total_bytes: None,
+            completed_files: total_files,
+            total_files: None,
+            current_path: None,
+        });
+        Ok((total_bytes, total_files))
+    }
+}
+
 impl FileOps for RealFileOps {
-    fn copy_tree(&self, src: &Path, dst: &Path, on_progress: &dyn Fn(u8)) -> AppResult<()> {
+    fn copy_tree(
+        &self,
+        src: &Path,
+        dst: &Path,
+        on_progress: &dyn Fn(&CopyProgress),
+        should_cancel: &dyn Fn() -> bool,
+    ) -> AppResult<()> {
+        let (total_bytes, total_files) = self.measure_tree(src, on_progress, should_cancel)?;
         std::fs::create_dir_all(dst)?;
         let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+        let mut completed_bytes = 0u64;
+        let mut completed_files = 0u64;
+        let mut last_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
         while let Some((cur_src, cur_dst)) = stack.pop() {
+            if should_cancel() {
+                return Err(AppError::Cancelled);
+            }
             // 跳过 reparse point 的内容递归，但仍创建占位（见 is_reparse_point 处理）
             let is_rp = self.is_reparse_point(&cur_src);
             if !cur_src.exists() {
@@ -85,9 +194,48 @@ impl FileOps for RealFileOps {
                     stack.push((child_src, child_dst));
                 }
             } else {
-                std::fs::copy(&cur_src, &cur_dst)?;
-                on_progress(0); // 真实实现可按字节累计；此处仅保证回调被调
+                copy_file_with_control(
+                    &cur_src,
+                    &cur_dst,
+                    should_cancel,
+                    &mut completed_bytes,
+                    &mut last_emit,
+                    |bytes| {
+                        on_progress(&CopyProgress {
+                            phase: CopyPhase::Copying,
+                            completed_bytes: bytes,
+                            total_bytes: Some(total_bytes),
+                            completed_files,
+                            total_files: Some(total_files),
+                            current_path: Some(relative_display_path(src, &cur_src)),
+                        });
+                    },
+                )?;
+                completed_files += 1;
+                if last_emit.elapsed() >= Duration::from_millis(100)
+                    || completed_files == total_files
+                {
+                    on_progress(&CopyProgress {
+                        phase: CopyPhase::Copying,
+                        completed_bytes,
+                        total_bytes: Some(total_bytes),
+                        completed_files,
+                        total_files: Some(total_files),
+                        current_path: Some(relative_display_path(src, &cur_src)),
+                    });
+                    last_emit = Instant::now();
+                }
             }
+        }
+        if total_files == 0 {
+            on_progress(&CopyProgress {
+                phase: CopyPhase::Copying,
+                completed_bytes: total_bytes,
+                total_bytes: Some(total_bytes),
+                completed_files: 0,
+                total_files: Some(0),
+                current_path: None,
+            });
         }
         Ok(())
     }
@@ -230,6 +378,43 @@ fn rel_under(root: &Path, p: &Path) -> String {
         .unwrap_or_else(|_| p.to_string_lossy().into())
 }
 
+fn relative_display_path(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root).unwrap_or(path).to_path_buf()
+}
+
+fn copy_file_with_control(
+    src: &Path,
+    dst: &Path,
+    should_cancel: &dyn Fn() -> bool,
+    completed_bytes: &mut u64,
+    last_emit: &mut Instant,
+    mut on_chunk: impl FnMut(u64),
+) -> AppResult<()> {
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    let mut input = std::fs::File::open(src)?;
+    let mut output = std::fs::File::create(dst)?;
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+
+    loop {
+        if should_cancel() {
+            return Err(AppError::Cancelled);
+        }
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        *completed_bytes = completed_bytes.saturating_add(read as u64);
+        if last_emit.elapsed() >= Duration::from_millis(100) {
+            on_chunk(*completed_bytes);
+            *last_emit = Instant::now();
+        }
+    }
+    output.flush()?;
+    std::fs::set_permissions(dst, std::fs::metadata(src)?.permissions())?;
+    Ok(())
+}
+
 fn copy_recursive(src: &Path, dst: &Path) -> AppResult<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dst)?;
@@ -258,9 +443,53 @@ mod tests {
         std::fs::write(src.join("a.txt"), b"hello").unwrap();
         std::fs::write(src.join("sub/b.txt"), b"world").unwrap();
         let dst = root.path().join("dst");
-        ops().copy_tree(&src, &dst, &|_| {}).unwrap();
+        ops().copy_tree(&src, &dst, &|_| {}, &|| false).unwrap();
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
         assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"world");
+    }
+
+    #[test]
+    fn copy_tree_reports_real_transfer_totals() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.bin"), vec![1u8; 1024]).unwrap();
+        std::fs::write(src.join("b.bin"), vec![2u8; 2048]).unwrap();
+        let dst = root.path().join("dst");
+        let events = std::cell::RefCell::new(Vec::new());
+
+        ops().copy_tree(
+            &src,
+            &dst,
+            &|progress| events.borrow_mut().push(progress.clone()),
+            &|| false,
+        ).unwrap();
+
+        let events = events.into_inner();
+        assert!(events.iter().any(|event| event.phase == CopyPhase::Preparing));
+        let last = events.iter()
+            .rev()
+            .find(|event| event.phase == CopyPhase::Copying)
+            .unwrap();
+        assert_eq!(last.completed_bytes, 3072);
+        assert_eq!(last.total_bytes, Some(3072));
+        assert_eq!(last.completed_files, 2);
+        assert_eq!(last.total_files, Some(2));
+        assert_eq!(last.percent(), 100);
+        assert!(last.current_path.is_some());
+    }
+
+    #[test]
+    fn copy_tree_honors_cancellation_while_preparing() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.bin"), vec![1u8; 1024]).unwrap();
+        let dst = root.path().join("dst");
+
+        let result = ops().copy_tree(&src, &dst, &|_| {}, &|| true);
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert!(!dst.exists());
     }
 
     #[cfg(windows)]
@@ -276,7 +505,7 @@ mod tests {
         junction::create(&link_target, &inner_link).unwrap();
         // 复制 src 到 dst
         let dst = root.path().join("dst");
-        ops().copy_tree(&src, &dst, &|_| {}).unwrap();
+        ops().copy_tree(&src, &dst, &|_| {}, &|| false).unwrap();
         // link 应作为占位存在（不跟随源 reparse point 的内容递归）
         assert!(dst.join("link").exists());
         // 不应在 dst 中递归进入 target 的内容（secret.txt 不应出现）
@@ -290,7 +519,7 @@ mod tests {
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("a.txt"), b"hello").unwrap();
         let dst = root.path().join("dst");
-        ops().copy_tree(&src, &dst, &|_| {}).unwrap();
+        ops().copy_tree(&src, &dst, &|_| {}, &|| false).unwrap();
         let m1 = ops().manifest(&src).unwrap();
         let m2 = ops().manifest(&dst).unwrap();
         assert!(ops().diff_manifests(&m1, &m2).is_empty(), "复制后 manifest 应一致");

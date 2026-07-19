@@ -27,7 +27,11 @@ pub fn local_appdata_dayu_dir() -> AppResult<PathBuf> {
 pub fn disk_free_bytes(path: &Path) -> AppResult<u64> {
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-    let wide = to_wide(&to_long_path(&path_to_str(path)));
+    // GetDiskFreeSpaceExW requires the path (or one of its parents) to exist.
+    // A migration repository is intentionally allowed to be created lazily, so
+    // probe the nearest existing ancestor instead of rejecting a new directory.
+    let probe_path = existing_path_for_probe(path);
+    let wide = to_wide(&to_long_path(&path_to_str(&probe_path)));
     let mut free_to_caller: u64 = 0;
     let mut total: u64 = 0;
     let mut free: u64 = 0;
@@ -167,6 +171,22 @@ fn path_to_str(p: &Path) -> String {
     p.to_string_lossy().replace('/', "\\")
 }
 
+/// Return `path` when it exists, otherwise walk up to the nearest existing
+/// parent.  This keeps disk/volume probing useful for paths that will be
+/// created during migration (for example `D:\\Migrated` on an existing D:).
+#[cfg(windows)]
+fn existing_path_for_probe(path: &Path) -> PathBuf {
+    let mut candidate = path.to_path_buf();
+    while !candidate.exists() {
+        let Some(parent) = candidate.parent() else { break };
+        if parent == candidate {
+            break;
+        }
+        candidate = parent.to_path_buf();
+    }
+    candidate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +207,14 @@ mod tests {
     fn disk_free_space_nonzero_on_temp() {
         let dir = TempDir::new().unwrap();
         let free = disk_free_bytes(dir.path()).unwrap();
+        assert!(free > 0);
+    }
+
+    #[test]
+    fn disk_free_space_accepts_nonexistent_child() {
+        let dir = TempDir::new().unwrap();
+        let child = dir.path().join("not-created-yet").join("nested");
+        let free = disk_free_bytes(&child).unwrap();
         assert!(free > 0);
     }
 

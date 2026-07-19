@@ -67,7 +67,11 @@ async function confirm() {
             <ArrowRight v-else :size="15" />
             {{ store.running ? '迁移中' : (store.report.ok ? '确认迁移' : '存在阻断项') }}
           </button>
-          <button v-if="store.running" class="button button-secondary" @click="store.cancel"><X :size="15" /> 取消</button>
+          <button v-if="store.running" class="button button-secondary" :disabled="store.cancelling" @click="store.cancel">
+            <LoaderCircle v-if="store.cancelling" class="spinning" :size="15" />
+            <X v-else :size="15" />
+            {{ store.cancelling ? '正在取消' : '取消' }}
+          </button>
         </div>
       </section>
 

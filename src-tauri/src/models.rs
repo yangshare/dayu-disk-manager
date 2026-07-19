@@ -128,11 +128,40 @@ pub struct HistoryEntry {
 // ===== Progress event (后端 emit -> 前端) =====
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    /// "preparing" | "copying"
+    pub phase: String,
+    pub completed_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    pub completed_files: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProgressEvent {
     pub task_id: String,
     pub stage: String,
     pub percent: u8,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<TransferProgress>,
+}
+
+impl ProgressEvent {
+    pub fn new(task_id: impl Into<String>, stage: &str, percent: u8, message: &str) -> Self {
+        Self {
+            task_id: task_id.into(),
+            stage: stage.into(),
+            percent,
+            message: message.into(),
+            transfer: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
