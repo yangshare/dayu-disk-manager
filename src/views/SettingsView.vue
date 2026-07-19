@@ -64,7 +64,7 @@ function removeExclude(i: number) { config.value?.scan.excludePaths.splice(i, 1)
   </div>
 </template>
 <style scoped>
-.settings-page { max-width: 980px; }
+.settings-page { max-width: none; }
 .settings-section { display: grid; grid-template-columns: minmax(220px, .8fr) minmax(300px, 1.2fr); align-items: center; gap: 34px; margin-bottom: 12px; }
 .settings-section.align-start { align-items: flex-start; }
 .settings-label { display: flex; align-items: center; gap: 11px; }

@@ -42,7 +42,7 @@ button:disabled { cursor: default; opacity: .56; }
   border-bottom: 1px solid var(--line);
   user-select: none;
 }
-.traffic-lights { display: flex; align-items: center; gap: 8px; width: 74px; }
+.traffic-lights { display: flex; align-items: center; gap: 8px; width: 74px; margin-left: auto; }
 .traffic-button {
   display: grid;
   width: 13px;
@@ -84,7 +84,7 @@ button:disabled { cursor: default; opacity: .56; }
 .sidebar-footer { display: flex; align-items: center; gap: 7px; margin-top: auto; padding: 12px 10px 2px; border-top: 1px solid #e5e5e8; color: #a0a0a7; font-size: 10px; }
 .content { min-width: 0; flex: 1; overflow: auto; background: var(--surface); }
 
-.page { max-width: 1180px; min-height: 100%; padding: 38px 46px 52px; }
+.page { width: 100%; min-height: 100%; padding: 38px clamp(28px, 3vw, 56px) 52px; }
 .page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 28px; margin-bottom: 30px; }
 .eyebrow { margin: 0 0 9px; color: var(--accent); font-size: 11px; font-weight: 700; letter-spacing: 0; text-transform: uppercase; }
 h2 { margin: 0; color: var(--text-primary); font-size: 27px; font-weight: 720; }

@@ -1,12 +1,23 @@
 <script setup lang="ts">
 import { RouterView, RouterLink } from 'vue-router'
+import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import {
   BarChart3, FolderKanban, Link2, History, Settings,
   Minus, Square, X, ShieldCheck, Sparkles,
 } from '@lucide/vue'
 
-const appWindow = '__TAURI_INTERNALS__' in window ? getCurrentWindow() : null
+const appWindow = isTauri() ? getCurrentWindow() : null
+
+function isInteractiveTarget(target: EventTarget | null) {
+  return target instanceof Element
+    && !!target.closest('button,a,input,select,textarea,[data-no-drag]')
+}
+
+async function startDrag(event: MouseEvent) {
+  if (event.button !== 0 || event.detail > 1 || isInteractiveTarget(event.target)) return
+  try { await appWindow?.startDragging() } catch { /* browser preview */ }
+}
 
 async function minimize() {
   try { await appWindow?.minimize() } catch { /* browser preview */ }
@@ -23,14 +34,14 @@ async function closeWindow() {
 
 <template>
   <div class="app-window">
-    <header class="titlebar" data-tauri-drag-region @dblclick="toggleMaximize">
-      <div class="traffic-lights" data-tauri-drag-region>
-        <button class="traffic-button traffic-close" aria-label="关闭" title="关闭" @click.stop="closeWindow"><X :size="11" /></button>
-        <button class="traffic-button traffic-minimize" aria-label="最小化" title="最小化" @click.stop="minimize"><Minus :size="11" /></button>
-        <button class="traffic-button traffic-maximize" aria-label="最大化" title="最大化" @click.stop="toggleMaximize"><Square :size="9" /></button>
+    <header class="titlebar" @mousedown="startDrag" @dblclick="toggleMaximize">
+      <div class="titlebar-title">大禹磁盘管理器</div>
+      <div class="titlebar-spacer" />
+      <div class="traffic-lights" data-no-drag @dblclick.stop>
+        <button class="traffic-button traffic-close" aria-label="关闭" title="关闭" @mousedown.stop @click.stop="closeWindow"><X :size="11" /></button>
+        <button class="traffic-button traffic-minimize" aria-label="最小化" title="最小化" @mousedown.stop @click.stop="minimize"><Minus :size="11" /></button>
+        <button class="traffic-button traffic-maximize" aria-label="最大化" title="最大化" @mousedown.stop @click.stop="toggleMaximize"><Square :size="9" /></button>
       </div>
-      <div class="titlebar-title" data-tauri-drag-region>大禹磁盘管理器</div>
-      <div class="titlebar-spacer" data-tauri-drag-region />
     </header>
 
     <div class="app-body">
