@@ -81,6 +81,11 @@ pub fn migrate(
         on_progress(ProgressEvent::new(&plan.task_id, stage, pct, msg));
     };
 
+    // 在写 journal 和复制前拒绝已是链接的源路径。
+    if ops.is_reparse_point(&plan.src) {
+        return Err(AppError::Migrate("源已是 reparse point，不能重复迁移".into()));
+    }
+
     journal.begin(
         &plan.task_id, &plan.migration_id, "migrate",
         &plan.src.to_string_lossy(),
@@ -137,10 +142,6 @@ pub fn migrate(
 
     // 阶段 c：改名源 + 增量同步 + 建链
     emit(stage::RENAMING_SOURCE, 70, "改名源目录");
-    if ops.is_reparse_point(&plan.src) {
-        journal.fail(&plan.task_id, "源已是 reparse point")?;
-        return Err(AppError::Migrate("源已是 reparse point".into()));
-    }
     if let Err(e) = ops.rename(&plan.src, &plan.old_path) {
         journal.fail(&plan.task_id, "源改名失败（可能被占用）")?;
         return Err(e);

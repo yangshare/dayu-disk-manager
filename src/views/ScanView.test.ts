@@ -52,6 +52,8 @@ describe('ScanView', () => {
       autoMigrate: false,
       isJunction: false,
       inaccessible: false,
+      scanStatus: null,
+      migrationId: null,
     })))
     const wrapper = mount(ScanView)
 
@@ -77,5 +79,53 @@ describe('ScanView', () => {
 
     finishScan([])
     await flushPromises()
+  })
+
+  it('marks managed links and replaces the migrate action', async () => {
+    mocks.scanDrives.mockResolvedValue([{
+      path: 'C:\\data\\cache',
+      displayName: 'cache',
+      sizeBytes: 1024,
+      matchedPreset: null,
+      category: null,
+      autoMigrate: false,
+      isJunction: true,
+      inaccessible: false,
+      scanStatus: 'migrated',
+      migrationId: 'migration-1',
+    }])
+    const wrapper = mount(ScanView)
+
+    await wrapper.get('[data-testid="start-scan"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('已迁移')
+    expect(wrapper.text()).not.toContain('自定义迁移')
+    const viewLink = wrapper.findAll('button').find((button) => button.text().includes('查看链接'))
+    expect(viewLink).toBeDefined()
+    await viewLink!.trigger('click')
+    expect(mocks.push).toHaveBeenCalledWith({ name: 'links' })
+  })
+
+  it('blocks migration for directories containing migrated children', async () => {
+    mocks.scanDrives.mockResolvedValue([{
+      path: 'C:\\data',
+      displayName: 'data',
+      sizeBytes: 1024,
+      matchedPreset: null,
+      category: null,
+      autoMigrate: false,
+      isJunction: false,
+      inaccessible: false,
+      scanStatus: 'contains_migrated',
+      migrationId: null,
+    }])
+    const wrapper = mount(ScanView)
+
+    await wrapper.get('[data-testid="start-scan"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('包含已迁移目录')
+    expect(wrapper.text()).not.toContain('自定义迁移')
   })
 })

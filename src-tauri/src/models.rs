@@ -77,6 +77,17 @@ pub struct Migration {
 }
 
 // ===== Scan =====
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanItemStatus {
+    Migrated,
+    MigrationPending,
+    LinkBroken,
+    ExistingLink,
+    ContainsMigrated,
+    ContainsLink,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanItem {
@@ -88,6 +99,8 @@ pub struct ScanItem {
     pub auto_migrate: bool,
     pub is_junction: bool,
     pub inaccessible: bool,
+    pub scan_status: Option<ScanItemStatus>,
+    pub migration_id: Option<String>,
 }
 
 // ===== Journal =====

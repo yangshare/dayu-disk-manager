@@ -3,7 +3,8 @@ import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useScanStore } from '../stores/scan'
 import SizeCell from '../components/SizeCell.vue'
-import { FolderSearch, RefreshCw, ArrowRight, HardDrive, ShieldCheck, Clock3, Square, ChevronDown } from '@lucide/vue'
+import { FolderSearch, RefreshCw, ArrowRight, HardDrive, ShieldCheck, Clock3, Square, ChevronDown, Link2 } from '@lucide/vue'
+import type { ScanItemStatus } from '../ipc/types'
 
 const store = useScanStore()
 const router = useRouter()
@@ -17,9 +18,26 @@ const categoryLabels: Record<string, string> = {
   ide: '开发工具', container: '容器数据', app_install: '应用程序', custom: '自定义',
 }
 
+const statusLabels: Record<ScanItemStatus, string> = {
+  migrated: '已迁移',
+  migration_pending: '迁移待处理',
+  link_broken: '链接异常',
+  existing_link: '已有软链接',
+  contains_migrated: '包含已迁移目录',
+  contains_link: '包含软链接目录',
+}
+
+const managedStatuses = new Set<ScanItemStatus>([
+  'migrated', 'migration_pending', 'link_broken', 'contains_migrated',
+])
+
 function migrate(item: { path: string; matchedPreset: string | null }) {
   // 选中目标后跳迁移页（传 path 与 presetId）
   router.push({ name: 'migrate', query: { src: item.path, presetId: item.matchedPreset ?? '' } })
+}
+
+function viewLinks() {
+  router.push({ name: 'links' })
 }
 
 function showMore() {
@@ -83,14 +101,17 @@ function showMore() {
           <td><SizeCell :bytes="it.sizeBytes" /></td>
           <td>{{ categoryLabels[it.category ?? 'custom'] ?? '自定义' }}</td>
           <td>
-            <span v-if="it.isJunction" class="tag">已迁移(junction)</span>
+            <span v-if="it.scanStatus" class="tag" :class="it.scanStatus">{{ statusLabels[it.scanStatus] }}</span>
             <span v-else-if="it.inaccessible" class="tag err">无法访问</span>
             <span v-else-if="!it.autoMigrate" class="tag warn">需确认风险</span>
           </td>
           <td>
-            <button v-if="!it.isJunction && !it.inaccessible" class="button button-quiet" @click="migrate(it)">
+            <button v-if="!it.scanStatus && !it.inaccessible" class="button button-quiet" @click="migrate(it)">
               {{ it.autoMigrate ? '一键迁移' : '自定义迁移' }}
               <ArrowRight :size="14" />
+            </button>
+            <button v-else-if="it.scanStatus && managedStatuses.has(it.scanStatus)" class="button button-secondary" @click="viewLinks">
+              <Link2 :size="14" /> 查看链接
             </button>
           </td>
         </tr>
@@ -107,7 +128,9 @@ function showMore() {
 <style scoped>
 .path { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; }
 .tag { display: inline-flex; padding: 4px 8px; border-radius: 999px; background: var(--surface-muted); color: var(--text-secondary); font-size: 12px; white-space: nowrap; }
-.tag.warn { background: #fff3d8; color: #a96800; } .tag.err { background: #ffe4e1; color: #b42318; }
+.tag.migrated { color: #18794e; background: #e8f8ef; }
+.tag.migration_pending, .tag.contains_migrated, .tag.contains_link, .tag.warn { color: #a96800; background: #fff3d8; }
+.tag.link_broken, .tag.err { color: #b42318; background: #ffe4e1; }
 .header-actions { display: flex; gap: 8px; }
 .results-more { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 12px 16px; color: var(--text-tertiary); border-top: 1px solid var(--line); font-size: 11px; }
 </style>

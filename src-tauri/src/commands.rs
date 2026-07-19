@@ -4,7 +4,7 @@ use crate::file_ops::RealFileOps;
 use crate::migrator::{self, MigratePlan};
 use crate::models::*;
 use crate::scanner;
-use crate::safety::{precheck, Win32Probe};
+use crate::safety::{migration_conflict, precheck, Win32Probe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,6 +17,7 @@ pub async fn scan_drives(
     state: State<'_, AppState>,
 ) -> AppResult<Vec<ScanItem>> {
     let cfg = state.store.load_config()?;
+    let migrations = state.store.load_migrations()?;
     let cancel = Arc::new(AtomicBool::new(false));
     let scan_slot = state.scan_cancel_token.clone();
     {
@@ -57,14 +58,21 @@ pub async fn scan_drives(
             &mut on_progress,
         )
         .map_err(|_| crate::error::AppError::Cancelled)?;
+        scanner::annotate_migrations(
+            &mut output.items,
+            &migrations,
+            &|source| crate::junction::verify(source),
+            &scanner::dir_size,
+        );
         let _ = app.emit("dayu://scan-progress", ScanProgressEvent {
             scanned_dirs: output.stats.scanned_dirs,
             scanned_files: output.stats.scanned_files,
             current_path: String::new(),
         });
-        output
-            .items
-            .sort_unstable_by_key(|item| std::cmp::Reverse(item.size_bytes));
+        output.items.sort_unstable_by_key(|item| {
+            let managed_priority = u8::from(item.migration_id.is_some());
+            (std::cmp::Reverse(managed_priority), std::cmp::Reverse(item.size_bytes))
+        });
         Ok(output.items)
     })
     .await
@@ -107,6 +115,10 @@ pub async fn start_migrate(
 ) -> AppResult<Migration> {
     let cfg = state.store.load_config()?;
     let src_path = PathBuf::from(&src);
+    let existing = state.store.load_migrations()?;
+    if let Some(conflict) = migration_conflict(&src_path, &existing) {
+        return Err(crate::error::AppError::Conflict(conflict));
+    }
     let preset = preset_id.as_ref().and_then(|id| cfg.presets.iter().find(|p| &p.id == id));
     let subdir = preset.map(|p| p.target_subdir.clone()).unwrap_or_else(|| "custom".into());
     let target = format!("{}/{}/{}/data", cfg.repository.trim_end_matches('/'), subdir, migration_id);

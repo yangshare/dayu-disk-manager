@@ -1,4 +1,4 @@
-use crate::models::{Config, Preset, ScanItem};
+use crate::models::{Config, Migration, MigrationStatus, Preset, ScanItem, ScanItemStatus};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +70,68 @@ pub fn matches_preset(actual_path: &str, preset: &Preset) -> bool {
 
 fn normalize(p: &str) -> String {
     p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+fn is_descendant(path: &str, parent: &str) -> bool {
+    let path = normalize(path);
+    let parent = normalize(parent);
+    path.strip_prefix(&parent)
+        .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+fn represents_migrated_link(status: &MigrationStatus) -> bool {
+    !matches!(status, MigrationStatus::TargetPendingDelete)
+}
+
+/// 合并迁移记录，使所有扫描调用方得到一致的状态和迁移资格判断。
+pub fn annotate_migrations(
+    items: &mut [ScanItem],
+    migrations: &[Migration],
+    link_valid: &dyn Fn(&Path) -> bool,
+    target_size: &dyn Fn(&Path) -> u64,
+) {
+    let linked_migrations: Vec<&Migration> = migrations
+        .iter()
+        .filter(|migration| represents_migrated_link(&migration.status))
+        .collect();
+    let junction_paths: Vec<String> = items
+        .iter()
+        .filter(|item| item.is_junction)
+        .map(|item| item.path.clone())
+        .collect();
+
+    for item in items {
+        if let Some(migration) = linked_migrations
+            .iter()
+            .find(|migration| normalize(&migration.source) == normalize(&item.path))
+        {
+            item.migration_id = Some(migration.id.clone());
+            let target = Path::new(&migration.target);
+            if target.exists() {
+                item.size_bytes = target_size(target);
+            }
+            item.scan_status = Some(if !link_valid(Path::new(&migration.source)) {
+                ScanItemStatus::LinkBroken
+            } else if migration.status == MigrationStatus::Active {
+                ScanItemStatus::Migrated
+            } else {
+                ScanItemStatus::MigrationPending
+            });
+            continue;
+        }
+
+        if linked_migrations
+            .iter()
+            .any(|migration| is_descendant(&migration.source, &item.path))
+        {
+            item.scan_status = Some(ScanItemStatus::ContainsMigrated);
+        } else if junction_paths
+            .iter()
+            .any(|junction_path| is_descendant(junction_path, &item.path))
+        {
+            item.scan_status = Some(ScanItemStatus::ContainsLink);
+        }
+    }
 }
 
 struct ScanContext {
@@ -291,6 +353,8 @@ fn push_if_big_or_preset(
         auto_migrate: preset_match.map(|p| p.auto_migrate).unwrap_or(false),
         is_junction: false,
         inaccessible: false,
+        scan_status: None,
+        migration_id: None,
     });
 }
 
@@ -307,6 +371,8 @@ fn junction_item(path: &Path) -> ScanItem {
         auto_migrate: false,
         is_junction: true,
         inaccessible: false,
+        scan_status: Some(ScanItemStatus::ExistingLink),
+        migration_id: None,
     }
 }
 
@@ -323,6 +389,8 @@ fn inaccessible_item(path: &Path) -> ScanItem {
         auto_migrate: false,
         is_junction: false,
         inaccessible: true,
+        scan_status: None,
+        migration_id: None,
     }
 }
 
@@ -331,6 +399,59 @@ mod tests {
     use super::*;
     use crate::store::default_config;
     use tempfile::TempDir;
+
+    fn scan_item(path: &str, is_junction: bool) -> ScanItem {
+        ScanItem {
+            path: path.into(), display_name: path.into(), size_bytes: 0,
+            matched_preset: None, category: None, auto_migrate: false,
+            is_junction, inaccessible: false,
+            scan_status: is_junction.then_some(ScanItemStatus::ExistingLink),
+            migration_id: None,
+        }
+    }
+
+    fn migration(source: &str, target: &Path, status: MigrationStatus) -> Migration {
+        Migration {
+            id: "migration-1".into(), schema_version: 1, source: source.into(),
+            target: target.to_string_lossy().into(), old_path: String::new(), preset: None,
+            created_at: "2026-07-19T00:00:00Z".into(), status,
+            source_volume_serial: "C".into(), target_volume_serial: "D".into(),
+            recycle_bin_ref: String::new(), pending_cleanup: None,
+        }
+    }
+
+    #[test]
+    fn migration_annotations_mark_exact_link_and_parent() {
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut items = vec![
+            scan_item("C:\\Users\\x", false),
+            scan_item("C:\\Users\\x\\Cache", true),
+        ];
+        let migrations = vec![migration("c:/users/X/cache/", &target, MigrationStatus::Active)];
+
+        annotate_migrations(&mut items, &migrations, &|_| true, &|_| 4096);
+
+        assert_eq!(items[0].scan_status, Some(ScanItemStatus::ContainsMigrated));
+        assert_eq!(items[1].scan_status, Some(ScanItemStatus::Migrated));
+        assert_eq!(items[1].migration_id.as_deref(), Some("migration-1"));
+        assert_eq!(items[1].size_bytes, 4096);
+    }
+
+    #[test]
+    fn migration_annotations_surface_broken_links() {
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut items = vec![scan_item("C:\\Users\\x\\Cache", false)];
+        let migrations = vec![migration("C:\\Users\\x\\Cache", &target, MigrationStatus::Active)];
+
+        annotate_migrations(&mut items, &migrations, &|_| false, &|_| 0);
+
+        assert_eq!(items[0].scan_status, Some(ScanItemStatus::LinkBroken));
+        assert_eq!(items[0].migration_id.as_deref(), Some("migration-1"));
+    }
 
     #[test]
     fn dir_size_sums_files() {

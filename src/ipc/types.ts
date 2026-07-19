@@ -7,7 +7,13 @@ export interface ScanItem {
   autoMigrate: boolean
   isJunction: boolean
   inaccessible: boolean
+  scanStatus: ScanItemStatus | null
+  migrationId: string | null
 }
+
+export type ScanItemStatus =
+  | 'migrated' | 'migration_pending' | 'link_broken'
+  | 'existing_link' | 'contains_migrated' | 'contains_link'
 
 export type PresetCategory =
   | 'communication' | 'game_library' | 'dev_cache'

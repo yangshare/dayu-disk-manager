@@ -67,6 +67,43 @@ fn safety_margin(src_size: u64) -> u64 {
     src_size / 10 + 100 * 1024 * 1024
 }
 
+fn migration_blocks_new_source(status: &MigrationStatus) -> bool {
+    !matches!(status, MigrationStatus::TargetPendingDelete)
+}
+
+fn is_descendant(path: &str, parent: &str) -> bool {
+    let path = norm(path);
+    let parent = norm(parent);
+    path.strip_prefix(&parent)
+        .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+/// 返回持久化迁移记录与待迁移路径之间的首个冲突。
+pub fn migration_conflict(src: &Path, existing: &[Migration]) -> Option<String> {
+    let src = src.to_string_lossy();
+    for migration in existing
+        .iter()
+        .filter(|migration| migration_blocks_new_source(&migration.status))
+    {
+        if norm(&migration.source) == norm(&src) {
+            return Some("源路径已有迁移记录，不能重复迁移".into());
+        }
+        if is_descendant(&migration.source, &src) {
+            return Some(format!(
+                "源目录包含已迁移的子目录：{}，请先在软链接管理中处理",
+                migration.source
+            ));
+        }
+        if is_descendant(&src, &migration.source) {
+            return Some(format!(
+                "源路径位于已迁移目录内部：{}，不能单独迁移",
+                migration.source
+            ));
+        }
+    }
+    None
+}
+
 pub fn precheck(
     src: &Path,
     config: &Config,
@@ -79,12 +116,9 @@ pub fn precheck(
     let mut blockers = Vec::new();
     let src_str = src.to_string_lossy().replace('/', "\\");
 
-    // 1. 重复迁移
-    if existing
-        .iter()
-        .any(|m| m.status == MigrationStatus::Active && norm(&m.source) == norm(&src_str))
-    {
-        blockers.push("源路径已存在 active 迁移记录（重复迁移）".into());
+    // 1. 重复或重叠迁移
+    if let Some(conflict) = migration_conflict(src, existing) {
+        blockers.push(conflict);
     }
 
     // 2. 系统黑名单（双方统一 norm：去末尾分隔符、统一反斜杠、统一小写）
@@ -230,6 +264,16 @@ mod tests {
         let mut c = default_config();
         c.repository = repo.into();
         c
+    }
+
+    fn migration(source: &str, status: MigrationStatus) -> Migration {
+        Migration {
+            id: "u1".into(), schema_version: 1, source: source.into(),
+            target: "D:/Migrated/c/u1/data".into(), old_path: String::new(), preset: None,
+            created_at: "2026-07-18T00:00:00Z".into(), status,
+            source_volume_serial: "C".into(), target_volume_serial: "D".into(),
+            recycle_bin_ref: String::new(), pending_cleanup: None,
+        }
     }
 
     #[test]
@@ -417,20 +461,7 @@ mod tests {
 
     #[test]
     fn blocks_duplicate_active_migration() {
-        let existing = vec![Migration {
-            id: "u1".into(),
-            schema_version: 1,
-            source: "C:/Users/x/Data".into(),
-            target: "D:/Migrated/c/u1/data".into(),
-            old_path: String::new(),
-            preset: None,
-            created_at: "2026-07-18T00:00:00Z".into(),
-            status: MigrationStatus::Active,
-            source_volume_serial: "C".into(),
-            target_volume_serial: "D".into(),
-            recycle_bin_ref: String::new(),
-            pending_cleanup: None,
-        }];
+        let existing = vec![migration("C:/Users/x/Data", MigrationStatus::Active)];
         let probe = Mock {
             free: 10_000_000_000,
             ntfs: true,
@@ -450,6 +481,35 @@ mod tests {
             .blockers
             .iter()
             .any(|b| b.contains("已迁移") || b.contains("重复")));
+    }
+
+    #[test]
+    fn blocks_parent_that_contains_a_migrated_directory() {
+        let existing = vec![migration(
+            "C:/Users/x/AppData/Local/Cache",
+            MigrationStatus::Active,
+        )];
+
+        let conflict = migration_conflict(Path::new("C:\\Users\\x\\AppData"), &existing);
+
+        assert!(conflict
+            .as_deref()
+            .is_some_and(|message| message.contains("包含已迁移的子目录")));
+    }
+
+    #[test]
+    fn blocks_pending_migration_but_not_restored_cleanup_record() {
+        let pending = vec![migration(
+            "C:/Users/x/Data",
+            MigrationStatus::PendingManualConfirm,
+        )];
+        let restored = vec![migration(
+            "C:/Users/x/Data",
+            MigrationStatus::TargetPendingDelete,
+        )];
+
+        assert!(migration_conflict(Path::new("C:/Users/x/Data"), &pending).is_some());
+        assert!(migration_conflict(Path::new("C:/Users/x/Data"), &restored).is_none());
     }
 
     /// 真机验证：running_process_names 真能枚举出非空进程列表。
