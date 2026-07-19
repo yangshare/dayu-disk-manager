@@ -1,7 +1,7 @@
 # dayu-disk-manager
 ## 1. 项目定位与核心价值
 
-**dayu-disk-manager** 是一款 Windows 桌面磁盘治理工具，核心功能是通过 **junction（目录联接）** 把 C 盘的大体积目录迁移到其他盘，并在原位建立链接，从而释放 C 盘空间。项目名取"大禹治水"之意——疏导归流，而非东搬西塞。
+**dayu-disk-manager** 是一款 Windows 磁盘治理桌面工具，核心功能是通过 **junction（目录联接）** 把 C 盘的大体积目录迁移到其他盘，并在原位建立链接，从而释放 C 盘空间。项目名取"大禹治水"之意——疏导归流，而非东搬西塞。
 
 <img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/9c0a9c7b-c357-4641-9be8-a263d3e190c0" />
 
