@@ -1,0 +1,71 @@
+name: Release (Windows)
+
+# 推送 tag 时自动构建 Windows 安装包并发布到 GitHub Releases；
+# 也可在 Actions 页面手动触发。
+# 思路参考 new-api/scripts/release.bat + release.yml：
+# 本地打 tag 并 push -> GitHub Actions 自动构建 -> 产物挂到对应 Release。
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  windows:
+    name: Windows Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version
+        shell: bash
+        run: |
+          # tag 触发时直接用 ref_name（如 v0.1.0）；手动触发时回退到 tauri.conf.json 的 version
+          if [ -n "${{ github.ref_name }}" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="v$(grep -o '"version": *"[^"]*"' src-tauri/tauri.conf.json | head -1 | sed -E 's/.*"version": *"([^"]*)".*/\1/')"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Resolved version: $VERSION"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Build Tauri app and upload to Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ env.VERSION }}
+          releaseName: '大禹磁盘管理器 ${{ env.VERSION }}'
+          releaseBody: '请下载对应的 .msi 或 .exe 安装包。'
+          releaseDraft: false
+          prerelease: false
+          args: --target x86_64-pc-windows-msvc
