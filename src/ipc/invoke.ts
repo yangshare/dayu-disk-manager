@@ -5,6 +5,7 @@ import type {
 
 export const ipc = {
   scanDrives: () => invoke<ScanItem[]>('scan_drives'),
+  cancelScan: () => invoke<boolean>('cancel_scan'),
   precheckMigrate: (src: string) => invoke<PrecheckReport>('precheck_migrate', { src }),
   startMigrate: (migrationId: string, src: string, presetId: string | null) =>
     invoke<Migration>('start_migrate', { migrationId, src, presetId }),

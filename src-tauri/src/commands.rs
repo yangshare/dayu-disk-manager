@@ -8,27 +8,84 @@ use crate::safety::{precheck, Win32Probe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command]
-pub async fn scan_drives(state: State<'_, AppState>) -> AppResult<Vec<ScanItem>> {
+pub async fn scan_drives(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<ScanItem>> {
     let cfg = state.store.load_config()?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let scan_slot = state.scan_cancel_token.clone();
+    {
+        let mut active = scan_slot.lock().unwrap();
+        if active.is_some() {
+            return Err(crate::error::AppError::Conflict("扫描任务已在运行".into()));
+        }
+        *active = Some(cancel.clone());
+    }
 
     // Directory walking and size calculation can take a long time on a real disk.
     // Keep it off the Tauri/UI thread so the window remains responsive while a scan runs.
-    tauri::async_runtime::spawn_blocking(move || {
+    let task_cancel = cancel.clone();
+    let task_result = tauri::async_runtime::spawn_blocking(move || {
         // 首版扫描根：当前用户目录 + Program Files（受 excludePaths 过滤）
         let mut roots = vec![];
         if let Some(home) = dirs::home_dir() { roots.push(home); }
         roots.push(PathBuf::from("C:/Program Files"));
-        let mut items = Vec::new();
-        for r in roots {
-            items.extend(scanner::scan(&r, &cfg));
-        }
-        Ok(items)
+        let mut last_emit = None::<Instant>;
+        let mut on_progress = |stats: &scanner::ScanStats, path: &std::path::Path| {
+            let now = Instant::now();
+            if last_emit
+                .map(|last| now.duration_since(last) >= Duration::from_millis(200))
+                .unwrap_or(true)
+            {
+                let _ = app.emit("dayu://scan-progress", ScanProgressEvent {
+                    scanned_dirs: stats.scanned_dirs,
+                    scanned_files: stats.scanned_files,
+                    current_path: path.to_string_lossy().into(),
+                });
+                last_emit = Some(now);
+            }
+        };
+        let mut output = scanner::scan_roots_with_control(
+            &roots,
+            &cfg,
+            &task_cancel,
+            &mut on_progress,
+        )
+        .map_err(|_| crate::error::AppError::Cancelled)?;
+        let _ = app.emit("dayu://scan-progress", ScanProgressEvent {
+            scanned_dirs: output.stats.scanned_dirs,
+            scanned_files: output.stats.scanned_files,
+            current_path: String::new(),
+        });
+        output
+            .items
+            .sort_unstable_by_key(|item| std::cmp::Reverse(item.size_bytes));
+        Ok(output.items)
     })
     .await
-    .map_err(|e| crate::error::AppError::Store(format!("扫描任务失败: {e}")))?
+    .map_err(|e| crate::error::AppError::Store(format!("扫描任务失败: {e}")));
+
+    {
+        let mut active = scan_slot.lock().unwrap();
+        if active.as_ref().is_some_and(|current| Arc::ptr_eq(current, &cancel)) {
+            *active = None;
+        }
+    }
+    task_result?
+}
+
+#[tauri::command]
+pub fn cancel_scan(state: State<AppState>) -> bool {
+    if let Some(token) = state.scan_cancel_token.lock().unwrap().as_ref() {
+        token.store(true, Ordering::Relaxed);
+        return true;
+    }
+    false
 }
 
 #[tauri::command]
@@ -137,7 +194,7 @@ pub fn list_history(op: Option<String>, from: Option<String>, to: Option<String>
         (Some(a), Some(b)) => Some((a.as_str(), b.as_str())),
         _ => None,
     };
-    Ok(state.history.list(op.as_deref(), range)?)
+    state.history.list(op.as_deref(), range)
 }
 
 #[tauri::command]

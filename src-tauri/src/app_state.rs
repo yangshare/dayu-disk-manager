@@ -24,6 +24,8 @@ pub struct AppState {
     pub history: crate::history::History,
     /// 当前迁移/还原任务的取消令牌；无任务时为 None
     pub cancel_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// 当前扫描任务的取消令牌；无任务时为 None
+    pub scan_cancel_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 /// 启动时根据 journal 恢复决策。

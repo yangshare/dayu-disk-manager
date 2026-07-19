@@ -135,6 +135,14 @@ pub struct ProgressEvent {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanProgressEvent {
+    pub scanned_dirs: u64,
+    pub scanned_files: u64,
+    pub current_path: String,
+}
+
 // ===== Precheck =====
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

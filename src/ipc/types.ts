@@ -81,6 +81,12 @@ export interface ProgressEvent {
   message: string
 }
 
+export interface ScanProgressEvent {
+  scannedDirs: number
+  scannedFiles: number
+  currentPath: string
+}
+
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   const units = ['KB', 'MB', 'GB', 'TB']

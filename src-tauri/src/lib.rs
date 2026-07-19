@@ -35,12 +35,14 @@ pub fn run() {
     let state = AppState {
         store, journal, history,
         cancel_token: Arc::new(Mutex::new(None)),
+        scan_cancel_token: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::scan_drives,
+            commands::cancel_scan,
             commands::precheck_migrate,
             commands::start_migrate,
             commands::cancel_migrate,
