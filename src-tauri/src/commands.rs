@@ -11,25 +11,36 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command]
-pub fn scan_drives(state: State<AppState>) -> AppResult<Vec<ScanItem>> {
+pub async fn scan_drives(state: State<'_, AppState>) -> AppResult<Vec<ScanItem>> {
     let cfg = state.store.load_config()?;
-    // 首版扫描根：当前用户目录 + Program Files（受 excludePaths 过滤）
-    let mut roots = vec![];
-    if let Some(home) = dirs::home_dir() { roots.push(home); }
-    roots.push(PathBuf::from("C:/Program Files"));
-    let mut items = Vec::new();
-    for r in roots {
-        items.extend(scanner::scan(&r, &cfg));
-    }
-    Ok(items)
+
+    // Directory walking and size calculation can take a long time on a real disk.
+    // Keep it off the Tauri/UI thread so the window remains responsive while a scan runs.
+    tauri::async_runtime::spawn_blocking(move || {
+        // 首版扫描根：当前用户目录 + Program Files（受 excludePaths 过滤）
+        let mut roots = vec![];
+        if let Some(home) = dirs::home_dir() { roots.push(home); }
+        roots.push(PathBuf::from("C:/Program Files"));
+        let mut items = Vec::new();
+        for r in roots {
+            items.extend(scanner::scan(&r, &cfg));
+        }
+        Ok(items)
+    })
+    .await
+    .map_err(|e| crate::error::AppError::Store(format!("扫描任务失败: {e}")))?
 }
 
 #[tauri::command]
-pub fn precheck_migrate(src: String, state: State<AppState>) -> AppResult<PrecheckReport> {
+pub async fn precheck_migrate(src: String, state: State<'_, AppState>) -> AppResult<PrecheckReport> {
     let cfg = state.store.load_config()?;
     let existing = state.store.load_migrations()?;
-    let src_size = scanner::dir_size(std::path::Path::new(&src));
-    Ok(precheck(std::path::Path::new(&src), &cfg, &existing, src_size, &Win32Probe))
+    tauri::async_runtime::spawn_blocking(move || {
+        let src_size = scanner::dir_size(std::path::Path::new(&src));
+        Ok(precheck(std::path::Path::new(&src), &cfg, &existing, src_size, &Win32Probe))
+    })
+    .await
+    .map_err(|e| crate::error::AppError::Store(format!("预检任务失败: {e}")))?
 }
 
 #[tauri::command]

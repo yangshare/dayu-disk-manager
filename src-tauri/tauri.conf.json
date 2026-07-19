@@ -15,7 +15,10 @@
       {
         "title": "大禹磁盘管理器",
         "width": 1000,
-        "height": 700
+        "height": 700,
+        "minWidth": 860,
+        "minHeight": 560,
+        "decorations": false
       }
     ],
     "security": {

@@ -6,13 +6,20 @@ import type { PrecheckReport, ProgressEvent } from '../ipc/types'
 
 export const useMigrateStore = defineStore('migrate', () => {
   const report = ref<PrecheckReport | null>(null)
+  const prechecking = ref(false)
+  const error = ref<string | null>(null)
   const running = ref(false)
   const progress = ref<ProgressEvent | null>(null)
   const result = ref<{ ok: boolean; message: string } | null>(null)
   let unlisten: (() => void) | null = null
 
   async function precheck(src: string) {
-    report.value = await ipc.precheckMigrate(src)
+    prechecking.value = true
+    error.value = null
+    report.value = null
+    try { report.value = await ipc.precheckMigrate(src) }
+    catch (e) { error.value = String(e) }
+    finally { prechecking.value = false }
   }
 
   async function initListener() {
@@ -35,5 +42,5 @@ export const useMigrateStore = defineStore('migrate', () => {
   function cancel() { ipc.cancelMigrate() }
 
   function cleanup() { unlisten?.(); unlisten = null }
-  return { report, running, progress, result, precheck, run, cancel, cleanup }
+  return { report, prechecking, error, running, progress, result, precheck, run, cancel, cleanup }
 })

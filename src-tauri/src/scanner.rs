@@ -61,16 +61,26 @@ fn normalize(p: &str) -> String {
     p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
-/// 扫描 root 下一层目录，返回大于阈值或命中预设的项。
+/// 单次后序遍历 root，返回大于阈值或命中预设的项。
 pub fn scan(root: &Path, cfg: &Config) -> Vec<ScanItem> {
-    let min_bytes = cfg.scan.min_size_mb * 1024 * 1024;
     let exclude: Vec<String> = cfg.scan.exclude_paths.iter()
         .filter(|p| !p.trim().is_empty())
         .map(|p| normalize(p))
         .collect();
     let mut items = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(cur) = stack.pop() {
+    let mut sizes = std::collections::HashMap::<PathBuf, u64>::new();
+    let mut stack = vec![(root.to_path_buf(), None::<PathBuf>, false)];
+
+    while let Some((cur, parent, visited)) = stack.pop() {
+        if visited {
+            let size = sizes.remove(&cur).unwrap_or(0);
+            push_if_big_or_preset(&mut items, &cur, size, cfg);
+            if let Some(parent) = parent {
+                *sizes.entry(parent).or_default() += size;
+            }
+            continue;
+        }
+
         let cur_str = cur.to_string_lossy();
         if exclude.iter().any(|ex| normalize(&cur_str).starts_with(ex)) { continue; }
         if !cur.exists() { continue; }
@@ -96,24 +106,23 @@ pub fn scan(root: &Path, cfg: &Config) -> Vec<ScanItem> {
                 continue;
             }
         };
-        let mut subdirs: Vec<PathBuf> = Vec::new();
+
+        let mut direct_size = 0u64;
+        let mut subdirs = Vec::new();
         for e in entries.flatten() {
             let p = e.path();
-            if p.is_dir() { subdirs.push(p); }
-        }
-        if subdirs.is_empty() {
-            // 叶子目录：算体积
-            let size = dir_size(&cur);
-            push_if_big_or_preset(&mut items, &cur, size, cfg);
-        } else {
-            for sd in subdirs {
-                stack.push(sd);
+            if p.is_dir() {
+                subdirs.push(p);
+            } else if let Ok(meta) = e.metadata() {
+                direct_size = direct_size.saturating_add(meta.len());
             }
-            // 同时也评估当前目录自身（可能是 preset 命中的数据根，如 WeChat Files）
-            let size = dir_size(&cur);
-            push_if_big_or_preset(&mut items, &cur, size, cfg);
         }
-        let _ = min_bytes; // 阈值比较在 push_if_big_or_preset 内
+
+        sizes.insert(cur.clone(), direct_size);
+        stack.push((cur.clone(), parent, true));
+        for subdir in subdirs {
+            stack.push((subdir, Some(cur.clone()), false));
+        }
     }
     items
 }
@@ -200,6 +209,25 @@ mod tests {
         cfg.scan.min_size_mb = 0;
         let items = scan(root.path(), &cfg);
         assert!(items.iter().any(|i| i.path.ends_with("big")));
+    }
+
+    #[test]
+    fn scan_aggregates_nested_sizes() {
+        let root = TempDir::new().unwrap();
+        let parent = root.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(parent.join("a.bin"), vec![0u8; 700]).unwrap();
+        std::fs::write(child.join("b.bin"), vec![0u8; 300]).unwrap();
+        let mut cfg = default_config();
+        cfg.scan.min_size_mb = 0;
+
+        let items = scan(root.path(), &cfg);
+        let parent_item = items.iter().find(|i| i.path == parent.to_string_lossy()).unwrap();
+        let child_item = items.iter().find(|i| i.path == child.to_string_lossy()).unwrap();
+
+        assert_eq!(parent_item.size_bytes, 1000);
+        assert_eq!(child_item.size_bytes, 300);
     }
 
     #[test]
