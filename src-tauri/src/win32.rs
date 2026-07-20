@@ -564,18 +564,19 @@ fn map_win32_error(e: windows::core::Error, operation: &'static str) -> VolumeEr
 
 /// 打开卷设备（如 `\\.\C:`），要求只读访问。
 ///
-/// T0 最小版本：
-/// - `dwDesiredAccess` 取 `FILE_READ_ATTRIBUTES`（只读，不需要管理员读取数据）；
-///   后续 IOCTL 实际只需要卷属性读取权限。
-/// - `dwShareMode` 允许 READ|WRITE|DELETE 共享，避免与其它进程冲突。
-/// - 非管理员对部分卷会返回 `ERROR_ACCESS_DENIED`，本函数保留该错误。
+/// 修复轮 2（真机权限）：`FILE_READ_ATTRIBUTES` 权限不足导致 NTFS IOCTL
+/// 返回 `ERROR_INVALID_FUNCTION`（code=1）；改用 `GENERIC_READ` 后 IOCTL
+/// 可正常执行。非管理员运行时 CreateFileW 返回 `AccessDenied`，由上层
+/// 触发提权流程。`dwShareMode` 保留 READ|WRITE|DELETE 共享。
 #[cfg(windows)]
 pub fn open_volume(drive_letter: char) -> Result<VolumeHandle, VolumeError> {
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES,
-        FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE, FILE_READ_ATTRIBUTES, OPEN_EXISTING,
+        FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE, OPEN_EXISTING,
+
     };
     use windows::core::PCWSTR;
+use windows::Win32::Foundation::GENERIC_READ;
 
     let drive = drive_letter.to_ascii_uppercase();
     if !drive.is_ascii_alphabetic() {
@@ -616,7 +617,7 @@ pub fn open_volume(drive_letter: char) -> Result<VolumeHandle, VolumeError> {
     let handle = unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
-            FILE_READ_ATTRIBUTES.0,
+            GENERIC_READ.0,
             FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
             None,
             FILE_CREATION_DISPOSITION(OPEN_EXISTING.0),
