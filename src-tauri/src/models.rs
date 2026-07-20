@@ -18,7 +18,7 @@ pub struct ScanConfig {
     pub exclude_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PresetCategory {
     Communication,
@@ -77,7 +77,7 @@ pub struct Migration {
 }
 
 // ===== Scan =====
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanItemStatus {
     Migrated,
@@ -86,6 +86,24 @@ pub enum ScanItemStatus {
     ExistingLink,
     ContainsMigrated,
     ContainsLink,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessState {
+    Unknown,
+    Accessible,
+    Inaccessible,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RootFileSummary {
+    pub direct_file_size_bytes: u64,
+    pub direct_file_count: u64,
+    pub system_metadata_size_bytes: Option<u64>,
+    pub total_known_size_bytes: u64,
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

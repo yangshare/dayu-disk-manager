@@ -1,9 +1,13 @@
-use crate::models::{Config, Migration, MigrationStatus, Preset, ScanItem, ScanItemStatus};
-use std::collections::{HashMap, HashSet};
+use crate::models::{
+    AccessState, Config, Migration, MigrationStatus, Preset, PresetCategory, RootFileSummary,
+    ScanItem, ScanItemStatus,
+};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::mft::{select_effective_names, FileRef, MftIndex};
+use crate::junction;
 
 /// 递归计算目录体积（字节）。不跟随 reparse point 的内容。
 pub fn dir_size(path: &Path) -> u64 {
@@ -136,14 +140,14 @@ pub fn annotate_migrations(
     }
 }
 
-struct ScanContext {
+pub(crate) struct ScanContext {
     exclude: Vec<String>,
     preset_by_path: HashMap<String, usize>,
     min_bytes: u64,
 }
 
 impl ScanContext {
-    fn new(cfg: &Config) -> Self {
+    pub(crate) fn new(cfg: &Config) -> Self {
         let exclude = cfg
             .scan
             .exclude_paths
@@ -172,12 +176,286 @@ impl ScanContext {
         }
     }
 
-    fn excluded(&self, normalized_path: &str) -> bool {
+    pub(crate) fn excluded(&self, normalized_path: &str) -> bool {
         is_path_excluded(normalized_path, &self.exclude)
     }
 
-    fn preset_index(&self, normalized_path: &str) -> Option<usize> {
+    pub(crate) fn preset_index(&self, normalized_path: &str) -> Option<usize> {
         self.preset_by_path.get(normalized_path).copied()
+    }
+}
+
+fn migration_scan_status(migration: &Migration, link_valid: bool) -> ScanItemStatus {
+    if !link_valid {
+        ScanItemStatus::LinkBroken
+    } else if migration.status == MigrationStatus::Active {
+        ScanItemStatus::Migrated
+    } else {
+        ScanItemStatus::MigrationPending
+    }
+}
+
+fn scan_status_priority(status: &ScanItemStatus) -> u8 {
+    match status {
+        ScanItemStatus::LinkBroken => 4,
+        ScanItemStatus::MigrationPending => 3,
+        ScanItemStatus::Migrated => 2,
+        ScanItemStatus::ExistingLink => 1,
+        ScanItemStatus::ContainsMigrated | ScanItemStatus::ContainsLink => 0,
+    }
+}
+
+fn is_exact_migrated_status(status: &ScanItemStatus) -> bool {
+    matches!(
+        status,
+        ScanItemStatus::Migrated
+            | ScanItemStatus::MigrationPending
+            | ScanItemStatus::LinkBroken
+    )
+}
+
+/// 标注 MFT 目录图，并返回根目录直接文件汇总。
+///
+/// `link_valid` 通常应传 [`junction::verify`]；`target_size` 通常应传
+/// [`dir_size`]。两个回调保留为参数，避免单元测试依赖真实文件系统。
+/// MFT 的 skipped record 由 [`annotate_graph_with_skipped_records`] 传入；
+/// 此兼容包装默认按 0 处理。
+pub fn annotate_graph(
+    graph: &mut DirectoryGraph,
+    cfg: &Config,
+    migrations: &[Migration],
+    link_valid: &dyn Fn(&Path) -> bool,
+    target_size: &dyn Fn(&Path) -> u64,
+) -> RootFileSummary {
+    annotate_graph_with_callbacks(
+        graph,
+        cfg,
+        migrations,
+        &junction::exists,
+        link_valid,
+        target_size,
+        0,
+    )
+}
+
+/// 带 MFT skipped record 计数的图标注入口。
+pub fn annotate_graph_with_skipped_records(
+    graph: &mut DirectoryGraph,
+    cfg: &Config,
+    migrations: &[Migration],
+    link_valid: &dyn Fn(&Path) -> bool,
+    target_size: &dyn Fn(&Path) -> u64,
+    skipped_records: u64,
+) -> RootFileSummary {
+    annotate_graph_with_callbacks(
+        graph,
+        cfg,
+        migrations,
+        &junction::exists,
+        link_valid,
+        target_size,
+        skipped_records,
+    )
+}
+
+/// 可注入 junction 分类回调的图标注实现。
+///
+/// `junction_exists` 只会对带有 reparse tag 且路径非空的节点调用；这使得
+/// 任意 reparse tag 不会被误分类为 junction，同时测试无需创建真实 junction。
+pub fn annotate_graph_with_callbacks(
+    graph: &mut DirectoryGraph,
+    cfg: &Config,
+    migrations: &[Migration],
+    junction_exists: &dyn Fn(&Path) -> bool,
+    link_valid: &dyn Fn(&Path) -> bool,
+    target_size: &dyn Fn(&Path) -> u64,
+    skipped_records: u64,
+) -> RootFileSummary {
+    let context = ScanContext::new(cfg);
+
+    // 先从 children 建反向索引。后续状态/可见性传播均沿该索引上行，
+    // 每条链都带 visited 与 nodes.len() 上界，损坏图也不会导致无限循环。
+    let mut parents: HashMap<FileRef, Vec<FileRef>> = HashMap::new();
+    for (parent, children) in &graph.children {
+        if !graph.nodes.contains_key(parent) {
+            continue;
+        }
+        for child in children {
+            if graph.nodes.contains_key(child) {
+                let entry = parents.entry(*child).or_default();
+                if !entry.contains(parent) {
+                    entry.push(*parent);
+                }
+            }
+        }
+    }
+
+    // 阶段 1：预设与 junction 分类，并为每个节点选择精确迁移状态。
+    for node in graph.nodes.values_mut() {
+        node.matched_preset = None;
+        node.category = None;
+        node.auto_migrate = false;
+        node.is_junction = false;
+        node.scan_status = None;
+        node.migration_id = None;
+        node.linked_target_size_bytes = None;
+        node.visible = false;
+
+        let normalized_path = normalize(&node.path);
+        if !normalized_path.is_empty() {
+            if let Some(index) = context.preset_index(&normalized_path) {
+                if let Some(preset) = cfg.presets.get(index) {
+                    node.matched_preset = Some(preset.id.clone());
+                    node.category = Some(preset.category.clone());
+                    node.auto_migrate = preset.auto_migrate;
+                }
+            }
+        }
+
+        if node.reparse_tag.is_some() && !node.path.is_empty() {
+            node.is_junction = junction_exists(Path::new(&node.path));
+        }
+
+        let matching_migration = migrations
+            .iter()
+            .filter(|migration| represents_migrated_link(&migration.status))
+            .filter(|migration| normalize(&migration.source) == normalized_path)
+            .map(|migration| {
+                let status = migration_scan_status(
+                    migration,
+                    link_valid(Path::new(&migration.source)),
+                );
+                (migration, status)
+            })
+            .max_by_key(|(_, status)| scan_status_priority(status));
+
+        if let Some((migration, status)) = matching_migration {
+            node.migration_id = Some(migration.id.clone());
+            let target = Path::new(&migration.target);
+            if target.exists() {
+                node.linked_target_size_bytes = Some(target_size(target));
+            }
+            node.scan_status = Some(status);
+        } else if node.is_junction {
+            node.scan_status = Some(ScanItemStatus::ExistingLink);
+        }
+    }
+
+    // 阶段 2：从精确迁移状态/确认 junction 向祖先传播。迁移状态优先于链接
+    // 状态，精确状态最后保持不变。
+    let node_refs: Vec<FileRef> = graph.nodes.keys().copied().collect();
+    let mut contains_migrated: HashSet<FileRef> = graph
+        .nodes
+        .iter()
+        .filter_map(|(file_ref, node)| {
+            node.scan_status
+                .as_ref()
+                .filter(|status| is_exact_migrated_status(status))
+                .map(|_| *file_ref)
+        })
+        .collect();
+    let mut contains_link: HashSet<FileRef> = graph
+        .nodes
+        .iter()
+        .filter_map(|(file_ref, node)| node.is_junction.then_some(*file_ref))
+        .collect();
+
+    let hop_limit = graph.nodes.len();
+    let mut propagation_queue = VecDeque::new();
+    for source in node_refs {
+        if contains_migrated.contains(&source) || contains_link.contains(&source) {
+            propagation_queue.push_back(source);
+        }
+    }
+
+    // Each marker is inserted into a node at most once, so the two visited sets
+    // also bound propagation through cycles. The hop limit is retained as a
+    // defensive upper bound for malformed graphs with unexpectedly large queues.
+    let mut propagation_events = 0usize;
+    let max_propagation_events = hop_limit.saturating_mul(2);
+    while let Some(current) = propagation_queue.pop_front() {
+        propagation_events = propagation_events.saturating_add(1);
+        if propagation_events > max_propagation_events {
+            break;
+        }
+        let source_migrated = contains_migrated.contains(&current);
+        let source_link = contains_link.contains(&current);
+        if let Some(source_parents) = parents.get(&current) {
+            for parent in source_parents {
+                let mut changed = false;
+                if source_migrated {
+                    changed |= contains_migrated.insert(*parent);
+                }
+                if source_link {
+                    changed |= contains_link.insert(*parent);
+                }
+                if changed {
+                    propagation_queue.push_back(*parent);
+                }
+            }
+        }
+    }
+
+    for (file_ref, node) in graph.nodes.iter_mut() {
+        if node.scan_status.is_some() {
+            continue;
+        }
+        if contains_migrated.contains(file_ref) {
+            node.scan_status = Some(ScanItemStatus::ContainsMigrated);
+        } else if contains_link.contains(file_ref) {
+            node.scan_status = Some(ScanItemStatus::ContainsLink);
+        }
+    }
+
+    // 阶段 3：先计算强制可见节点，再沿父链补齐导航祖先。
+    let min_bytes = context.min_bytes;
+    let forced_visible: HashSet<FileRef> = graph
+        .nodes
+        .iter()
+        .filter_map(|(file_ref, node)| {
+            let forced = node.subtree_size_bytes >= min_bytes
+                || node.matched_preset.is_some()
+                || node.scan_status.is_some()
+                || node.access_state == AccessState::Inaccessible;
+            forced.then_some(*file_ref)
+        })
+        .collect();
+    let mut visible_refs = forced_visible.clone();
+    let mut visibility_queue: VecDeque<FileRef> = forced_visible.into_iter().collect();
+    while let Some(current) = visibility_queue.pop_front() {
+        if let Some(source_parents) = parents.get(&current) {
+            for parent in source_parents {
+                if visible_refs.insert(*parent) {
+                    visibility_queue.push_back(*parent);
+                }
+            }
+        }
+    }
+    for (file_ref, node) in graph.nodes.iter_mut() {
+        node.visible = !node.excluded && visible_refs.contains(file_ref);
+    }
+
+    build_root_summary(graph, skipped_records)
+}
+
+/// 从图中实际根 `FileRef` 汇总根目录直接文件与已知系统元数据。
+///
+/// T4 的 `DirectoryGraph` 不携带 MFT skipped record，因此由调用方显式传入；
+/// `skipped_records > 0` 时结果标记为不完整。
+pub fn build_root_summary(graph: &DirectoryGraph, skipped_records: u64) -> RootFileSummary {
+    let (direct_file_size_bytes, direct_file_count) = graph
+        .nodes
+        .get(&graph.root)
+        .map(|node| (node.direct_file_size_bytes, node.direct_file_count))
+        .unwrap_or((0, 0));
+    let system_metadata_size_bytes = Some(graph.system_metadata_size_bytes);
+    let total_known_size_bytes = direct_file_size_bytes.saturating_add(graph.system_metadata_size_bytes);
+    RootFileSummary {
+        direct_file_size_bytes,
+        direct_file_count,
+        system_metadata_size_bytes,
+        total_known_size_bytes,
+        incomplete: skipped_records > 0,
     }
 }
 
@@ -438,6 +716,22 @@ pub struct DirectoryNode {
     pub reparse_tag: Option<u32>,
     /// 是否为本工具创建的 junction。T4 留 `false`，由 T5/T8 借 `junction::verify` 填充。
     pub is_junction: bool,
+    /// 命中的预设 id。
+    pub matched_preset: Option<String>,
+    /// 命中预设的分类。
+    pub category: Option<PresetCategory>,
+    /// 命中预设是否允许自动迁移。
+    pub auto_migrate: bool,
+    /// MFT 图默认未知；filesystem 扫描可填充可访问性。
+    pub access_state: AccessState,
+    /// 迁移/链接状态标注。
+    pub scan_status: Option<ScanItemStatus>,
+    /// 匹配迁移记录的 id。
+    pub migration_id: Option<String>,
+    /// 迁移目标目录的大小，不覆盖源盘占用统计。
+    pub linked_target_size_bytes: Option<u64>,
+    /// 是否进入可见树。
+    pub visible: bool,
     /// 本目录直接子文件的 logical_size 之和（不含子目录内文件）。
     pub direct_file_size_bytes: u64,
     /// 本目录直接子文件数（按文件 record 计数，硬链接近似下每个有效名入口计一次）。
@@ -547,6 +841,14 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
                     depth: 0,
                     reparse_tag: record.reparse_tag,
                     is_junction: false, // T5/T8 才用 junction::verify 填
+                    matched_preset: None,
+                    category: None,
+                    auto_migrate: false,
+                    access_state: AccessState::Unknown,
+                    scan_status: None,
+                    migration_id: None,
+                    linked_target_size_bytes: None,
+                    visible: false,
                     direct_file_size_bytes: 0,
                     direct_file_count: 0,
                     direct_dir_count: 0,
@@ -990,7 +1292,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("big.bin"), vec![0u8; 2000]).unwrap();
         #[cfg(windows)]
-        junction::create(&target, d.join("link")).unwrap();
+        junction::create(&d.join("link"), &target).unwrap();
         // link 是 reparse point，其内部 2000 字节不应计入 d
         let size = dir_size(&d);
         assert_eq!(size, 0, "reparse point 内部内容不应计数");
@@ -1943,6 +2245,443 @@ mod tests {
             ));
             // 不匹配
             assert!(!is_path_excluded("c:\\program files", &exclude));
+        }
+    }
+
+    // ===== T5：树状态标注、可见性与根汇总测试 =====
+    mod annotation {
+        use super::*;
+        use crate::models::{PresetCategory, ScanConfig};
+        use std::collections::HashMap;
+
+        pub(super) fn fileref(record_no: u64, sequence: u16) -> FileRef {
+            FileRef { record_no, sequence }
+        }
+
+        pub(super) fn node(
+            record_no: u64,
+            path: &str,
+            depth: u32,
+            subtree_size_bytes: u64,
+            reparse_tag: Option<u32>,
+            excluded: bool,
+        ) -> DirectoryNode {
+            DirectoryNode {
+                file_ref: fileref(record_no, 1),
+                path: path.into(),
+                display_name: path.rsplit('\\').next().unwrap_or(path).into(),
+                depth,
+                reparse_tag,
+                is_junction: false,
+                direct_file_size_bytes: 0,
+                direct_file_count: 0,
+                direct_dir_count: 0,
+                subtree_size_bytes,
+                subtree_file_count: 0,
+                subtree_dir_count: 1,
+                excluded,
+                reachable_from_root: true,
+                matched_preset: None,
+                category: None,
+                auto_migrate: false,
+                access_state: AccessState::Unknown,
+                scan_status: None,
+                migration_id: None,
+                linked_target_size_bytes: None,
+                visible: false,
+            }
+        }
+
+        pub(super) fn make_graph(
+            nodes: Vec<DirectoryNode>,
+            edges: &[(u64, u64)],
+            root_record_no: u64,
+        ) -> DirectoryGraph {
+            let mut node_map = HashMap::new();
+            for node in nodes {
+                node_map.insert(node.file_ref, node);
+            }
+            let mut children: HashMap<FileRef, Vec<FileRef>> = HashMap::new();
+            for &(parent, child) in edges {
+                children
+                    .entry(fileref(parent, 1))
+                    .or_default()
+                    .push(fileref(child, 1));
+            }
+            DirectoryGraph {
+                nodes: node_map,
+                root: fileref(root_record_no, 1),
+                children,
+                system_metadata_size_bytes: 0,
+                diagnostics: GraphDiagnostics::default(),
+                excluded_subtree_size_bytes: 0,
+            }
+        }
+
+        pub(super) fn config(min_size_mb: u64, presets: Vec<Preset>) -> Config {
+            Config {
+                schema_version: 1,
+                repository: "D:\\repo".into(),
+                scan: ScanConfig {
+                    min_size_mb,
+                    exclude_paths: Vec::new(),
+                },
+                presets,
+            }
+        }
+
+        pub(super) fn preset(path: &str) -> Preset {
+            Preset {
+                id: "cache".into(),
+                name: "Cache".into(),
+                category: PresetCategory::DevCache,
+                match_paths: vec![path.into()],
+                match_processes: Vec::new(),
+                auto_migrate: true,
+                target_subdir: "cache".into(),
+            }
+        }
+
+        pub(super) fn migration(
+            id: &str,
+            source: &str,
+            target: &Path,
+            status: MigrationStatus,
+        ) -> Migration {
+            Migration {
+                id: id.into(),
+                schema_version: 1,
+                source: source.into(),
+                target: target.to_string_lossy().into(),
+                old_path: String::new(),
+                preset: None,
+                created_at: "2026-07-20T00:00:00Z".into(),
+                status,
+                source_volume_serial: "C".into(),
+                target_volume_serial: "D".into(),
+                recycle_bin_ref: String::new(),
+                pending_cleanup: None,
+            }
+        }
+
+        #[test]
+        fn annotation_marks_preset_junction_and_target_size_without_changing_occupancy() {
+            let target = tempfile::tempdir().unwrap();
+            let path = "C:\\Users\\alice\\Cache";
+            let mut graph = make_graph(
+                vec![
+                    node(5, "C:\\", 0, 4096, None, false),
+                    node(20, path, 1, 4096, Some(0xA0000003), false),
+                ],
+                &[(5, 20)],
+                5,
+            );
+            let cfg = config(1, vec![preset(path)]);
+            let migrations = vec![migration("m1", path, target.path(), MigrationStatus::Active)];
+            annotate_graph_with_callbacks(
+                &mut graph,
+                &cfg,
+                &migrations,
+                &|_| true,
+                &|_| true,
+                &|_| 777,
+                0,
+            );
+
+            let annotated = &graph.nodes[&fileref(20, 1)];
+            assert_eq!(annotated.matched_preset.as_deref(), Some("cache"));
+            assert_eq!(annotated.category, Some(PresetCategory::DevCache));
+            assert!(annotated.auto_migrate);
+            assert!(annotated.is_junction);
+            assert_eq!(annotated.scan_status, Some(ScanItemStatus::Migrated));
+            assert_eq!(annotated.migration_id.as_deref(), Some("m1"));
+            assert_eq!(annotated.linked_target_size_bytes, Some(777));
+            assert_eq!(annotated.subtree_size_bytes, 4096);
+        }
+
+        #[test]
+        fn annotation_status_priority_is_broken_then_pending_then_migrated_then_existing() {
+            let target = tempfile::tempdir().unwrap();
+            let path = "C:\\data";
+            let cfg = config(0, Vec::new());
+
+            let statuses = vec![
+                MigrationStatus::Active,
+                MigrationStatus::PendingManualConfirm,
+                MigrationStatus::OldPendingDelete,
+            ];
+            let migrations = statuses
+                .into_iter()
+                .enumerate()
+                .map(|(i, status)| migration(&format!("m{i}"), path, target.path(), status))
+                .collect::<Vec<_>>();
+            let mut broken = make_graph(
+                vec![
+                    node(5, "C:\\", 0, 0, None, false),
+                    node(20, path, 1, 0, Some(1), false),
+                ],
+                &[(5, 20)],
+                5,
+            );
+            annotate_graph_with_callbacks(
+                &mut broken,
+                &cfg,
+                &migrations,
+                &|_| true,
+                &|_| false,
+                &|_| 0,
+                0,
+            );
+            assert_eq!(
+                broken.nodes[&fileref(20, 1)].scan_status,
+                Some(ScanItemStatus::LinkBroken)
+            );
+
+            let pending = vec![migration(
+                "pending",
+                path,
+                target.path(),
+                MigrationStatus::PendingManualConfirm,
+            )];
+            let mut graph_pending = make_graph(
+                vec![
+                    node(5, "C:\\", 0, 0, None, false),
+                    node(20, path, 1, 0, Some(1), false),
+                ],
+                &[(5, 20)],
+                5,
+            );
+            annotate_graph_with_callbacks(
+                &mut graph_pending,
+                &cfg,
+                &pending,
+                &|_| true,
+                &|_| true,
+                &|_| 0,
+                0,
+            );
+            assert_eq!(
+                graph_pending.nodes[&fileref(20, 1)].scan_status,
+                Some(ScanItemStatus::MigrationPending)
+            );
+
+            let active = vec![migration("active", path, target.path(), MigrationStatus::Active)];
+            let mut graph_active = make_graph(
+                vec![
+                    node(5, "C:\\", 0, 0, None, false),
+                    node(20, path, 1, 0, Some(1), false),
+                ],
+                &[(5, 20)],
+                5,
+            );
+            annotate_graph_with_callbacks(
+                &mut graph_active,
+                &cfg,
+                &active,
+                &|_| true,
+                &|_| true,
+                &|_| 0,
+                0,
+            );
+            assert_eq!(
+                graph_active.nodes[&fileref(20, 1)].scan_status,
+                Some(ScanItemStatus::Migrated)
+            );
+
+            let mut existing = make_graph(
+                vec![
+                    node(5, "C:\\", 0, 0, None, false),
+                    node(20, path, 1, 0, Some(1), false),
+                ],
+                &[(5, 20)],
+                5,
+            );
+            annotate_graph_with_callbacks(
+                &mut existing,
+                &cfg,
+                &[],
+                &|_| true,
+                &|_| true,
+                &|_| 0,
+                0,
+            );
+            assert_eq!(
+                existing.nodes[&fileref(20, 1)].scan_status,
+                Some(ScanItemStatus::ExistingLink)
+            );
+        }
+
+        #[test]
+        fn annotation_reparse_without_confirmed_junction_is_not_existing_link() {
+            let path = "C:\\not-a-junction";
+            let mut graph = make_graph(
+                vec![
+                    node(5, "C:\\", 0, 0, None, false),
+                    node(20, path, 1, 0, Some(1), false),
+                ],
+                &[(5, 20)],
+                5,
+            );
+            annotate_graph_with_callbacks(
+                &mut graph,
+                &config(0, Vec::new()),
+                &[],
+                &|_| false,
+                &|_| true,
+                &|_| 0,
+                0,
+            );
+            assert!(!graph.nodes[&fileref(20, 1)].is_junction);
+            assert_eq!(graph.nodes[&fileref(20, 1)].scan_status, None);
+        }
+
+        #[test]
+        fn annotation_propagates_migrated_before_link_and_stops_on_cycles() {
+            let target = tempfile::tempdir().unwrap();
+            let mut graph = make_graph(
+                vec![
+                    node(5, "C:\\", 0, 0, None, false),
+                    node(20, "C:\\parent", 1, 0, None, false),
+                    node(30, "C:\\parent\\migrated", 2, 0, None, false),
+                    node(40, "C:\\parent\\link", 2, 0, Some(1), false),
+                ],
+                &[(5, 20), (20, 30), (20, 40), (30, 20)],
+                5,
+            );
+            let migrations = vec![migration(
+                "m1",
+                "C:\\parent\\migrated",
+                target.path(),
+                MigrationStatus::Active,
+            )];
+            annotate_graph_with_callbacks(
+                &mut graph,
+                &config(0, Vec::new()),
+                &migrations,
+                &|_| true,
+                &|_| true,
+                &|_| 0,
+                0,
+            );
+            assert_eq!(
+                graph.nodes[&fileref(30, 1)].scan_status,
+                Some(ScanItemStatus::Migrated)
+            );
+            assert_eq!(
+                graph.nodes[&fileref(40, 1)].scan_status,
+                Some(ScanItemStatus::ExistingLink)
+            );
+            assert_eq!(
+                graph.nodes[&fileref(20, 1)].scan_status,
+                Some(ScanItemStatus::ContainsMigrated)
+            );
+            assert_eq!(
+                graph.nodes[&fileref(5, 1)].scan_status,
+                Some(ScanItemStatus::ContainsMigrated)
+            );
+        }
+    }
+
+    mod visibility {
+        use super::annotation::*;
+        use super::*;
+
+        #[test]
+        fn visibility_uses_subtree_size_and_forced_ancestor_chain() {
+            let mut graph = make_graph(
+                vec![
+                    node(5, "C:\\", 0, 1, None, false),
+                    node(20, "C:\\big", 1, 1024 * 1024, None, false),
+                    node(30, "C:\\big\\small", 2, 1, None, false),
+                    node(40, "C:\\preset", 1, 1, None, false),
+                    node(50, "C:\\inaccessible", 1, 1, None, false),
+                    node(60, "C:\\hidden", 1, 1, None, false),
+                ],
+                &[(5, 20), (20, 30), (5, 40), (5, 50), (5, 60)],
+                5,
+            );
+            graph.nodes
+                .get_mut(&fileref(50, 1))
+                .unwrap()
+                .access_state = AccessState::Inaccessible;
+            let mut preset = preset("C:\\preset");
+            preset.id = "preset".into();
+            annotate_graph_with_callbacks(
+                &mut graph,
+                &config(1, vec![preset]),
+                &[],
+                &|_| false,
+                &|_| true,
+                &|_| 0,
+                0,
+            );
+            assert!(graph.nodes[&fileref(5, 1)].visible); // navigation ancestor
+            assert!(graph.nodes[&fileref(20, 1)].visible); // large directory
+            assert!(!graph.nodes[&fileref(30, 1)].visible); // ordinary small descendant
+            assert!(graph.nodes[&fileref(40, 1)].visible); // preset
+            assert!(graph.nodes[&fileref(50, 1)].visible); // inaccessible
+            assert!(!graph.nodes[&fileref(60, 1)].visible);
+        }
+
+        #[test]
+        fn visibility_min_zero_shows_normal_nodes_but_never_excluded_nodes() {
+            let mut graph = make_graph(
+                vec![
+                    node(5, "C:\\", 0, 0, None, false),
+                    node(20, "C:\\normal", 1, 0, None, false),
+                    node(30, "C:\\excluded", 1, u64::MAX, None, true),
+                ],
+                &[(5, 20), (5, 30)],
+                5,
+            );
+            annotate_graph_with_callbacks(
+                &mut graph,
+                &config(0, Vec::new()),
+                &[],
+                &|_| false,
+                &|_| true,
+                &|_| 0,
+                0,
+            );
+            assert!(graph.nodes[&fileref(5, 1)].visible);
+            assert!(graph.nodes[&fileref(20, 1)].visible);
+            assert!(!graph.nodes[&fileref(30, 1)].visible);
+        }
+    }
+
+    mod root_summary {
+        use super::annotation::*;
+        use super::*;
+
+        #[test]
+        fn root_summary_uses_actual_root_ref_and_saturates_total() {
+            let root = fileref(5, 42);
+            let mut root_node = node(5, "C:\\", 0, 0, None, false);
+            root_node.file_ref = root;
+            root_node.direct_file_size_bytes = u64::MAX - 3;
+            root_node.direct_file_count = 7;
+            let mut graph = make_graph(vec![root_node], &[], 5);
+            graph.root = root;
+            graph.system_metadata_size_bytes = 10;
+
+            let summary = build_root_summary(&graph, 2);
+            assert_eq!(summary.direct_file_size_bytes, u64::MAX - 3);
+            assert_eq!(summary.direct_file_count, 7);
+            assert_eq!(summary.system_metadata_size_bytes, Some(10));
+            assert_eq!(summary.total_known_size_bytes, u64::MAX);
+            assert!(summary.incomplete);
+        }
+
+        #[test]
+        fn root_summary_is_complete_when_no_mft_records_are_skipped() {
+            let mut root_node = node(5, "C:\\", 0, 123, None, false);
+            root_node.direct_file_size_bytes = 123;
+            root_node.direct_file_count = 1;
+            let graph = make_graph(vec![root_node], &[], 5);
+            let summary = build_root_summary(&graph, 0);
+            assert_eq!(summary.system_metadata_size_bytes, Some(0));
+            assert!(!summary.incomplete);
+            assert_eq!(summary.total_known_size_bytes, 123);
         }
     }
 }
