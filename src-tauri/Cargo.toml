@@ -37,6 +37,8 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

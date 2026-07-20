@@ -213,7 +213,7 @@ impl Drop for VolumeHandle {
     }
 }
 
-/// 卷读取失败的分类错误。T0 仅引入枚举本身，T1 才整合到全局 AppError。
+/// 卷读取失败的分类错误。T0 仅引入枚举本身，T7 结构化 scan_drive 时整合到全局 AppError。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VolumeError {
     /// `ERROR_ACCESS_DENIED` 精确映射——非管理员、卷被独占等。
@@ -243,6 +243,30 @@ impl std::fmt::Display for VolumeError {
 }
 
 impl std::error::Error for VolumeError {}
+
+/// UAC 提权启动结果。
+///
+/// 三分支明确区分：成功启动新提权进程、用户取消、启动失败。
+/// 失败分支保留 ShellExecuteW 返回的原始数值 code，便于上层记录与排错。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElevationOutcome {
+    /// 已以 `runas` 启动新进程（ShellExecuteW 返回值 > 32）。
+    Launched,
+    /// 用户在 UAC 对话框选择取消（返回值 == ERROR_CANCELLED / 1223）。
+    Cancelled,
+    /// 启动失败，code 为 ShellExecuteW 返回值（<= 32 且非 1223）。
+    Failed { code: u32 },
+}
+
+impl std::fmt::Display for ElevationOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ElevationOutcome::Launched => f.write_str("已启动提权进程"),
+            ElevationOutcome::Cancelled => f.write_str("用户取消 UAC 提权"),
+            ElevationOutcome::Failed { code } => write!(f, "UAC 提权启动失败，code={code}"),
+        }
+    }
+}
 
 /// 单条 MFT 记录的字节视图（`file_reference` 取低 48 位记录号语义，
 /// `bytes` 为 `FileRecordBuffer` 的实际有效字节）。
@@ -345,15 +369,25 @@ fn parse_volume_data_buffer(bytes: &[u8]) -> Result<VolumeData, VolumeError> {
     let bytes_per_cluster = read_u32_at(bytes, VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET)?;
     let bytes_per_file_record_segment =
         read_u32_at(bytes, VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET)?;
-    let mft_valid_data_length = read_u64_at(bytes, VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET)?;
+    let mft_valid_data_length_i64 = read_i64_at(bytes, VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET)?;
 
     if bytes_per_file_record_segment == 0 {
         // 避免除零；只可能由零填充被误解析成字段触发。
         return Err(VolumeError::InvalidVolumeData);
     }
 
+    // MftValidDataLength 是 signed i64，负值在物理上非法。
+    if mft_valid_data_length_i64 < 0 {
+        return Err(VolumeError::InvalidVolumeData);
+    }
+    let mft_valid_data_length = mft_valid_data_length_i64 as u64;
+
+    // 向上取整槽位数，同时防止 (mft_valid_data_length + record_size - 1) 溢出。
+    let record_size = u64::from(bytes_per_file_record_segment);
     let slot_count = mft_valid_data_length
-        .div_ceil(u64::from(bytes_per_file_record_segment));
+        .checked_add(record_size - 1)
+        .map(|sum| sum / record_size)
+        .ok_or(VolumeError::InvalidVolumeData)?;
 
     Ok(VolumeData {
         bytes_per_sector,
@@ -442,6 +476,12 @@ fn assemble_volume_data(bytes: &[u8], bytes_returned: usize) -> Result<VolumeDat
     data.major_version = major;
     data.minor_version = minor;
 
+    // T1：只接受明确的 NTFS 3.1（Windows XP+ 及当前所有 Windows 版本使用的版本）。
+    // 其它版本号（3.0、3.2 及更早）在驱动 ABI 上未经验证，拒绝以避免误解析。
+    if data.major_version != 3 || data.minor_version != 1 {
+        return Err(VolumeError::InvalidVolumeData);
+    }
+
     Ok(data)
 }
 
@@ -463,6 +503,14 @@ fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64, VolumeError> {
     let mut arr = [0u8; 8];
     arr.copy_from_slice(slice);
     Ok(u64::from_le_bytes(arr))
+}
+
+/// 从字节切片读取小端 i64，越界返回 InvalidVolumeData。
+fn read_i64_at(bytes: &[u8], offset: usize) -> Result<i64, VolumeError> {
+    let slice = bytes.get(offset..offset + 8).ok_or(VolumeError::InvalidVolumeData)?;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(slice);
+    Ok(i64::from_le_bytes(arr))
 }
 
 /// `NTFS_FILE_RECORD_OUTPUT_BUFFER` 中 `FileRecordBuffer` 的字节偏移。
@@ -752,6 +800,57 @@ pub fn read_mft_record(
     })
 }
 
+// ===== UAC 提权封装 =====
+
+/// 把 `ShellExecuteW` 的 HINSTANCE 返回值分类为三分支结果。
+///
+/// 纯函数，无 Win32 调用，可单测。
+pub fn classify_shell_result(hinst: isize) -> ElevationOutcome {
+    use windows::Win32::Foundation::ERROR_CANCELLED;
+    // ERROR_CANCELLED(1223) 本身是 >32 的数值，但语义上属于用户取消，必须优先判断。
+    if hinst == ERROR_CANCELLED.0 as isize {
+        ElevationOutcome::Cancelled
+    } else if hinst > 32 {
+        ElevationOutcome::Launched
+    } else {
+        ElevationOutcome::Failed { code: hinst as u32 }
+    }
+}
+
+/// 以管理员权限重新启动当前可执行文件。
+///
+/// - exe 路径取自 `std::env::current_exe()`，用 `OsStrExt::encode_wide` 编码为宽字符，不以
+///   `to_string_lossy()` 中转，避免非 UTF-8 路径字节丢失。
+/// - 使用 `ShellExecuteW` + `runas` verb；不主动退出旧实例。
+/// - 返回 `ElevationOutcome` 三分支：成功启动 / 用户取消 / 启动失败。
+#[cfg(windows)]
+pub fn request_elevation() -> Result<ElevationOutcome, VolumeError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    let exe = std::env::current_exe().map_err(|e| VolumeError::Io {
+        code: e.raw_os_error().map(|c| c as u32).unwrap_or(u32::MAX),
+        operation: "request_elevation/current_exe",
+    })?;
+    let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let verb = to_wide("runas");
+
+    let hinst = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(exe_wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+
+    Ok(classify_shell_result(hinst.0 as isize))
+}
+
 // ===== 非 windows 平台 stub（保证 cargo build 通过） =====
 
 #[cfg(not(windows))]
@@ -774,14 +873,10 @@ pub fn read_volume_data(_vol: &VolumeHandle) -> Result<VolumeData, VolumeError> 
 }
 
 #[cfg(not(windows))]
-pub fn read_mft_record(
-    _vol: &VolumeHandle,
-    _file_reference: u64,
-    _record_capacity_bytes: u32,
-) -> Result<RawFileRecord, VolumeError> {
+pub fn request_elevation() -> Result<ElevationOutcome, VolumeError> {
     Err(VolumeError::Io {
         code: u32::MAX,
-        operation: "read_mft_record/not_windows",
+        operation: "request_elevation/not_windows",
     })
 }
 
@@ -1313,5 +1408,116 @@ mod tests {
             }
             other => panic!("期望 Io 变体，得到 {:?}", other),
         }
+    }
+
+    // ===== T1 生产接口与 UAC 边界单测 =====
+
+    fn valid_volume_data_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; VOLUME_DATA_BUFFER_SIZE + 16];
+        bytes[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1_048_576u64.to_le_bytes());
+        let ext_off = VOLUME_DATA_BUFFER_SIZE;
+        bytes[ext_off..ext_off + 4].copy_from_slice(&16u32.to_le_bytes());
+        bytes[ext_off + 4..ext_off + 6].copy_from_slice(&3u16.to_le_bytes());
+        bytes[ext_off + 6..ext_off + 8].copy_from_slice(&1u16.to_le_bytes());
+        bytes
+    }
+
+    /// T1：open_volume 拒绝非 ASCII 字母盘符，不得静默当 C/A 处理。
+    #[test]
+    fn open_volume_rejects_non_ascii_letter() {
+        assert!(open_volume('1').is_err(), "数字盘符必须被拒绝");
+        assert!(open_volume('/').is_err(), "符号盘符必须被拒绝");
+        assert!(open_volume('中').is_err(), "非 ASCII 字母必须被拒绝");
+    }
+
+    /// T1：MftValidDataLength 为负时返回 InvalidVolumeData。
+    #[test]
+    fn parse_volume_data_buffer_negative_valid_data_length() {
+        let mut bytes = valid_volume_data_bytes();
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&(-1i64).to_le_bytes());
+
+        let result = parse_volume_data_buffer(&bytes);
+        assert!(result.is_err(), "负 MftValidDataLength 必须返回 InvalidVolumeData");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+    }
+
+    /// T1：slot_count 向上取整计算必须防溢出，不得 panic/wrap。
+    #[test]
+    fn parse_volume_data_buffer_slot_count_no_overflow() {
+        let mut bytes = valid_volume_data_bytes();
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let result = parse_volume_data_buffer(&bytes);
+        assert!(result.is_err(), "slot_count 溢出必须返回 InvalidVolumeData");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+    }
+
+    /// T1：明确拒绝 NTFS 3.0。
+    #[test]
+    fn assemble_volume_data_rejects_ntfs30() {
+        let mut bytes = valid_volume_data_bytes();
+        let ext_off = VOLUME_DATA_BUFFER_SIZE;
+        bytes[ext_off + 6..ext_off + 8].copy_from_slice(&0u16.to_le_bytes());
+
+        let result = assemble_volume_data(&bytes, VOLUME_DATA_BUFFER_SIZE + 16);
+        assert!(result.is_err(), "NTFS 3.0 必须被拒绝");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+    }
+
+    /// T1：明确拒绝 NTFS 3.2。
+    #[test]
+    fn assemble_volume_data_rejects_ntfs32() {
+        let mut bytes = valid_volume_data_bytes();
+        let ext_off = VOLUME_DATA_BUFFER_SIZE;
+        bytes[ext_off + 6..ext_off + 8].copy_from_slice(&2u16.to_le_bytes());
+
+        let result = assemble_volume_data(&bytes, VOLUME_DATA_BUFFER_SIZE + 16);
+        assert!(result.is_err(), "NTFS 3.2 必须被拒绝");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+    }
+
+    /// T1：classify_shell_result 纯函数映射测试。
+    #[test]
+    fn classify_shell_result_success() {
+        assert_eq!(classify_shell_result(33), ElevationOutcome::Launched);
+        assert_eq!(classify_shell_result(100), ElevationOutcome::Launched);
+    }
+
+    #[test]
+    fn classify_shell_result_cancelled() {
+        assert_eq!(classify_shell_result(1223), ElevationOutcome::Cancelled);
+    }
+
+    #[test]
+    fn classify_shell_result_failed() {
+        assert_eq!(classify_shell_result(0), ElevationOutcome::Failed { code: 0 });
+        assert_eq!(classify_shell_result(2), ElevationOutcome::Failed { code: 2 });
+        assert_eq!(classify_shell_result(31), ElevationOutcome::Failed { code: 31 });
+    }
+
+    /// T1：request_elevation 真实 Win32 调用手动 gate 测试。
+    ///
+    /// 普通 `cargo test` 跳过；设置 DAYU_MANUAL_ELEVATION_TEST=1 才会实际尝试提权。
+    /// 测试只确认函数可调用并返回三分支之一，不作成功断言。
+    #[cfg(windows)]
+    #[test]
+    fn request_elevation_manual_gate() {
+        if std::env::var("DAYU_MANUAL_ELEVATION_TEST").unwrap_or_default() != "1" {
+            eprintln!("跳过 request_elevation 手动测试；设置 DAYU_MANUAL_ELEVATION_TEST=1 以启用");
+            return;
+        }
+        let outcome = request_elevation().expect("request_elevation 在 current_exe 失败时不应 panic");
+        println!("request_elevation outcome: {}", outcome);
     }
 }
