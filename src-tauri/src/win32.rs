@@ -377,8 +377,10 @@ fn parse_volume_data_buffer(bytes: &[u8]) -> Result<VolumeData, VolumeError> {
 ///   MinorVersion: u16 @ 6
 ///   BytesPerPhysicalSector: u32 @ 8
 ///   ...
+/// - 微软 ABI：`ByteCount` 是 NTFS_EXTENDED_VOLUME_DATA 结构本身的总大小
+///   （包含 ByteCount 字段自身），由驱动设置；不可理解为"不含自身的后续长度"。
 /// - 必须按实际 `bytes_returned` 判断扩展结构是否完整，且校验 `ByteCount`
-///   真实反映内容大小（不是预分配容量）。
+///   真实反映结构总大小（不是预分配容量）。
 fn parse_extended_volume_data(
     bytes: &[u8],
     bytes_returned: usize,
@@ -394,13 +396,13 @@ fn parse_extended_volume_data(
         return Err(VolumeError::InvalidVolumeData);
     }
     let byte_count = read_u32_at(bytes, 0)?;
-    // ByteCount 是驱动实际写入的字节数（不含自身字段），用于校验完整性。
-    // 我们要求它至少覆盖到 MinorVersion（4 字节）。
-    if (byte_count as usize) < 4 {
+    // ByteCount 是 NTFS_EXTENDED_VOLUME_DATA 结构总大小（含自身 4 字节）。
+    // 我们要求它至少覆盖到 MinorVersion 字段末尾（offset 6 + 2 = 8）。
+    if (byte_count as usize) < MIN_EXTENDED_BYTES {
         return Err(VolumeError::InvalidVolumeData);
     }
-    // ByteCount + 4（自身头部）不能多于驱动实际返回的字节数。
-    if (byte_count as usize + 4) > bytes_returned {
+    // ByteCount 不能超过驱动实际返回的字节数。
+    if (byte_count as usize) > bytes_returned {
         return Err(VolumeError::InvalidVolumeData);
     }
     let major = read_u16_at(bytes, 4)?;
@@ -957,17 +959,17 @@ mod tests {
         assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
-    /// 0.2-3b：给定截断的扩展卷数据（ByteCount 声称有版本号但 bytes_returned 不够）。
+    /// 0.2-3b：给定截断的扩展卷数据（ByteCount 含自身且超过 bytes_returned）时返回错误。
     #[test]
     fn parse_extended_volume_data_byte_count_exceeds_returned() {
-        let mut bytes = vec![0u8; 16];
-        // ByteCount = 100（声称写入 100 字节，不含自身 4 字节）
-        bytes[0..4].copy_from_slice(&100u32.to_le_bytes());
+        let mut bytes = vec![0u8; 32];
+        // ByteCount = 40（含自身，声称结构总大小 40 字节）
+        bytes[0..4].copy_from_slice(&40u32.to_le_bytes());
         // MajorVersion = 3, MinorVersion = 1
         bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
         bytes[6..8].copy_from_slice(&1u16.to_le_bytes());
-        // bytes_returned = 8（但 ByteCount + 4 = 104 > 8）
-        let result = parse_extended_volume_data(&bytes, 8);
+        // bytes_returned = 32（ByteCount 40 > 32）
+        let result = parse_extended_volume_data(&bytes, 32);
         assert!(result.is_err(), "ByteCount 超过实际返回必须返回错误");
         assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
@@ -985,11 +987,13 @@ mod tests {
     }
 
     /// 0.2-3d：合法扩展卷数据正确解析。
+    ///
+    /// 真机语义：`ByteCount` 是 NTFS_EXTENDED_VOLUME_DATA 结构总大小（含自身）。
     #[test]
     fn parse_extended_volume_data_valid() {
         let mut bytes = vec![0u8; 32];
-        // ByteCount = 8（4 字节版本号 + 4 字节 BytesPerPhysicalSector）
-        bytes[0..4].copy_from_slice(&8u32.to_le_bytes());
+        // ByteCount = 32（结构总大小，含自身 4 字节）
+        bytes[0..4].copy_from_slice(&32u32.to_le_bytes());
         // MajorVersion = 3, MinorVersion = 1
         bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
         bytes[6..8].copy_from_slice(&1u16.to_le_bytes());
@@ -1200,6 +1204,8 @@ mod tests {
 
     /// 重要 2 修复-d：assemble_volume_data 在合法完整输入下产出含版本号的
     /// VolumeData。
+    ///
+    /// 使用 ByteCount=16（扩展区实际长度，含自身 4 字节），验证"含自身"语义。
     #[test]
     fn assemble_volume_data_valid() {
         let mut bytes = vec![0u8; VOLUME_DATA_BUFFER_SIZE + 16];
@@ -1211,9 +1217,9 @@ mod tests {
             .copy_from_slice(&1024u32.to_le_bytes());
         bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
-        // 扩展结构：ByteCount=8, Major=3, Minor=1
+        // 扩展结构：ByteCount=16（含自身）, Major=3, Minor=1
         let ext_off = VOLUME_DATA_BUFFER_SIZE;
-        bytes[ext_off..ext_off + 4].copy_from_slice(&8u32.to_le_bytes());
+        bytes[ext_off..ext_off + 4].copy_from_slice(&16u32.to_le_bytes());
         bytes[ext_off + 4..ext_off + 6].copy_from_slice(&3u16.to_le_bytes());
         bytes[ext_off + 6..ext_off + 8].copy_from_slice(&1u16.to_le_bytes());
 
@@ -1224,6 +1230,59 @@ mod tests {
         assert_eq!(data.mft_valid_data_length, 1_048_576);
         assert_eq!(data.major_version, 3, "扩展数据中的版本号应被填入");
         assert_eq!(data.minor_version, 1);
+        assert_eq!(data.slot_count, 1024);
+    }
+
+    /// 黄金 fixture：控制者真机 C 盘 NTFS 3.1 扩展区字节，钉死 ABI 语义。
+    ///
+    /// 原始扩展区 32 字节（offset 96..128）：
+    ///   ByteCount=0x20（结构总大小，含自身）
+    ///   MajorVersion=3, MinorVersion=1
+    #[test]
+    fn parse_extended_volume_data_real_ntfs31_bytes() {
+        let ext_bytes: Vec<u8> = vec![
+            0x20, 0x00, 0x00, 0x00, // ByteCount = 32
+            0x03, 0x00, // MajorVersion = 3
+            0x01, 0x00, // MinorVersion = 1
+            0x00, 0x02, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0xff, 0xff,
+            0xff, 0xff, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+        ];
+        assert_eq!(ext_bytes.len(), 32);
+        let result = parse_extended_volume_data(&ext_bytes, 32);
+        assert_eq!(result.unwrap(), (3, 1));
+    }
+
+    /// 黄金 fixture：完整 FSCTL_GET_NTFS_VOLUME_DATA 输出（96 字节基础 + 32 字节扩展）。
+    ///
+    /// 扩展区使用控制者真机观测到的 32 字节；基础字段按典型 NTFS 几何填入。
+    #[test]
+    fn assemble_volume_data_real_ntfs31_bytes() {
+        let mut bytes = vec![0u8; VOLUME_DATA_BUFFER_SIZE + 32];
+        bytes[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        // 1024 个文件记录段 -> slot_count = 1024
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&(1024u64 * 1024u64).to_le_bytes());
+
+        let ext_off = VOLUME_DATA_BUFFER_SIZE;
+        let ext_bytes: &[u8] = &[
+            0x20, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x3e, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x40,
+        ];
+        bytes[ext_off..ext_off + ext_bytes.len()].copy_from_slice(ext_bytes);
+
+        let data = assemble_volume_data(&bytes, VOLUME_DATA_BUFFER_SIZE + 32).unwrap();
+        assert_eq!(data.bytes_per_sector, 512);
+        assert_eq!(data.bytes_per_cluster, 4096);
+        assert_eq!(data.bytes_per_file_record_segment, 1024);
+        assert_eq!(data.mft_valid_data_length, 1024u64 * 1024u64);
+        assert_eq!(data.major_version, 3, "真机扩展数据 MajorVersion 应为 3");
+        assert_eq!(data.minor_version, 1, "真机扩展数据 MinorVersion 应为 1");
         assert_eq!(data.slot_count, 1024);
     }
 
