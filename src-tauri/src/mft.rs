@@ -15,6 +15,8 @@
 //! 本模块的 [`parse_record`] 只保证返回的信息足以支撑 T2 的分类与合并决策。
 
 // ===== FILE header 字段偏移（集中常量定义，简报 3.2） =====
+
+use std::collections::HashSet;
 //
 // 这些常量来自 NTFS 官方文档的 FILE record 布局（与 windows 0.62 绑定/微软 SDK 一致）：
 //   0x00 FILE signature ('FILE')
@@ -231,6 +233,8 @@ pub struct MftName {
 ///   对 base record 携带 `$ATTRIBUTE_LIST`（如 big.bin），extension extent 在 T2 合并时累加。
 ///   同一 stream 的 extension extent 通过 `lowest_vcn != 0` 在本记录里被排除。
 /// - `reparse_tag` 仅解析 tag；本工具不在此判断是否为本工具的 junction。
+/// - `in_use` 来自 FILE header flags bit0（`FILE_RECORD_SEGMENT_IN_USE`），
+///   T2 可据此区分"未在用"与"在用但无名且大小 0"的记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MftRecord {
     /// 记录自身引用（record_no + header 的 sequence）。
@@ -243,6 +247,8 @@ pub struct MftRecord {
     pub logical_size: u64,
     /// 是否目录（FILE record flags bit1）。
     pub is_dir: bool,
+    /// 是否在用（FILE record flags bit0）。
+    pub in_use: bool,
     /// `$REPARSE_POINT` 的 tag（仅当该属性存在）。
     pub reparse_tag: Option<u32>,
     /// 该 base record 是否带有 non-resident `$ATTRIBUTE_LIST`。
@@ -255,7 +261,9 @@ pub struct MftRecord {
 /// 一段连续的簇分配（Data Run）。
 ///
 /// `start_lcn` 是起始逻辑簇号（可带符号：负偏移表示从前一段尾部的反向跳转，
-/// 解码时已按 NTFS 累加语义还原成绝对 LCN）；`length_clusters` 是该段簇数。
+/// 解码时已按 NTFS 累加语义还原成绝对 LCN）。**sparse extent**（无物理分配）
+/// 的 `start_lcn == 0`（NTFS 保留簇，`$MFT` 数据不可能在 LCN 0），T2 读取时
+/// 应跳过/补零；`length_clusters` 仍如实计入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataRun {
     pub start_lcn: i64,
@@ -553,17 +561,22 @@ pub fn decode_data_runs(bytes: &[u8]) -> Result<Vec<DataRun>, MftError> {
         };
 
         let start_lcn = if off_size == 0 {
-            // Sparse extent：LCN 不变（用前一段的 end 作为占位，length 仍计入）。
-            prev_end_lcn
+            // Sparse extent：无物理分配。start_lcn 设为 0（NTFS 保留簇，`$MFT`
+            // 数据不可能在 LCN 0），T2 读取时应跳过/补零。
+            0
         } else {
             prev_end_lcn.checked_add(signed_offset).ok_or(MftError::BadRecord {
                 ref_no: 0,
             })?
         };
-        // 累加位置用于下一段相对偏移（sparse 段也算占用长度推进 prev_end）。
-        prev_end_lcn = start_lcn
-            .checked_add(length_clusters as i64)
-            .ok_or(MftError::BadRecord { ref_no: 0 })?;
+        // 累加位置用于下一段相对偏移。**sparse 段不推进 prev_end**（无物理位置），
+        // 下一段 allocated 段仍以最近一个 allocated 段尾部为基准；allocated 段
+        // 用本段 length 推进 prev_end。
+        if off_size != 0 {
+            prev_end_lcn = start_lcn
+                .checked_add(length_clusters as i64)
+                .ok_or(MftError::BadRecord { ref_no: 0 })?;
+        }
 
         runs.push(DataRun {
             start_lcn,
@@ -836,14 +849,71 @@ pub fn parse_attribute_list_entries(
 
 /// 最小有效性检查：FILE 签名 + 足够容纳 bytes_in_use 字段的长度。
 ///
-/// 用于 [`parse_record`] 的 USA 降级路径：当 [`apply_usa_fixup`] 因 sector 尾部
-/// 既不匹配 USN 也不匹配 USA[i] 而失败时，若字节至少有合法 FILE 签名与最小
-/// header，则假设 IOCTL 已在上层完成 USA fix-up，直接用原字节继续解析。
+/// 仅检查签名与最小 header 长度；不验证 USA 几何或内容。**不可**单独用于
+/// USA 降级路径（会把真正损坏但签名尚存的记录当有效）——使用
+/// [`is_ioctl_fixed_record`] 区分"IOCTL 已修复"与"记录真损坏"。
 fn is_minimal_valid_record(bytes: &[u8]) -> bool {
     if bytes.len() < FILE_BYTES_IN_USE_OFFSET + 4 {
         return false;
     }
     bytes[0..4] == FILE_SIGNATURE
+}
+
+/// 判断一条记录字节是否为"`FSCTL_GET_NTFS_FILE_RECORD` 在现代 Windows 上
+/// 返回的已 USA 修复字节"。
+///
+/// 现代版本的 IOCTL 返回的记录中，sector 尾部已是应用数据（USA 已应用），
+/// USA 数组区域被归零或从未写入——典型特征是 USA 替换数组（`USA[1..usa_count]`）
+/// **全为零**。此时 [`apply_usa_fixup`] 会因 sector 尾部既不匹配 USN 也不匹配
+/// USA[i] 而失败，但字节本身是正确的（已 fix-up），应降级用原字节。
+///
+/// 区分"IOCTL 已修复"与"记录真损坏"的判定（全部满足才降级）：
+/// 1. FILE 签名正确；
+/// 2. 长度至少能容纳 bytes_in_use 字段；
+/// 3. USA 几何一致（`usa_count == record_len / bytes_per_sector + 1`，
+///    且 `record_len` 是 `bytes_per_sector` 的整数倍）；
+/// 4. USA 替换数组（从 `usa_offset + 2` 起的 `(usa_count - 1) * 2` 字节，
+///    即 `USA[1..usa_count]`）**全部为零**。
+///
+/// 若 USA 替换数组非全零，说明 USA 被真实写入、记录本应做 fix-up 却 fix-up
+/// 失败（sector 尾部与 USN/USA 都不匹配）——这是真损坏，**不**降级。
+pub(crate) fn is_ioctl_fixed_record(bytes: &[u8], bytes_per_sector: u32) -> bool {
+    if !is_minimal_valid_record(bytes) {
+        return false;
+    }
+    let record_len = bytes.len();
+    let bps = bytes_per_sector as usize;
+    if bps == 0 || !record_len.is_multiple_of(bps) {
+        return false;
+    }
+    let usa_offset = match read_u16_at(bytes, FILE_USA_OFFSET_OFFSET, 0) {
+        Ok(v) => v as usize,
+        Err(_) => return false,
+    };
+    let usa_count = match read_u16_at(bytes, FILE_USA_COUNT_OFFSET, 0) {
+        Ok(v) => v as usize,
+        Err(_) => return false,
+    };
+    let expected_count = record_len / bps + 1;
+    if usa_count != expected_count {
+        return false;
+    }
+    // USA 数组（含 USN 自身）必须完整落在 record 内。
+    let usa_total_bytes = match usa_count.checked_mul(2) {
+        Some(total) if usa_offset + total <= record_len => total,
+        _ => return false,
+    };
+    // 替换数组从 USA[1] 开始（USN 在 USA[0]，占 2 字节），
+    // 长度 (usa_count - 1) * 2 字节。
+    let repl_start = usa_offset + 2;
+    let repl_len = usa_total_bytes.saturating_sub(2);
+    if repl_start + repl_len > record_len {
+        return false;
+    }
+    // 全零检查（usa_count>=2 时 repl_len>=2，有实际替换项可检查）。
+    bytes[repl_start..repl_start + repl_len]
+        .iter()
+        .all(|&b| b == 0)
 }
 
 // ===== 核心：parse_record（简报 3.3-3.5） =====
@@ -873,12 +943,15 @@ pub fn parse_record(
     bytes_per_sector: u32,
 ) -> Result<MftRecord, MftError> {
     // 1. USA fix-up（在副本上）。现代 Windows 的 FSCTL_GET_NTFS_FILE_RECORD 返回的
-    //    字节中，sector 尾部通常已是应用数据（USA 已修复），USA 数组不可信。
+    //    字节中，sector 尾部通常已是应用数据（USA 已修复），USA 数组区域被归零。
     //    此时 apply_usa_fixup 会因尾部既不匹配 USN 也不匹配 USA[i] 而返回 BadRecord。
-    //    降级路径：直接使用原始字节（仅验证签名与最小长度）。
+    //    降级路径：当字节满足 is_ioctl_fixed_record（USA 替换数组全零，表明 IOCTL
+    //    已 fix-up 而 USA 数组从未写入或已过时归零）时，直接使用原字节。
+    //    若 USA 替换数组非全零（说明 USA 被真实写入、本应 fix-up 却失败 = 真损坏），
+    //    不降级、返回 BadRecord。
     let fixed = match apply_usa_fixup(bytes, record_no, bytes_per_sector) {
         Ok(fixed) => fixed,
-        Err(MftError::BadRecord { .. }) if is_minimal_valid_record(bytes) => {
+        Err(MftError::BadRecord { .. }) if is_ioctl_fixed_record(bytes, bytes_per_sector) => {
             // IOCTL 已修复 USA；原字节可直接用。
             bytes.to_vec()
         }
@@ -910,6 +983,7 @@ pub fn parse_record(
             names: Vec::new(),
             logical_size: 0,
             is_dir,
+            in_use: false,
             reparse_tag: None,
             has_nonresident_attr_list: false,
         });
@@ -923,9 +997,11 @@ pub fn parse_record(
     let mut reparse_tag: Option<u32> = None;
     let mut has_nonresident_attr_list = false;
     // 用于 `$DATA` 同 stream 去重：每个 (name, attribute_id) 只在 lowest_vcn==0
-    // 时累计一次逻辑大小（简报 3.3：extension extent 不重复累计）。
-    // 注意：同一条记录里出现同 stream 多 extent 是少见但合法的情况；此处仅做
-    // 防御性去重，真正跨记录的 extension extent 合并在 T2 完成。
+    // 时累计一次逻辑大小（简报 3.3：extension extent 不重复累计，stream identity
+    // 含属性名称与 attribute id）。resident `$DATA` 同理（每对 (name, attr_id)
+    // 只累加一次）。unnamed `$DATA` 的 name 为空字符串，同样纳入去重键。
+    // 真正跨记录的 extension extent 合并在 T2 完成。
+    let mut seen_data_streams: HashSet<(String, u16)> = HashSet::new();
 
     for attr in &attrs {
         match attr.type_ {
@@ -943,18 +1019,21 @@ pub fn parse_record(
                 // 只累加未命名 `$DATA` 与文件命名流（ADS）。
                 // 简报 4.3：non-resident `$DATA` 读 logical size；resident
                 // 读 value length。lowest_vcn==0 保证一 stream 只累计一次。
+                // 简报 3.3：stream identity = (name, attribute_id)；同一对
+                // 多次出现只累计一次（防御性去重，跨记录合并在 T2）。
+                let key = (attr.name.clone(), attr.attribute_id);
                 if attr.non_resident {
                     if attr.bytes.len() < ATTR_NONRESIDENT_HEADER_LEN {
                         return Err(MftError::BadRecord { ref_no: record_no });
                     }
                     let lowest_vcn =
                         read_u64_at(attr.bytes, ATTR_NONRES_LOWEST_VCN_OFFSET, record_no)?;
-                    if lowest_vcn == 0 {
+                    if lowest_vcn == 0 && seen_data_streams.insert(key) {
                         let logical =
                             read_u64_at(attr.bytes, ATTR_NONRES_LOGICAL_SIZE_OFFSET, record_no)?;
                         accumulate_data_size(&mut logical_size, attr, logical, record_no)?;
                     }
-                } else {
+                } else if seen_data_streams.insert(key) {
                     let value_length = read_u32_at(
                         attr.bytes,
                         ATTR_RESIDENT_VALUE_LENGTH_OFFSET,
@@ -999,6 +1078,7 @@ pub fn parse_record(
         names,
         logical_size,
         is_dir,
+        in_use: true,
         reparse_tag,
         has_nonresident_attr_list,
     })
@@ -1292,10 +1372,11 @@ mod tests {
 
     #[test]
     fn decode_data_runs_sparse_extent() {
-        // header 0x21 = len_size=1, off_size=2（用 2 字节 off 让 200/315 在正数范围内）
+        // header 0x21 = len_size=1, off_size=2（用 2 字节 off 让 200/310 在正数范围内）
         // 第一段：len=10, off=100（绝对 LCN=100，prev_end=110）
-        // 第二段：sparse（header 0x01：len_size=1, off_size=0），len=5（prev_end 推进到 115）
-        // 第三段：len=3, off=200（绝对 LCN = 115 + 200 = 315）
+        // 第二段：sparse（header 0x01：len_size=1, off_size=0），len=5（start_lcn=0；
+        //   sparse 不推进 prev_end，仍为 110）
+        // 第三段：len=3, off=200（绝对 LCN = 110 + 200 = 310）
         let runs_bytes = [
             0x21, 10, 100, 0,
             0x01, 5,
@@ -1306,9 +1387,41 @@ mod tests {
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[0].start_lcn, 100);
         assert_eq!(runs[0].length_clusters, 10);
-        assert_eq!(runs[1].start_lcn, 110); // sparse：占位用 prev_end
+        assert_eq!(runs[1].start_lcn, 0); // sparse：无物理分配
         assert_eq!(runs[1].length_clusters, 5);
-        assert_eq!(runs[2].start_lcn, 315);
+        assert_eq!(runs[2].start_lcn, 310); // prev_end 仍为 110（sparse 不推进）
+    }
+
+    #[test]
+    fn decode_data_runs_sparse_has_zero_lcn() {
+        // 单一 sparse extent：start_lcn 必须为 0。
+        let runs_bytes = [0x01, 7, 0x00];
+        let runs = decode_data_runs(&runs_bytes).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].start_lcn, 0);
+        assert_eq!(runs[0].length_clusters, 7);
+    }
+
+    #[test]
+    fn decode_data_runs_mixed_allocated_and_sparse() {
+        // [allocated, sparse, allocated] 序列：
+        //   第一段 allocated：len=10, off=100 -> start_lcn=100, prev_end=110
+        //   第二段 sparse：len=5 -> start_lcn=0，prev_end 保持 110（不推进）
+        //   第三段 allocated：len=3, off=50 -> start_lcn=110+50=160, prev_end=163
+        let runs_bytes = [
+            0x11, 10, 100,
+            0x01, 5,
+            0x11, 3, 50,
+            0x00,
+        ];
+        let runs = decode_data_runs(&runs_bytes).unwrap();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].start_lcn, 100);
+        assert_eq!(runs[0].length_clusters, 10);
+        assert_eq!(runs[1].start_lcn, 0);
+        assert_eq!(runs[1].length_clusters, 5);
+        assert_eq!(runs[2].start_lcn, 160);
+        assert_eq!(runs[2].length_clusters, 3);
     }
 
     // ===== sign_extend =====
@@ -1517,7 +1630,7 @@ mod tests {
         let parent_ref = (5u64 << 48) | 5u64; // record 5, seq 5
         let bytes = build_minimal_file_record(42, parent_ref, "hello.txt", 22);
         let rec = parse_record(&bytes, 42, 512).expect("合法记录应解析成功");
-        assert_eq_file_record(&rec, 42, 1, false, false);
+        assert_eq_file_record(&rec, 42, 1, false, false, true);
         assert_eq!(rec.logical_size, 22);
         assert_eq!(rec.names.len(), 1);
         assert_eq!(rec.names[0].name, "hello.txt");
@@ -1540,6 +1653,7 @@ mod tests {
         let rec = parse_record(&bytes, 42, 512).unwrap();
         assert!(rec.names.is_empty());
         assert_eq!(rec.logical_size, 0);
+        assert!(!rec.in_use, "in_use 应为 false");
     }
 
     #[test]
@@ -1603,6 +1717,181 @@ mod tests {
         assert!(matches!(err, MftError::BadRecord { ref_no: 42 }));
     }
 
+    // ===== USA 降级精确化（K1） =====
+
+    /// 构造一条"IOCTL 已修复"的记录：FILE 签名正确、USA 替换数组全零、
+    /// sector 尾部为应用数据（非 USN）。
+    fn build_ioctl_fixed_record(record_len: usize, bytes_per_sector: usize) -> Vec<u8> {
+        assert_eq!(record_len % bytes_per_sector, 0);
+        let mut buf = vec![0u8; record_len];
+        buf[0..4].copy_from_slice(b"FILE");
+        let usa_offset = 0x30usize;
+        let first_attr = 0x38usize;
+        let usa_count = record_len / bytes_per_sector + 1;
+        buf[0x04..0x06].copy_from_slice(&(usa_offset as u16).to_le_bytes());
+        buf[0x06..0x08].copy_from_slice(&(usa_count as u16).to_le_bytes());
+        buf[0x10..0x12].copy_from_slice(&1u16.to_le_bytes()); // sequence
+        buf[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
+        buf[0x16..0x18].copy_from_slice(&0x01u16.to_le_bytes()); // in use
+        buf[0x18..0x1C].copy_from_slice(&(record_len as u32).to_le_bytes());
+        // USN = 0（IOCTL 已修复的典型特征：USA 全零）
+        // USA 替换数组 [usa_offset+2 .. usa_offset+2*usa_count] 全零（buf 已初始化为零）
+        // sector 尾部放应用数据（非 USN），模拟 IOCTL 已 fix-up 的状态
+        for i in 1..usa_count {
+            let sector_end = i * bytes_per_sector - 2;
+            let app_data: u16 = 0xBB00 + i as u16;
+            buf[sector_end..sector_end + 2].copy_from_slice(&app_data.to_le_bytes());
+        }
+        // 写入 end marker（0xFFFFFFFF）以便 walk_attributes 停止
+        buf[first_attr..first_attr + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn parse_record_ioctl_fixed_zero_usa_array_degrades_safely() {
+        // 构造 USA 数组全零、sector 尾部为应用数据（非 USN）的记录。
+        // apply_usa_fixup 会因尾部既不匹配 USN(0) 也不匹配 USA[i](0) 而失败
+        // （因为尾部 0xBB01 != 0），但 is_ioctl_fixed_record 应识别 USA 替换
+        // 数组全零，降级用原字节。
+        let bytes = build_ioctl_fixed_record(1024, 512);
+        let rec = parse_record(&bytes, 99, 512).expect("IOCTL 已修复记录应降级成功");
+        assert_eq!(rec.id.record_no, 99);
+        assert_eq!(rec.id.sequence, 1);
+        assert!(rec.in_use);
+        assert!(!rec.is_dir);
+    }
+
+    #[test]
+    fn parse_record_real_corruption_with_nonzero_usa_rejected() {
+        // 构造 USA 数组非零、sector 尾部与 USN 不匹配的记录（模拟真损坏）。
+        // is_ioctl_fixed_record 应因 USA 替换数组非零而返回 false，
+        // parse_record 不降级、返回 BadRecord。
+        let mut bytes = build_ioctl_fixed_record(1024, 512);
+        // 在 USA 替换数组中写入非零值（模拟 USA 被真实写入）
+        let usa_offset = 0x30usize;
+        // USA[1] = 0xDEAD（非零替换值）
+        bytes[usa_offset + 2..usa_offset + 4].copy_from_slice(&0xDEADu16.to_le_bytes());
+        // sector 1 尾部仍为 0xBB01（既不匹配 USN=0 也不匹配 USA[1]=0xDEAD）
+        let err = parse_record(&bytes, 99, 512).unwrap_err();
+        assert!(
+            matches!(err, MftError::BadRecord { ref_no: 99 }),
+            "USA 非零且 sector 尾部不匹配时应返回 BadRecord，不降级"
+        );
+    }
+
+    #[test]
+    fn is_ioctl_fixed_record_allows_zero_usa_array() {
+        let bytes = build_ioctl_fixed_record(1024, 512);
+        assert!(
+            is_ioctl_fixed_record(&bytes, 512),
+            "USA 替换数组全零应被识别为 IOCTL 已修复"
+        );
+    }
+
+    #[test]
+    fn is_ioctl_fixed_record_rejects_nonzero_usa_array() {
+        let mut bytes = build_ioctl_fixed_record(1024, 512);
+        let usa_offset = 0x30usize;
+        bytes[usa_offset + 2..usa_offset + 4].copy_from_slice(&0x0001u16.to_le_bytes());
+        assert!(
+            !is_ioctl_fixed_record(&bytes, 512),
+            "USA 替换数组非零不应被识别为 IOCTL 已修复"
+        );
+    }
+
+    #[test]
+    fn is_ioctl_fixed_record_rejects_bad_signature() {
+        let mut bytes = build_ioctl_fixed_record(1024, 512);
+        bytes[0..4].copy_from_slice(b"BAAD");
+        assert!(!is_ioctl_fixed_record(&bytes, 512));
+    }
+
+    #[test]
+    fn is_ioctl_fixed_record_rejects_wrong_usa_count() {
+        let mut bytes = build_ioctl_fixed_record(1024, 512);
+        // 把 USA count 改成错误的值
+        bytes[0x06..0x08].copy_from_slice(&5u16.to_le_bytes());
+        assert!(!is_ioctl_fixed_record(&bytes, 512));
+    }
+
+    // ===== $DATA stream 去重（I3） =====
+
+    /// 构造一条含两个同 (name, attribute_id) 的 lowest_vcn==0 non-resident `$DATA`
+    /// 的记录（模拟损坏/异常），验证 logical_size 只累加一次。
+    fn build_duplicate_data_stream_record() -> Vec<u8> {
+        let record_len = 1024;
+        let bytes_per_sector = 512;
+        let usa_offset = 0x30usize;
+        let first_attr = 0x38usize;
+
+        let mut buf = vec![0u8; record_len];
+        buf[0..4].copy_from_slice(b"FILE");
+        buf[0x04..0x06].copy_from_slice(&(usa_offset as u16).to_le_bytes());
+        buf[0x06..0x08].copy_from_slice(&3u16.to_le_bytes()); // 1024/512+1
+        buf[0x10..0x12].copy_from_slice(&1u16.to_le_bytes()); // sequence
+        buf[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
+        buf[0x16..0x18].copy_from_slice(&0x01u16.to_le_bytes()); // in use
+        buf[0x18..0x1C].copy_from_slice(&(record_len as u32).to_le_bytes());
+
+        // 第一个 non-resident $DATA：unnamed, attr_id=0, lowest_vcn=0, logical_size=1000
+        let mut off = first_attr;
+        let data1_len = ATTR_NONRESIDENT_HEADER_LEN; // 0x40
+        let data1_padded = (data1_len + 7) & !7; // 0x40 已对齐
+        buf[off..off + 4].copy_from_slice(&0x80u32.to_le_bytes()); // $DATA
+        buf[off + 4..off + 8].copy_from_slice(&(data1_padded as u32).to_le_bytes());
+        buf[off + 8] = 1; // non-resident
+        buf[off + 9] = 0; // no attr name
+        buf[off + 0x0A..off + 0x0C].copy_from_slice(&0x40u16.to_le_bytes()); // name offset
+        buf[off + 0x0E..off + 0x10].copy_from_slice(&0u16.to_le_bytes()); // attr_id = 0
+        // non-resident specific fields
+        buf[off + 0x10..off + 0x18].copy_from_slice(&0u64.to_le_bytes()); // lowest_vcn = 0
+        buf[off + 0x18..off + 0x20].copy_from_slice(&0u64.to_le_bytes()); // highest_vcn
+        buf[off + 0x20..off + 0x22].copy_from_slice(&0x40u16.to_le_bytes()); // run offset
+        buf[off + 0x30..off + 0x38].copy_from_slice(&1000u64.to_le_bytes()); // logical_size
+        off += data1_padded;
+
+        // 第二个 non-resident $DATA：unnamed, attr_id=0, lowest_vcn=0, logical_size=2000
+        // （同 stream 重复，应被去重跳过）
+        buf[off..off + 4].copy_from_slice(&0x80u32.to_le_bytes()); // $DATA
+        buf[off + 4..off + 8].copy_from_slice(&(data1_padded as u32).to_le_bytes());
+        buf[off + 8] = 1; // non-resident
+        buf[off + 9] = 0; // no attr name
+        buf[off + 0x0A..off + 0x0C].copy_from_slice(&0x40u16.to_le_bytes());
+        buf[off + 0x0E..off + 0x10].copy_from_slice(&0u16.to_le_bytes()); // attr_id = 0 (same!)
+        buf[off + 0x10..off + 0x18].copy_from_slice(&0u64.to_le_bytes()); // lowest_vcn = 0
+        buf[off + 0x18..off + 0x20].copy_from_slice(&0u64.to_le_bytes());
+        buf[off + 0x20..off + 0x22].copy_from_slice(&0x40u16.to_le_bytes());
+        buf[off + 0x30..off + 0x38].copy_from_slice(&2000u64.to_le_bytes()); // logical_size
+        off += data1_padded;
+
+        // end marker
+        buf[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&0u32.to_le_bytes());
+
+        // 应用 USA 占位
+        let usn: u16 = 0x4321;
+        buf[usa_offset..usa_offset + 2].copy_from_slice(&usn.to_le_bytes());
+        for i in 1..3 {
+            let sector_end = i * bytes_per_sector - 2;
+            let original = u16::from_le_bytes([buf[sector_end], buf[sector_end + 1]]);
+            buf[usa_offset + i * 2..usa_offset + i * 2 + 2]
+                .copy_from_slice(&original.to_le_bytes());
+            buf[sector_end..sector_end + 2].copy_from_slice(&usn.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn parse_record_duplicate_data_stream_no_double_count() {
+        let bytes = build_duplicate_data_stream_record();
+        let rec = parse_record(&bytes, 77, 512).expect("含重复 $DATA 的记录应解析成功");
+        // 两个同 (name="", attr_id=0) 的 $DATA，logical_size 只累加第一个 (1000)
+        assert_eq!(
+            rec.logical_size, 1000,
+            "重复 stream 的 logical_size 不应双倍累加"
+        );
+    }
+
     // ===== proptest 健壮性（简报 3.6） =====
 
     mod proptest_tests {
@@ -1627,6 +1916,92 @@ mod tests {
             fn parse_attribute_list_arbitrary_bytes_never_panics(data in prop::collection::vec(any::<u8>(), 0..512)) {
                 let _ = parse_attribute_list_entries(&data, 0);
             }
+
+            #[test]
+            fn parse_record_arbitrary_usa_offset_count_never_panics(
+                usa_offset in 0u16..1024,
+                usa_count in 0u16..6,
+            ) {
+                // 任意 USA offset/count：构造合成记录字节（含 FILE 签名 + header 字段），
+                // 喂给 parse_record，断言不 panic（可返回 BadRecord 或 Ok）。
+                // 覆盖 usa_count=0、usa_offset 越界等极端值。
+                let record_len = 1024usize;
+                let bytes_per_sector = 512u32;
+                let mut buf = vec![0u8; record_len];
+                buf[0..4].copy_from_slice(b"FILE");
+                buf[0x04..0x06].copy_from_slice(&usa_offset.to_le_bytes());
+                buf[0x06..0x08].copy_from_slice(&usa_count.to_le_bytes());
+                buf[0x10..0x12].copy_from_slice(&1u16.to_le_bytes()); // sequence
+                buf[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes()); // first attr
+                buf[0x16..0x18].copy_from_slice(&0x01u16.to_le_bytes()); // in use
+                buf[0x18..0x1C].copy_from_slice(&(record_len as u32).to_le_bytes());
+                // end marker at first_attr
+                buf[0x38..0x3C].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+                // 不 panic 即通过
+                let _ = parse_record(&buf, 7, bytes_per_sector);
+            }
+
+            #[test]
+            fn parse_record_arbitrary_utf16_name_length_never_panics(
+                name_length_declared in 0u8..64,
+            ) {
+                // 生成 $FILE_NAME 属性，name_length 字段声明任意值（含超过 value 边界的值），
+                // 喂给 parse_record/parse_file_name，断言不 panic、不越界
+                // （声明的 name_length 越界时返回 BadRecord）。
+                let record_len = 1024usize;
+                let bytes_per_sector = 512u32;
+                let usa_offset = 0x30usize;
+                let first_attr = 0x38usize;
+
+                let mut buf = vec![0u8; record_len];
+                buf[0..4].copy_from_slice(b"FILE");
+                buf[0x04..0x06].copy_from_slice(&(usa_offset as u16).to_le_bytes());
+                buf[0x06..0x08].copy_from_slice(&3u16.to_le_bytes()); // 1024/512+1
+                buf[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+                buf[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
+                buf[0x16..0x18].copy_from_slice(&0x01u16.to_le_bytes());
+                buf[0x18..0x1C].copy_from_slice(&(record_len as u32).to_le_bytes());
+
+                // 构造 $FILE_NAME 属性，value 长度固定 0x42 + 8 字节（只放 4 个 UTF-16 字符）
+                let actual_name_chars: usize = 4;
+                let fn_value_len = 0x42 + actual_name_chars * 2;
+                let fn_attr_len_padded = ((0x18 + fn_value_len + 7) & !7).max(0x20);
+
+                let mut off = first_attr;
+                buf[off..off + 4].copy_from_slice(&0x30u32.to_le_bytes());
+                buf[off + 4..off + 8].copy_from_slice(&(fn_attr_len_padded as u32).to_le_bytes());
+                buf[off + 8] = 0; // resident
+                buf[off + 9] = 0; // no attr name
+                buf[off + 0x0A..off + 0x0C].copy_from_slice(&0x18u16.to_le_bytes());
+                buf[off + 0x0E..off + 0x10].copy_from_slice(&0u16.to_le_bytes());
+                buf[off + 0x10..off + 0x14].copy_from_slice(&(fn_value_len as u32).to_le_bytes());
+                buf[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+                let val_off = off + 0x18;
+                buf[val_off..val_off + 8].copy_from_slice(&((5u64 << 48) | 5u64).to_le_bytes());
+                // 关键：name_length 字段写入 proptest 任意值（可能远超 value 边界）
+                buf[val_off + 0x40] = name_length_declared;
+                buf[val_off + 0x41] = NAMESPACE_WIN32;
+                // 实际只放 actual_name_chars 个 UTF-16 字符
+                for i in 0..actual_name_chars {
+                    buf[val_off + 0x42 + i * 2] = b'a';
+                }
+
+                off += fn_attr_len_padded;
+                buf[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+                // 应用 USA 占位
+                let usn: u16 = 0x4321;
+                buf[usa_offset..usa_offset + 2].copy_from_slice(&usn.to_le_bytes());
+                for i in 1..3usize {
+                    let sector_end = i * 512 - 2;
+                    let original = u16::from_le_bytes([buf[sector_end], buf[sector_end + 1]]);
+                    buf[usa_offset + i * 2..usa_offset + i * 2 + 2]
+                        .copy_from_slice(&original.to_le_bytes());
+                    buf[sector_end..sector_end + 2].copy_from_slice(&usn.to_le_bytes());
+                }
+                // 不 panic 即通过（返回 Ok 或 BadRecord 都可）
+                let _ = parse_record(&buf, 7, bytes_per_sector);
+            }
         }
     }
 
@@ -1637,10 +2012,12 @@ mod tests {
         sequence: u16,
         is_dir: bool,
         has_base: bool,
+        in_use: bool,
     ) {
         assert_eq!(rec.id.record_no, record_no);
         assert_eq!(rec.id.sequence, sequence);
         assert_eq!(rec.is_dir, is_dir);
         assert_eq!(rec.base_record.is_some(), has_base);
+        assert_eq!(rec.in_use, in_use);
     }
 }

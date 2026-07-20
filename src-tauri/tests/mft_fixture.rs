@@ -419,12 +419,124 @@ fn alpha_txt_two_parents_hardlink() {
 
 #[test]
 fn system_records_0_through_15_parse_successfully() {
-    for rec_no in 0u64..=15 {
+    // 简报 3.1：断言具体值，不仅 is_ok()。
+    // 系统元记录 0..=15 的 sequence、in_use、is_dir 经观测（解析真实 fixture）为：
+    //   rec=0 ($MFT)     seq=1  in_use=true is_dir=false（$MFT 首条记录 seq=1）
+    //   rec=1 ($MFTMirr) seq=1  in_use=true is_dir=false
+    //   rec=2 ($LogFile) seq=2  in_use=true is_dir=false
+    //   rec=3 ($Volume)  seq=3  in_use=true is_dir=false
+    //   rec=4 ($AttrDef) seq=4  in_use=true is_dir=false
+    //   rec=5 (root)     seq=5  in_use=true is_dir=true
+    //   rec=6..=10       seq=record_no in_use=true is_dir=false
+    //   rec=11 ($Extend) seq=11 in_use=true is_dir=true
+    //   rec=12..=15      seq=record_no in_use=true is_dir=false
+    // 钉死这些具体值，避免回归（如 USA 降级误删字段）。
+    let expectations: [(u64, u16, bool); 16] = [
+        (0, 1, false),
+        (1, 1, false),
+        (2, 2, false),
+        (3, 3, false),
+        (4, 4, false),
+        (5, 5, true),
+        (6, 6, false),
+        (7, 7, false),
+        (8, 8, false),
+        (9, 9, false),
+        (10, 10, false),
+        (11, 11, true),
+        (12, 12, false),
+        (13, 13, false),
+        (14, 14, false),
+        (15, 15, false),
+    ];
+    for (rec_no, expected_seq, expected_is_dir) in expectations {
         let bytes = read_record_bin(rec_no);
-        // 有些系统记录可能不在用（如 12-15），parse_record 不应 panic
         let result = parse_record(&bytes, rec_no, BYTES_PER_SECTOR);
-        assert!(result.is_ok(), "系统记录 {} 解析不应失败", rec_no);
+        let rec = result.expect("系统记录解析不应失败");
+        assert!(rec.in_use, "系统记录 {} 应在用", rec_no);
+        assert_eq!(
+            rec.id.sequence, expected_seq,
+            "系统记录 {} 的 sequence",
+            rec_no
+        );
+        assert_eq!(rec.is_dir, expected_is_dir, "系统记录 {} 的 is_dir", rec_no);
+        assert!(
+            rec.base_record.is_none(),
+            "系统记录 {} 应为 base record",
+            rec_no
+        );
     }
+}
+
+#[test]
+fn system_record_0_mft_has_data_and_not_dir() {
+    // $MFT (record 0) 是文件、非目录、有 $DATA（用于 T2 批量读 MFT 字节）。
+    let rec = parse_fixture_record(0);
+    assert!(!rec.is_dir, "$MFT 应为文件（非目录）");
+    assert!(rec.in_use);
+    assert!(rec.base_record.is_none());
+    // $MFT 自身的 $DATA 一定存在且非零（驱动 $MFT 数据流的载体）。
+    assert!(
+        rec.logical_size > 0,
+        "$MFT 应有 non-resident $DATA (logical_size > 0)，实际={}",
+        rec.logical_size
+    );
+    assert!(!rec.names.is_empty(), "$MFT 应有 $FILE_NAME 入口");
+    let effective = select_effective_names(&rec.names);
+    assert!(
+        effective.iter().any(|n| n.name == "$MFT"),
+        "$MFT 的 $FILE_NAME 应包含 \"$MFT\"，实际={:?}",
+        effective.iter().map(|n| &n.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn system_records_1_through_4_specific_assertions() {
+    // $MFTMirr (1)、$LogFile (2)、$Volume (3)、$AttrDef (4)：均为文件，非目录。
+    let expectations = [
+        // (rec_no, name_hint, logical_size_must_be_positive)
+        (1u64, "$MFTMirr"),
+        (2u64, "$LogFile"),
+        (3u64, "$Volume"),
+        (4u64, "$AttrDef"),
+    ];
+    for (rec_no, name_hint) in expectations {
+        let rec = parse_fixture_record(rec_no);
+        assert!(!rec.is_dir, "记录 {} ({}) 应非目录", rec_no, name_hint);
+        assert!(rec.in_use);
+        assert!(rec.base_record.is_none());
+        // 系统元文件命名空间多变（POSIX/Win32+DOS），用 select_effective_names
+        // 钉死有效名集合含本系统元文件的标准名。
+        if !rec.names.is_empty() {
+            let effective = select_effective_names(&rec.names);
+            let names: Vec<&str> = effective.iter().map(|n| n.name.as_str()).collect();
+            assert!(
+                names.iter().any(|n| n.contains(&name_hint[1..]) || *n == name_hint),
+                "记录 {} 的 $FILE_NAME 应含 {}，实际={:?}",
+                rec_no,
+                name_hint,
+                names
+            );
+        }
+    }
+}
+
+#[test]
+fn system_record_11_extend_is_directory() {
+    // $Extend (record 11) 是 NTFS 的系统目录（容纳 $ObjId、$Quota、$Reparse、$RmMetadata）。
+    let rec = parse_fixture_record(11);
+    assert!(rec.is_dir, "$Extend (record 11) 应为目录");
+    assert!(rec.in_use);
+    assert!(rec.base_record.is_none());
+}
+
+#[test]
+fn system_record_5_root_in_use_and_dir() {
+    // 根目录 record 5 已有专门测试；这里钉死 in_use。
+    let rec = parse_fixture_record(REC_ROOT);
+    assert!(rec.is_dir);
+    assert!(rec.in_use, "根目录应在用");
+    assert!(rec.base_record.is_none());
 }
 
 #[test]
