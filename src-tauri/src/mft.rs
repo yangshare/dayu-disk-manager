@@ -16,7 +16,9 @@
 
 // ===== FILE header 字段偏移（集中常量定义，简报 3.2） =====
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use crate::win32::{read_mft_record, read_volume_bytes_at, RawFileRecord, VolumeData, VolumeError, VolumeHandle};
 //
 // 这些常量来自 NTFS 官方文档的 FILE record 布局（与 windows 0.62 绑定/微软 SDK 一致）：
 //   0x00 FILE signature ('FILE')
@@ -1153,6 +1155,320 @@ pub fn select_effective_names(names: &[MftName]) -> Vec<MftName> {
     }
 }
 
+// ===== T2：批量读、枚举与索引聚合 =====
+
+impl From<VolumeError> for MftError {
+    fn from(e: VolumeError) -> Self {
+        match e {
+            VolumeError::AccessDenied => MftError::NeedElevation,
+            VolumeError::UnsupportedFilesystem { actual } => {
+                MftError::UnsupportedFilesystem { actual }
+            }
+            VolumeError::InvalidVolumeData => MftError::InvalidVolumeData,
+            VolumeError::Io { code, operation } => MftError::Io(std::io::Error::other(format!(
+                "Win32 I/O error: operation={operation} code={code}"
+            ))),
+        }
+    }
+}
+
+/// MFT 枚举聚合产物。
+#[derive(Debug, Clone)]
+pub struct MftIndex {
+    /// 按 `record_no` 索引的 base 与独立记录。
+    pub records: HashMap<u64, MftRecord>,
+    /// 交给 `parse_record` 并检查过的记录总数（含最终被判坏的记录）。
+    pub scanned_records: u64,
+    /// 因内容损坏/竞态无法使用的记录数。
+    pub skipped_records: u64,
+    /// 非目录、在用的 base/独立记录数（按 record 计数）。
+    pub scanned_files: u64,
+    /// 额外长名入口数（硬链接诊断）。
+    pub hard_link_entries: u64,
+}
+
+/// 记录读取器抽象。
+///
+/// T2 批量读路线下，`read(n)` 从 reader 持有的 `$MFT` 字节缓冲按记录号切片，
+/// 返回的 `file_reference` 恒等于 `n`。
+pub trait RecordReader {
+    fn read(&self, requested_record: u64) -> Result<RawFileRecord, MftError>;
+}
+
+/// 从记录 0（`$MFT`）的原始字节提取其 non-resident `$DATA`（未命名默认流）
+/// 的 Data Run，用于批量读 `$MFT` 文件本身。
+///
+/// USA 处理与 [`parse_record`] 保持一致：先尝试 fix-up，失败时若判定为
+/// IOCTL 已修复记录则降级使用原字节。
+pub fn extract_mft_data_runs(
+    record0_bytes: &[u8],
+    bytes_per_sector: u32,
+) -> Result<Vec<DataRun>, MftError> {
+    // 与 parse_record USA 路径一致。
+    let fixed = match apply_usa_fixup(record0_bytes, 0, bytes_per_sector) {
+        Ok(fixed) => fixed,
+        Err(MftError::BadRecord { .. }) if is_ioctl_fixed_record(record0_bytes, bytes_per_sector) => {
+            record0_bytes.to_vec()
+        }
+        Err(e) => return Err(e),
+    };
+
+    let attrs = walk_attributes(&fixed, 0)?;
+    for attr in attrs {
+        if attr.type_ == ATTR_TYPE_DATA && attr.non_resident && attr.name.is_empty() {
+            if attr.bytes.len() < ATTR_NONRESIDENT_HEADER_LEN {
+                return Err(MftError::BadRecord { ref_no: 0 });
+            }
+            let lowest_vcn = read_u64_at(attr.bytes, ATTR_NONRES_LOWEST_VCN_OFFSET, 0)?;
+            if lowest_vcn == 0 {
+                let run_offset = read_u16_at(attr.bytes, ATTR_NONRES_RUN_OFFSET_FIELD, 0)? as usize;
+                if run_offset > attr.length {
+                    return Err(MftError::BadRecord { ref_no: 0 });
+                }
+                let run_bytes = &attr.bytes[run_offset..attr.length];
+                return decode_data_runs(run_bytes);
+            }
+        }
+    }
+    Err(MftError::BadRecord { ref_no: 0 })
+}
+
+fn validate_volume_data(volume_data: &VolumeData) -> Result<(), MftError> {
+    if volume_data.slot_count == 0 || volume_data.bytes_per_file_record_segment == 0 {
+        return Err(MftError::InvalidVolumeData);
+    }
+    if volume_data.major_version != 3 || volume_data.minor_version != 1 {
+        return Err(MftError::UnsupportedNtfsVersion {
+            major: volume_data.major_version,
+            minor: volume_data.minor_version,
+        });
+    }
+    Ok(())
+}
+
+/// 批量读 `$MFT` 文件的生产 reader。
+///
+/// 先读记录 0 定位 `$MFT` Data Run，逐段卷级读取拼成完整缓冲，之后按记录号
+/// 随机切片。
+pub struct MftFileReader {
+    bytes: Vec<u8>,
+    record_size: u32,
+}
+
+impl MftFileReader {
+    /// 读记录 0 定位 `$MFT` Data Run，逐段卷级读取拼成完整缓冲。
+    #[cfg(windows)]
+    pub fn open(vol: &VolumeHandle, volume_data: VolumeData) -> Result<Self, MftError> {
+        validate_volume_data(&volume_data)?;
+        let record_size = volume_data.bytes_per_file_record_segment;
+        let record0 = read_mft_record(vol, 0, record_size).map_err(MftError::from)?;
+        let runs = extract_mft_data_runs(&record0.bytes, volume_data.bytes_per_sector)?;
+        if runs.is_empty() {
+            return Err(MftError::BadRecord { ref_no: 0 });
+        }
+
+        let mut bytes = Vec::with_capacity(volume_data.mft_valid_data_length as usize);
+        let bpc = volume_data.bytes_per_cluster as u64;
+        let valid_len = volume_data.mft_valid_data_length;
+
+        for run in runs {
+            if run.start_lcn < 0 {
+                return Err(MftError::InvalidVolumeData);
+            }
+            let run_bytes = run
+                .length_clusters
+                .checked_mul(bpc)
+                .ok_or(MftError::InvalidVolumeData)?;
+            let current_len = bytes.len() as u64;
+            if current_len + run_bytes > valid_len {
+                return Err(MftError::InvalidVolumeData);
+            }
+            if run.start_lcn == 0 {
+                bytes.resize((current_len + run_bytes) as usize, 0);
+            } else {
+                let offset = (run.start_lcn as u64)
+                    .checked_mul(bpc)
+                    .ok_or(MftError::InvalidVolumeData)?;
+                let chunk = read_volume_bytes_at(vol, offset, run_bytes).map_err(MftError::from)?;
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+
+        let record_size_u64 = record_size as u64;
+        let aligned = (valid_len / record_size_u64) * record_size_u64;
+        if (bytes.len() as u64) < aligned {
+            return Err(MftError::InvalidVolumeData);
+        }
+        bytes.truncate(aligned as usize);
+
+        Ok(Self { bytes, record_size })
+    }
+
+    /// 测试构造器：直接注入 `$MFT` 字节缓冲。
+    #[cfg(test)]
+    pub(crate) fn from_bytes(bytes: Vec<u8>, record_size: u32) -> Self {
+        Self { bytes, record_size }
+    }
+
+    /// `$MFT` 有效数据覆盖的记录数。
+    pub fn record_count(&self) -> u64 {
+        self.bytes.len() as u64 / self.record_size as u64
+    }
+}
+
+impl RecordReader for MftFileReader {
+    fn read(&self, requested_record: u64) -> Result<RawFileRecord, MftError> {
+        let offset = requested_record
+            .checked_mul(self.record_size as u64)
+            .ok_or_else(|| {
+                MftError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "record offset overflow",
+                ))
+            })?;
+        let end = offset + self.record_size as u64;
+        if end > self.bytes.len() as u64 {
+            return Err(MftError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("record {requested_record} out of range"),
+            )));
+        }
+        Ok(RawFileRecord {
+            file_reference: requested_record,
+            bytes: self.bytes[offset as usize..end as usize].to_vec(),
+        })
+    }
+}
+
+/// 枚举 `$MFT` 记录并聚合为 [`MftIndex`]。
+///
+/// - 遍历升序 `0..record_count`，`record_count = mft_valid_data_length / record_size`。
+/// - 周期性检查 `cancel` 回调。
+/// - 每 4096 条调用 `progress(scanned_records)`。
+pub fn enumerate_mft(
+    reader: &dyn RecordReader,
+    volume_data: VolumeData,
+    cancel: &mut dyn FnMut() -> bool,
+    progress: &mut dyn FnMut(u64),
+) -> Result<MftIndex, MftError> {
+    validate_volume_data(&volume_data)?;
+    let record_size = volume_data.bytes_per_file_record_segment as u64;
+    let record_count = volume_data.mft_valid_data_length / record_size;
+    let bytes_per_sector = volume_data.bytes_per_sector;
+
+    let mut records: HashMap<u64, MftRecord> = HashMap::new();
+    let mut pending_extensions: HashMap<u64, Vec<MftRecord>> = HashMap::new();
+    let mut scanned_records = 0u64;
+    let mut skipped_records = 0u64;
+
+    for n in 0..record_count {
+        if cancel() {
+            return Err(MftError::Cancelled);
+        }
+
+        let raw = match reader.read(n) {
+            Ok(r) => r,
+            Err(_) => {
+                // read 失败说明记录号超出 reader 缓冲；这是 reader 层面的损坏/空洞，
+                // 不交给 parse_record，只计 skipped（简报 2.4 步骤 2）。
+                skipped_records += 1;
+                if skipped_records > 100 && skipped_records.saturating_mul(100) > scanned_records {
+                    return Err(MftError::ExcessiveRecordErrors {
+                        skipped: skipped_records,
+                        scanned: scanned_records,
+                    });
+                }
+                continue;
+            }
+        };
+
+        let record = match parse_record(&raw.bytes, n, bytes_per_sector) {
+            Ok(r) => r,
+            Err(_) => {
+                scanned_records += 1;
+                skipped_records += 1;
+                if skipped_records > 100 && skipped_records.saturating_mul(100) > scanned_records {
+                    return Err(MftError::ExcessiveRecordErrors {
+                        skipped: skipped_records,
+                        scanned: scanned_records,
+                    });
+                }
+                continue;
+            }
+        };
+
+        scanned_records += 1;
+
+        if (n + 1) % 4096 == 0 {
+            if cancel() {
+                return Err(MftError::Cancelled);
+            }
+            progress(scanned_records);
+        }
+
+        if !record.in_use {
+            continue;
+        }
+
+        if let Some(base) = record.base_record {
+            let base_no = base.record_no;
+            if let Some(base_rec) = records.get_mut(&base_no) {
+                base_rec.logical_size = base_rec
+                    .logical_size
+                    .checked_add(record.logical_size)
+                    .ok_or(MftError::BadRecord { ref_no: base_no })?;
+            } else {
+                pending_extensions.entry(base_no).or_default().push(record);
+            }
+        } else {
+            let rec_no = record.id.record_no;
+            let mut merged = record;
+            if let Some(exts) = pending_extensions.remove(&rec_no) {
+                for ext in exts {
+                    merged.logical_size = merged
+                        .logical_size
+                        .checked_add(ext.logical_size)
+                        .ok_or(MftError::BadRecord { ref_no: rec_no })?;
+                }
+            }
+            records.insert(rec_no, merged);
+        }
+
+        if skipped_records > 100 && skipped_records.saturating_mul(100) > scanned_records {
+            return Err(MftError::ExcessiveRecordErrors {
+                skipped: skipped_records,
+                scanned: scanned_records,
+            });
+        }
+    }
+
+    if !records.contains_key(&5) {
+        return Err(MftError::RootRecordMissing);
+    }
+
+    let mut scanned_files = 0u64;
+    let mut hard_link_entries = 0u64;
+    for rec in records.values() {
+        if rec.is_dir || !rec.in_use {
+            continue;
+        }
+        let effective = select_effective_names(&rec.names);
+        let distinct_parents: HashSet<_> = effective.iter().map(|n| n.parent.record_no).collect();
+        if effective.len() > 1 && distinct_parents.len() > 1 {
+            hard_link_entries += (effective.len() - 1) as u64;
+        }
+        scanned_files += 1;
+    }
+
+    Ok(MftIndex {
+        records,
+        scanned_records,
+        skipped_records,
+        scanned_files,
+        hard_link_entries,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2003,6 +2319,577 @@ mod tests {
                 let _ = parse_record(&buf, 7, bytes_per_sector);
             }
         }
+    }
+
+    // ===== T2：批量读、枚举与索引聚合测试 =====
+
+    const TEST_RECORD_SIZE: u32 = 1024;
+    const TEST_BYTES_PER_SECTOR: u32 = 512;
+
+    fn test_volume_data(record_count: u64) -> VolumeData {
+        VolumeData {
+            bytes_per_sector: TEST_BYTES_PER_SECTOR,
+            bytes_per_cluster: 4096,
+            bytes_per_file_record_segment: TEST_RECORD_SIZE,
+            mft_valid_data_length: record_count * TEST_RECORD_SIZE as u64,
+            major_version: 3,
+            minor_version: 1,
+            slot_count: record_count,
+        }
+    }
+
+    fn apply_usa_placeholder(buf: &mut [u8], bytes_per_sector: usize, usa_offset: usize) {
+        let record_len = buf.len();
+        let usa_count = record_len / bytes_per_sector + 1;
+        let usn: u16 = 0x4321;
+        buf[usa_offset..usa_offset + 2].copy_from_slice(&usn.to_le_bytes());
+        for i in 1..usa_count {
+            let sector_end = i * bytes_per_sector - 2;
+            let original = u16::from_le_bytes([buf[sector_end], buf[sector_end + 1]]);
+            buf[usa_offset + i * 2..usa_offset + i * 2 + 2]
+                .copy_from_slice(&original.to_le_bytes());
+            buf[sector_end..sector_end + 2].copy_from_slice(&usn.to_le_bytes());
+        }
+    }
+
+    fn build_directory_record(_record_no: u64, parent_ref: u64, name: &str) -> Vec<u8> {
+        let mut bytes = build_minimal_file_record(0, parent_ref, name, 0);
+        let flags = u16::from_le_bytes([bytes[0x16], bytes[0x17]]) | FILE_FLAG_DIRECTORY;
+        bytes[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
+        bytes
+    }
+
+    fn build_not_in_use_record(_record_no: u64) -> Vec<u8> {
+        let mut bytes = build_minimal_file_record(0, (5u64 << 48) | 5u64, "x", 0);
+        let flags = u16::from_le_bytes([bytes[0x16], bytes[0x17]]) & !FILE_FLAG_IN_USE;
+        bytes[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
+        bytes
+    }
+
+    fn build_hardlink_record(
+        _record_no: u64,
+        parent1: u64,
+        name1: &str,
+        parent2: u64,
+        name2: &str,
+    ) -> Vec<u8> {
+        let record_len = 1024usize;
+        let bytes_per_sector = 512usize;
+        let usa_offset = 0x30usize;
+        let first_attr = 0x38usize;
+        let mut buf = vec![0u8; record_len];
+        buf[0..4].copy_from_slice(b"FILE");
+        buf[0x04..0x06].copy_from_slice(&(usa_offset as u16).to_le_bytes());
+        buf[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        buf[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        buf[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
+        buf[0x16..0x18].copy_from_slice(&0x01u16.to_le_bytes());
+        buf[0x18..0x1C].copy_from_slice(&(record_len as u32).to_le_bytes());
+        buf[0x20..0x28].copy_from_slice(&0u64.to_le_bytes());
+
+        let mut off = first_attr;
+        for (idx, (parent_ref, name)) in [(parent1, name1), (parent2, name2)].iter().enumerate() {
+            let name_utf16: Vec<u16> = name.encode_utf16().collect();
+            let name_bytes: Vec<u8> = name_utf16
+                .iter()
+                .flat_map(|&w| w.to_le_bytes())
+                .collect();
+            let fn_value_len = 0x42 + name_bytes.len();
+            let fn_attr_len = 0x18 + fn_value_len;
+            let fn_attr_len_padded = (fn_attr_len + 7) & !7;
+
+            buf[off..off + 4].copy_from_slice(&0x30u32.to_le_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&(fn_attr_len_padded as u32).to_le_bytes());
+            buf[off + 8] = 0;
+            buf[off + 9] = 0;
+            buf[off + 0x0A..off + 0x0C].copy_from_slice(&0x18u16.to_le_bytes());
+            buf[off + 0x0E..off + 0x10].copy_from_slice(&(idx as u16).to_le_bytes());
+            buf[off + 0x10..off + 0x14].copy_from_slice(&(fn_value_len as u32).to_le_bytes());
+            buf[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+            let val_off = off + 0x18;
+            buf[val_off..val_off + 8].copy_from_slice(&parent_ref.to_le_bytes());
+            buf[val_off + 0x40] = name_utf16.len() as u8;
+            buf[val_off + 0x41] = NAMESPACE_WIN32;
+            buf[val_off + 0x42..val_off + 0x42 + name_bytes.len()].copy_from_slice(&name_bytes);
+            off += fn_attr_len_padded;
+        }
+
+        // resident $DATA attr_id = 2, value length 0
+        let data_attr_len = 0x18;
+        let data_attr_len_padded = (data_attr_len + 7) & !7;
+        buf[off..off + 4].copy_from_slice(&0x80u32.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&(data_attr_len_padded as u32).to_le_bytes());
+        buf[off + 8] = 0;
+        buf[off + 9] = 0;
+        buf[off + 0x0A..off + 0x0C].copy_from_slice(&0x18u16.to_le_bytes());
+        buf[off + 0x0E..off + 0x10].copy_from_slice(&2u16.to_le_bytes());
+        buf[off + 0x10..off + 0x14].copy_from_slice(&0u32.to_le_bytes());
+        buf[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        off += data_attr_len_padded;
+
+        buf[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&0u32.to_le_bytes());
+        apply_usa_placeholder(&mut buf, bytes_per_sector, usa_offset);
+        buf
+    }
+
+    fn build_same_parent_win32_dos_record(
+        _record_no: u64,
+        parent_ref: u64,
+        long_name: &str,
+        short_name: &str,
+    ) -> Vec<u8> {
+        let record_len = 1024usize;
+        let bytes_per_sector = 512usize;
+        let usa_offset = 0x30usize;
+        let first_attr = 0x38usize;
+        let mut buf = vec![0u8; record_len];
+        buf[0..4].copy_from_slice(b"FILE");
+        buf[0x04..0x06].copy_from_slice(&(usa_offset as u16).to_le_bytes());
+        buf[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        buf[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        buf[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
+        buf[0x16..0x18].copy_from_slice(&0x01u16.to_le_bytes());
+        buf[0x18..0x1C].copy_from_slice(&(record_len as u32).to_le_bytes());
+        buf[0x20..0x28].copy_from_slice(&0u64.to_le_bytes());
+
+        let mut off = first_attr;
+        for (idx, (parent_ref_val, name, ns)) in [
+            (parent_ref, long_name, NAMESPACE_WIN32),
+            (parent_ref, short_name, NAMESPACE_DOS),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let name_utf16: Vec<u16> = name.encode_utf16().collect();
+            let name_bytes: Vec<u8> = name_utf16
+                .iter()
+                .flat_map(|&w| w.to_le_bytes())
+                .collect();
+            let fn_value_len = 0x42 + name_bytes.len();
+            let fn_attr_len = 0x18 + fn_value_len;
+            let fn_attr_len_padded = (fn_attr_len + 7) & !7;
+
+            buf[off..off + 4].copy_from_slice(&0x30u32.to_le_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&(fn_attr_len_padded as u32).to_le_bytes());
+            buf[off + 8] = 0;
+            buf[off + 9] = 0;
+            buf[off + 0x0A..off + 0x0C].copy_from_slice(&0x18u16.to_le_bytes());
+            buf[off + 0x0E..off + 0x10].copy_from_slice(&(idx as u16).to_le_bytes());
+            buf[off + 0x10..off + 0x14].copy_from_slice(&(fn_value_len as u32).to_le_bytes());
+            buf[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+            let val_off = off + 0x18;
+            buf[val_off..val_off + 8].copy_from_slice(&parent_ref_val.to_le_bytes());
+            buf[val_off + 0x40] = name_utf16.len() as u8;
+            buf[val_off + 0x41] = *ns;
+            buf[val_off + 0x42..val_off + 0x42 + name_bytes.len()].copy_from_slice(&name_bytes);
+            off += fn_attr_len_padded;
+        }
+
+        let data_attr_len = 0x18;
+        let data_attr_len_padded = (data_attr_len + 7) & !7;
+        buf[off..off + 4].copy_from_slice(&0x80u32.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&(data_attr_len_padded as u32).to_le_bytes());
+        buf[off + 8] = 0;
+        buf[off + 9] = 0;
+        buf[off + 0x0A..off + 0x0C].copy_from_slice(&0x18u16.to_le_bytes());
+        buf[off + 0x0E..off + 0x10].copy_from_slice(&2u16.to_le_bytes());
+        buf[off + 0x10..off + 0x14].copy_from_slice(&0u32.to_le_bytes());
+        buf[off + 0x14..off + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+        off += data_attr_len_padded;
+
+        buf[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&0u32.to_le_bytes());
+        apply_usa_placeholder(&mut buf, bytes_per_sector, usa_offset);
+        buf
+    }
+
+    fn build_extension_record(_record_no: u64, base_no: u64, logical_size: u64) -> Vec<u8> {
+        let record_len = 1024usize;
+        let bytes_per_sector = 512usize;
+        let usa_offset = 0x30usize;
+        let first_attr = 0x38usize;
+        let mut buf = vec![0u8; record_len];
+        buf[0..4].copy_from_slice(b"FILE");
+        buf[0x04..0x06].copy_from_slice(&(usa_offset as u16).to_le_bytes());
+        buf[0x06..0x08].copy_from_slice(&3u16.to_le_bytes());
+        buf[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        buf[0x14..0x16].copy_from_slice(&(first_attr as u16).to_le_bytes());
+        buf[0x16..0x18].copy_from_slice(&0x01u16.to_le_bytes());
+        buf[0x18..0x1C].copy_from_slice(&(record_len as u32).to_le_bytes());
+        let base_ref = (1u64 << 48) | base_no;
+        buf[0x20..0x28].copy_from_slice(&base_ref.to_le_bytes());
+
+        let mut off = first_attr;
+        let data_len = ATTR_NONRESIDENT_HEADER_LEN;
+        let data_padded = (data_len + 7) & !7;
+        buf[off..off + 4].copy_from_slice(&0x80u32.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&(data_padded as u32).to_le_bytes());
+        buf[off + 8] = 1;
+        buf[off + 9] = 0;
+        buf[off + 0x0A..off + 0x0C].copy_from_slice(&0x40u16.to_le_bytes());
+        buf[off + 0x0E..off + 0x10].copy_from_slice(&0u16.to_le_bytes());
+        buf[off + 0x10..off + 0x18].copy_from_slice(&0u64.to_le_bytes());
+        buf[off + 0x18..off + 0x20].copy_from_slice(&0u64.to_le_bytes());
+        buf[off + 0x20..off + 0x22].copy_from_slice(&0x40u16.to_le_bytes());
+        buf[off + 0x30..off + 0x38].copy_from_slice(&logical_size.to_le_bytes());
+        off += data_padded;
+
+        buf[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&0u32.to_le_bytes());
+        apply_usa_placeholder(&mut buf, bytes_per_sector, usa_offset);
+        buf
+    }
+
+    fn build_bad_record() -> Vec<u8> {
+        vec![0xFFu8; TEST_RECORD_SIZE as usize]
+    }
+
+    struct MockReader {
+        records: HashMap<u64, Vec<u8>>,
+    }
+
+    impl MockReader {
+        fn from_records(records: HashMap<u64, Vec<u8>>, _record_size: u32) -> Self {
+            Self { records }
+        }
+    }
+
+    impl RecordReader for MockReader {
+        fn read(&self, requested_record: u64) -> Result<RawFileRecord, MftError> {
+            match self.records.get(&requested_record) {
+                Some(bytes) => Ok(RawFileRecord {
+                    file_reference: requested_record,
+                    bytes: bytes.clone(),
+                }),
+                None => Err(MftError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mock record {requested_record} missing"),
+                ))),
+            }
+        }
+    }
+
+    #[test]
+    fn enumeration_visits_all_records_ascending() {
+        let mut records = HashMap::new();
+        records.insert(0, build_minimal_file_record(0, (5u64 << 48) | 5u64, "mft", 0));
+        records.insert(1, build_minimal_file_record(0, (5u64 << 48) | 5u64, "one", 10));
+        records.insert(5, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(6);
+        let mut cancel = || false;
+        let mut progress = |_n| {};
+        let index = enumerate_mft(&reader, vd, &mut cancel, &mut progress).unwrap();
+        assert_eq!(index.scanned_records, 3);
+        assert_eq!(index.skipped_records, 3);
+        assert!(index.records.contains_key(&0));
+        assert!(index.records.contains_key(&1));
+        assert!(index.records.contains_key(&5));
+    }
+
+    #[test]
+    fn enumeration_skips_not_in_use_records() {
+        let mut records = HashMap::new();
+        records.insert(0, build_minimal_file_record(0, (5u64 << 48) | 5u64, "mft", 0));
+        records.insert(1, build_not_in_use_record(1));
+        records.insert(5, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(6);
+        let index = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap();
+        assert!(!index.records.contains_key(&1));
+        assert_eq!(index.scanned_records, 3);
+        assert_eq!(index.skipped_records, 3);
+        assert_eq!(index.scanned_files, 1); // record 0 only
+    }
+
+    #[test]
+    fn enumeration_counts_bad_records_as_skipped() {
+        let mut records = HashMap::new();
+        records.insert(0, build_minimal_file_record(0, (5u64 << 48) | 5u64, "mft", 0));
+        records.insert(1, build_bad_record());
+        records.insert(5, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(6);
+        let index = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap();
+        assert_eq!(index.skipped_records, 4); // 1 bad + 3 missing (2..4 not in mock)
+        assert!(!index.records.contains_key(&1));
+    }
+
+    #[test]
+    fn enumeration_root_missing_returns_error() {
+        let mut records = HashMap::new();
+        records.insert(0, build_minimal_file_record(0, (5u64 << 48) | 5u64, "mft", 0));
+        records.insert(1, build_minimal_file_record(0, (5u64 << 48) | 5u64, "one", 10));
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(6);
+        let err = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap_err();
+        assert!(matches!(err, MftError::RootRecordMissing));
+    }
+
+    #[test]
+    fn enumeration_precancel_returns_cancelled() {
+        let mut records = HashMap::new();
+        records.insert(0, build_minimal_file_record(0, (5u64 << 48) | 5u64, "mft", 0));
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(6);
+        let err = enumerate_mft(&reader, vd, &mut || true, &mut |_| {}).unwrap_err();
+        assert!(matches!(err, MftError::Cancelled));
+    }
+
+    #[test]
+    fn enumeration_cancel_mid_scan() {
+        let mut records = HashMap::new();
+        for n in 0..6 {
+            records.insert(
+                n,
+                build_minimal_file_record(0, (5u64 << 48) | 5u64, &format!("f{n}"), 1),
+            );
+        }
+        // record 5 as directory to satisfy root check once we get there
+        records.insert(5, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(6);
+        let mut calls = 0u64;
+        let err = enumerate_mft(
+            &reader,
+            vd,
+            &mut || {
+                calls += 1;
+                calls == 2
+            },
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, MftError::Cancelled));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn enumeration_excessive_errors_threshold() {
+        let mut records = HashMap::new();
+        // 256 records: first 150 are bad/missing -> >50% and >100 skipped
+        for n in 0..256u64 {
+            if n < 150 {
+                records.insert(n, build_bad_record());
+            } else if n == 5 {
+                records.insert(n, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+            } else {
+                records.insert(
+                    n,
+                    build_minimal_file_record(0, (5u64 << 48) | 5u64, "f", 1),
+                );
+            }
+        }
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(256);
+        let err = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap_err();
+        match err {
+            MftError::ExcessiveRecordErrors { skipped, scanned } => {
+                assert!(skipped > 100);
+                assert!(skipped.saturating_mul(100) > scanned);
+            }
+            other => panic!("期望 ExcessiveRecordErrors，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enumeration_record_0_passed_to_parser_once() {
+        let mut records = HashMap::new();
+        records.insert(0, build_minimal_file_record(0, (5u64 << 48) | 5u64, "mft", 0));
+        records.insert(1, build_minimal_file_record(0, (5u64 << 48) | 5u64, "one", 10));
+        records.insert(5, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(6);
+        let index = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap();
+        assert_eq!(index.scanned_records, 3);
+        assert!(index.records.contains_key(&0));
+    }
+
+    #[test]
+    fn enumeration_extension_merge_sizes() {
+        let mut records = HashMap::new();
+        records.insert(0, build_minimal_file_record(0, (5u64 << 48) | 5u64, "mft", 0));
+        records.insert(5, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+        records.insert(41, build_minimal_file_record(0, (5u64 << 48) | 5u64, "base", 10));
+        records.insert(49, build_extension_record(49, 41, 100));
+        records.insert(50, build_extension_record(50, 41, 200));
+        for n in 1..51u64 {
+            if !records.contains_key(&n) {
+                records.insert(
+                    n,
+                    build_minimal_file_record(0, (5u64 << 48) | 5u64, "f", 1),
+                );
+            }
+        }
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(51);
+        let index = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap();
+        let base = index.records.get(&41).expect("base record 41 应存在");
+        assert_eq!(base.logical_size, 10 + 100 + 200);
+        assert!(!index.records.contains_key(&49));
+        assert!(!index.records.contains_key(&50));
+    }
+
+    #[test]
+    fn enumeration_extension_bounded_before_base() {
+        let mut records = HashMap::new();
+        records.insert(0, build_minimal_file_record(0, (5u64 << 48) | 5u64, "mft", 0));
+        records.insert(5, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+        records.insert(30, build_extension_record(30, 41, 55));
+        records.insert(41, build_minimal_file_record(0, (5u64 << 48) | 5u64, "base", 10));
+        for n in 1..42u64 {
+            if !records.contains_key(&n) {
+                records.insert(
+                    n,
+                    build_minimal_file_record(0, (5u64 << 48) | 5u64, "f", 1),
+                );
+            }
+        }
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(42);
+        let index = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap();
+        let base = index.records.get(&41).expect("base record 41 应存在");
+        assert_eq!(base.logical_size, 10 + 55);
+    }
+
+    #[test]
+    fn enumeration_hard_link_entries_counted() {
+        let mut records = HashMap::new();
+        for n in 0..42u64 {
+            if n == 5 {
+                records.insert(n, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+            } else if n == 40 {
+                records.insert(
+                    n,
+                    build_hardlink_record(
+                        n,
+                        (5u64 << 48) | 5u64,
+                        "alpha.txt",
+                        (1u64 << 48) | 42u64,
+                        "hardlink_to_alpha.txt",
+                    ),
+                );
+            } else {
+                records.insert(
+                    n,
+                    build_minimal_file_record(0, (5u64 << 48) | 5u64, "f", 1),
+                );
+            }
+        }
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(42);
+        let index = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap();
+        assert_eq!(index.scanned_files, 41); // 42 records - 1 directory
+        assert_eq!(index.hard_link_entries, 1);
+    }
+
+    #[test]
+    fn enumeration_same_parent_win32_dos_not_hard_link() {
+        let mut records = HashMap::new();
+        for n in 0..46u64 {
+            if n == 5 {
+                records.insert(n, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+            } else if n == 45 {
+                records.insert(
+                    n,
+                    build_same_parent_win32_dos_record(
+                        n,
+                        (5u64 << 48) | 5u64,
+                        "long filename.txt",
+                        "LONGFI~1.TXT",
+                    ),
+                );
+            } else {
+                records.insert(
+                    n,
+                    build_minimal_file_record(0, (5u64 << 48) | 5u64, "f", 1),
+                );
+            }
+        }
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(46);
+        let index = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap();
+        assert_eq!(index.hard_link_entries, 0);
+        assert_eq!(index.scanned_files, 45);
+    }
+
+    #[test]
+    fn enumeration_progress_callback_monotonic() {
+        let mut records = HashMap::new();
+        for n in 0..4098u64 {
+            if n == 5 {
+                records.insert(n, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+            } else {
+                records.insert(
+                    n,
+                    build_minimal_file_record(0, (5u64 << 48) | 5u64, "f", 1),
+                );
+            }
+        }
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(4098);
+        let mut progress_calls = Vec::new();
+        let index = enumerate_mft(
+            &reader,
+            vd,
+            &mut || false,
+            &mut |n| progress_calls.push(n),
+        )
+        .unwrap();
+        assert!(!progress_calls.is_empty());
+        for w in progress_calls.windows(2) {
+            assert!(w[0] <= w[1], "progress 应单调不减");
+        }
+        assert_eq!(index.scanned_records, 4098);
+    }
+
+    #[test]
+    fn extract_mft_data_runs_from_fixture_record_0() {
+        let bytes = std::fs::read("tests/fixtures/ntfs_sample/raw/record_000000.bin")
+            .expect("应能读取 fixture record 0");
+        let runs = extract_mft_data_runs(&bytes, TEST_BYTES_PER_SECTOR)
+            .expect("记录 0 Data Run 提取应成功");
+        assert!(!runs.is_empty());
+        for run in &runs {
+            assert!(run.start_lcn >= 0, "start_lcn 不应为负: {:?}", run);
+            assert!(run.length_clusters > 0, "length_clusters 应正: {:?}", run);
+        }
+        let total_clusters: u64 = runs.iter().map(|r| r.length_clusters).sum();
+        let total_bytes = total_clusters * 4096u64;
+        assert!(
+            total_bytes >= 262_144u64,
+            "总字节数 {} 应 >= mft_valid_data_length 262144",
+            total_bytes
+        );
+    }
+
+    #[test]
+    fn reader_read_slices_record_n() {
+        let r0 = build_minimal_file_record(0, (5u64 << 48) | 5u64, "a", 1);
+        let r1 = build_minimal_file_record(0, (5u64 << 48) | 5u64, "b", 2);
+        let r2 = build_minimal_file_record(0, (5u64 << 48) | 5u64, "c", 3);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&r0);
+        bytes.extend_from_slice(&r1);
+        bytes.extend_from_slice(&r2);
+        let reader = MftFileReader::from_bytes(bytes, TEST_RECORD_SIZE);
+        assert_eq!(reader.record_count(), 3);
+        for (n, expected_first_name) in [(0u64, "a"), (1, "b"), (2, "c")] {
+            let rec = reader.read(n).unwrap();
+            assert_eq!(rec.file_reference, n);
+            assert_eq!(rec.bytes.len(), TEST_RECORD_SIZE as usize);
+            let parsed = parse_record(&rec.bytes, n, TEST_BYTES_PER_SECTOR).unwrap();
+            assert_eq!(parsed.names[0].name, expected_first_name);
+        }
+    }
+
+    #[test]
+    fn reader_read_out_of_range_returns_io_error() {
+        let r0 = build_minimal_file_record(0, (5u64 << 48) | 5u64, "a", 1);
+        let reader = MftFileReader::from_bytes(r0, TEST_RECORD_SIZE);
+        let err = reader.read(1).unwrap_err();
+        assert!(matches!(err, MftError::Io(_)));
     }
 
     // 辅助断言函数。

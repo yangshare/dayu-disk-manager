@@ -800,6 +800,78 @@ pub fn read_mft_record(
     })
 }
 
+/// 从已打开的卷句柄按字节偏移读取 `byte_count` 字节原始卷数据。
+///
+/// `start_byte_offset` 为相对卷头的绝对字节偏移（= start_lcn * bytes_per_cluster）。
+/// 用 SetFilePointerEx 定位 + ReadFile 读取；分块读取累加至 byte_count。
+#[cfg(windows)]
+const READ_VOLUME_CHUNK: usize = 1024 * 1024;
+
+#[cfg(windows)]
+pub fn read_volume_bytes_at(
+    vol: &VolumeHandle,
+    start_byte_offset: u64,
+    byte_count: u64,
+) -> Result<Vec<u8>, VolumeError> {
+    use windows::Win32::Storage::FileSystem::{ReadFile, SetFilePointerEx};
+    use windows::Win32::Storage::FileSystem::FILE_BEGIN;
+
+    if byte_count == 0 {
+        return Ok(Vec::new());
+    }
+    if start_byte_offset > i64::MAX as u64 {
+        return Err(VolumeError::InvalidVolumeData);
+    }
+
+    unsafe {
+        SetFilePointerEx(
+            vol.handle,
+            start_byte_offset as i64,
+            None,
+            FILE_BEGIN,
+        )
+    }
+    .map_err(|e| map_win32_error(e, "SetFilePointerEx"))?;
+
+    let mut out = Vec::with_capacity(byte_count as usize);
+    let mut remaining = byte_count as usize;
+    let mut buf = vec![0u8; READ_VOLUME_CHUNK];
+    while remaining > 0 {
+        let to_read = remaining.min(READ_VOLUME_CHUNK);
+        let mut bytes_read: u32 = 0;
+        unsafe {
+            ReadFile(
+                vol.handle,
+                Some(&mut buf[..to_read]),
+                Some(&mut bytes_read as *mut u32),
+                None,
+            )
+        }
+        .map_err(|e| map_win32_error(e, "ReadFile"))?;
+        if bytes_read == 0 {
+            return Err(VolumeError::Io {
+                code: 0,
+                operation: "read_volume_bytes_at/eof",
+            });
+        }
+        out.extend_from_slice(&buf[..bytes_read as usize]);
+        remaining -= bytes_read as usize;
+    }
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+pub fn read_volume_bytes_at(
+    _vol: &VolumeHandle,
+    _start_byte_offset: u64,
+    _byte_count: u64,
+) -> Result<Vec<u8>, VolumeError> {
+    Err(VolumeError::Io {
+        code: u32::MAX,
+        operation: "read_volume_bytes_at/not_windows",
+    })
+}
+
 // ===== UAC 提权封装 =====
 
 /// 把 `ShellExecuteW` 的 HINSTANCE 返回值分类为三分支结果。
