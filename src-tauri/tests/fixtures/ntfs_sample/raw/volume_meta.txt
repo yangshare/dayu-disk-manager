@@ -1,0 +1,7 @@
+drive=Z:
+bytes_per_sector=512
+bytes_per_cluster=4096
+bytes_per_file_record_segment=1024
+mft_valid_data_length=262144
+ntfs_version=3.1
+slot_count=256
