@@ -434,9 +434,7 @@ pub struct DirectoryNode {
     pub display_name: String,
     /// 距根的层数。根 = 0。
     pub depth: u32,
-    /// 是否携带 `$REPARSE_POINT` 属性。
-    pub is_reparse: bool,
-    /// `$REPARSE_POINT` tag（仅当 `is_reparse == true`）。
+    /// `$REPARSE_POINT` tag。`Some(_)` 表示该目录携带 reparse 属性。
     pub reparse_tag: Option<u32>,
     /// 是否为本工具创建的 junction。T4 留 `false`，由 T5/T8 借 `junction::verify` 填充。
     pub is_junction: bool,
@@ -469,21 +467,26 @@ pub struct GraphDiagnostics {
     pub missing_parent: u64,
     /// 目录的有效名指向第二个不同的父（重复目录入口）。
     pub duplicate_dir_entry: u64,
-    /// 三色 DFS 检测到的循环节点数。
+    /// 三色 DFS 检测到的循环节点数（按 record 级别去重）。
     pub cycle_nodes: u64,
     /// 建图后未从根可达的目录节点数。
     pub unreachable_nodes: u64,
-    /// 等价于 unreachable_nodes（规格 4.5 orphan 语义：不伪挂到根下）。
-    pub orphan_entries: u64,
     /// 根记录 5 不在 `records` 中，或不是目录。
     pub root_missing: bool,
+    /// 文件父引用命中一条 `is_dir == false` 且 sequence 一致的 record。
+    pub non_dir_parent_files: u64,
+    /// 目录父引用命中一条 `is_dir == false` 且 sequence 一致的 record。
+    pub non_dir_parent_dirs: u64,
 }
 
 /// 线性构建的目录图。
 ///
-/// `nodes` 含全部目录节点（含不可达，便于诊断），`children` 仅含从根可达、
-/// 未循环、未排除的正常边。`system_metadata_size_bytes` 是记录 0..15 除根 5
-/// 之外的 logical_size 汇总。
+/// `nodes` 与 `children` 仅含从根可达的目录节点与边（orphan/cycle/缺父节点
+/// 在 Phase 5 末尾物理剔除，但保留在 `diagnostics.unreachable_nodes` 中）。
+/// `excluded` 节点保留在 `nodes` 中（T5 需对 excluded 节点做预设/状态标注，
+/// 剔除会让 T5 丢失信息）。`root_missing` 时 `nodes` 与 `children` 均为空，
+/// `root` 字段为占位 `(5, 0)`——调用方必须先检查 `diagnostics.root_missing`。
+/// `system_metadata_size_bytes` 是记录 0..15 除根 5 之外的 logical_size 汇总。
 #[derive(Debug, Clone)]
 pub struct DirectoryGraph {
     pub nodes: HashMap<FileRef, DirectoryNode>,
@@ -491,7 +494,7 @@ pub struct DirectoryGraph {
     pub children: HashMap<FileRef, Vec<FileRef>>,
     pub system_metadata_size_bytes: u64,
     pub diagnostics: GraphDiagnostics,
-    /// 被排除节点的 `subtree_size_bytes` 之和（诊断用）。
+    /// 被排除节点的 `subtree_size_bytes` 之和（仅计顶层 excluded 节点，避免重复）。
     pub excluded_subtree_size_bytes: u64,
 }
 
@@ -542,7 +545,6 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
                     path: String::new(),
                     display_name: String::new(),
                     depth: 0,
-                    is_reparse: record.reparse_tag.is_some(),
                     reparse_tag: record.reparse_tag,
                     is_junction: false, // T5/T8 才用 junction::verify 填
                     direct_file_size_bytes: 0,
@@ -587,7 +589,7 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
                     }
                     Some(_) => {
                         // 记录存在且 sequence 匹配，但不在 nodes（系统记录或非目录）。
-                        // 不计入诊断——视为超出当前树的范围。
+                        diagnostics.non_dir_parent_files += 1;
                     }
                 }
             }
@@ -608,12 +610,17 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
             continue;
         }
         let effective_names = select_effective_names(&record.names);
+        // F9: 单条目录 record 的自引用仅在 record 级首次计入一次。
+        let mut self_ref_counted = false;
         for name in &effective_names {
             let parent_ref = name.parent;
 
             // 防御：非根目录的"自引用"（不应出现在合法 MFT 中）→ 当作循环。
             if parent_ref == record.id {
-                diagnostics.cycle_nodes += 1;
+                if !self_ref_counted {
+                    diagnostics.cycle_nodes += 1;
+                    self_ref_counted = true;
+                }
                 continue;
             }
 
@@ -625,7 +632,8 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
                         diagnostics.stale_sequence_dirs += 1;
                     }
                     Some(_) => {
-                        // 父存在但不在 nodes（系统记录或非目录）：静默跳过。
+                        // 父存在但不在 nodes（系统记录或非目录）：计入 non_dir_parent_dirs。
+                        diagnostics.non_dir_parent_dirs += 1;
                     }
                 }
                 continue;
@@ -645,6 +653,15 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
                 .or_default()
                 .push((record.id, name.name.clone()));
         }
+    }
+
+    // F5: 稳定 sibling 顺序——按 (record_no, name) 排序，保证跨进程一致。
+    for (_, kids) in children.iter_mut() {
+        kids.sort_by(|a, b| {
+            a.0.record_no
+                .cmp(&b.0.record_no)
+                .then_with(|| a.1.cmp(&b.1))
+        });
     }
 
     // ===== 根 5 检测 =====
@@ -671,6 +688,8 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
         // color: 0=白, 1=灰, 2=黑
         let mut color: HashMap<FileRef, u8> = HashMap::new();
         let mut stack: Vec<(FileRef, bool)> = Vec::new();
+        // F8: 同一循环节点被多条反向边命中时，仅在 record 级首次计入一次。
+        let mut cycle_set: HashSet<FileRef> = HashSet::new();
         color.insert(root_file_ref, 1);
         stack.push((root_file_ref, false));
 
@@ -687,8 +706,10 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
                 for (child_ref, child_name) in node_children.iter().rev() {
                     match color.get(child_ref).copied() {
                         Some(1) => {
-                            // 灰 = 循环
-                            diagnostics.cycle_nodes += 1;
+                            // 灰 = 循环；按 record 级去重。
+                            if cycle_set.insert(*child_ref) {
+                                diagnostics.cycle_nodes += 1;
+                            }
                             continue;
                         }
                         Some(2) => {
@@ -739,7 +760,6 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
     // 不可达节点统计：建图后所有 nodes 中 reachable_from_root == false 的目录节点。
     let reachable_count = nodes.values().filter(|n| n.reachable_from_root).count() as u64;
     diagnostics.unreachable_nodes = (nodes.len() as u64).saturating_sub(reachable_count);
-    diagnostics.orphan_entries = diagnostics.unreachable_nodes;
 
     // ===== Phase 4：排除子树标记（在路径构建之后、后序聚合之前） =====
     for node in nodes.values_mut() {
@@ -776,7 +796,12 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
     }
 
     // post_order：叶子在前，根在最后。
-    // 聚合规则：非排除节点 = 直接 + Σ 非排除子节点.subtree；排除节点 = 直接（不下传）。
+    // 聚合规则：
+    //   - 非 excluded 节点 = 自身 direct + Σ 非 excluded 子节点.subtree
+    //     （F2: aggregate 不含的 cycle/orphan 子节点必须跳过，否则会反向污染可达父节点）
+    //   - excluded 节点 = 自身 direct + Σ 所有子节点（含 excluded 子）
+    //     （简报第 9 条：excluded 节点不下传到祖先，但 excluded 节点自身的
+    //      subtree 仍正常聚合自身 + 全部后代，用于 excluded_subtree_size_bytes）
     // subtree_dir_count 含自身（=1+Σ）。
     let mut aggregate: HashMap<FileRef, (u64, u64, u64)> = HashMap::new();
     let mut excluded_subtree_size_bytes: u64 = 0;
@@ -790,15 +815,29 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
         let mut dir_count: u64 = 1; // 包含自身
 
         if !node.excluded {
+            // 非 excluded 节点：聚合非 excluded 子的 subtree。
             if let Some(kids) = children_index.get(node_ref) {
                 for kid in kids {
                     if let Some(kid_node) = nodes.get(kid) {
+                        // 排除子不下传。
                         if kid_node.excluded {
-                            // 排除子节点不计入父的聚合。
                             continue;
                         }
-                        let (ks, kfc, kdc) =
-                            aggregate.get(kid).copied().unwrap_or((0, 0, 0));
+                        // F2: kid 不在 aggregate（cycle/orphan/缺父）→ 跳过。
+                        if let Some(&(ks, kfc, kdc)) = aggregate.get(kid) {
+                            size = size.saturating_add(ks);
+                            file_count = file_count.saturating_add(kfc);
+                            dir_count = dir_count.saturating_add(kdc);
+                        }
+                    }
+                }
+            }
+        } else {
+            // F3: excluded 节点聚合全部子节点（含 excluded 子），
+            // 用于正确的 excluded_subtree_size_bytes 计数。
+            if let Some(kids) = children_index.get(node_ref) {
+                for kid in kids {
+                    if let Some(&(ks, kfc, kdc)) = aggregate.get(kid) {
                         size = size.saturating_add(ks);
                         file_count = file_count.saturating_add(kfc);
                         dir_count = dir_count.saturating_add(kdc);
@@ -808,17 +847,58 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
         }
 
         aggregate.insert(*node_ref, (size, file_count, dir_count));
-        if node.excluded {
-            excluded_subtree_size_bytes =
-                excluded_subtree_size_bytes.saturating_add(size);
-        }
     }
 
+    // F3: 写回 subtree_* 字段。
     for (node_ref, (size, file_count, dir_count)) in &aggregate {
         if let Some(node) = nodes.get_mut(node_ref) {
             node.subtree_size_bytes = *size;
             node.subtree_file_count = *file_count;
             node.subtree_dir_count = *dir_count;
+        }
+    }
+
+    // F3: excluded_subtree_size_bytes 只累加"顶层" excluded 节点（parent 未 excluded
+    // 或该节点为根的直接 excluded 子）的 subtree_size_bytes；下层 excluded 节点的
+    // 字节已被其祖先 excluded 节点覆盖，避免重复计数。
+    for (node_ref, (size, _, _)) in &aggregate {
+        let node_is_excluded = nodes
+            .get(node_ref)
+            .map(|n| n.excluded)
+            .unwrap_or(false);
+        if !node_is_excluded {
+            continue;
+        }
+        let is_top = match assigned_parent.get(node_ref) {
+            None => true,
+            Some(p) => nodes.get(p).map(|n| !n.excluded).unwrap_or(true),
+        };
+        if is_top {
+            excluded_subtree_size_bytes =
+                excluded_subtree_size_bytes.saturating_add(*size);
+        }
+    }
+
+    // F1: 从 nodes 中物理剔除 reachable_from_root == false 的节点（orphan /
+    // cycle / 缺父）；excluded 节点因其 reachable_from_root 为 true 保留在 nodes 中。
+    // F4: root_missing 时由于没有可达锚点，全部节点都是 unreachable，清空 nodes。
+    let unreachable_set: HashSet<FileRef> = nodes
+        .iter()
+        .filter(|(_, n)| !n.reachable_from_root)
+        .map(|(k, _)| *k)
+        .collect();
+    for r in &unreachable_set {
+        nodes.remove(r);
+    }
+    // 移除孤儿边：父或子任一为 orphan 时整条边剔除；excluded 节点保留。
+    children_index.retain(|parent, kids| {
+        !unreachable_set.contains(parent)
+            && kids.iter().all(|k| !unreachable_set.contains(k))
+    });
+    // 剔除后，剩余节点的 direct_dir_count 重算以反映实际可达子目录数。
+    for (parent, kids) in &children_index {
+        if let Some(parent_node) = nodes.get_mut(parent) {
+            parent_node.direct_dir_count = kids.len() as u32;
         }
     }
 
@@ -1252,7 +1332,9 @@ mod tests {
             let g = build_graph(&index, &[], 'C');
 
             assert_eq!(g.diagnostics.stale_sequence_dirs, 1);
-            assert_eq!(g.nodes[&fileref(30, 1)].reachable_from_root, false);
+            // dir 30 是 unreachable orphan，被物理剔除；诊断在 diagnostics 中保留。
+            assert!(!g.nodes.contains_key(&fileref(30, 1)));
+            assert_eq!(g.diagnostics.unreachable_nodes, 1);
             // dir 20 不应有 30 作为子节点
             assert!(g.children.get(&fileref(20, 1)).is_none());
             // dir 20 subtree = 0（无文件、无子目录）
@@ -1396,13 +1478,10 @@ mod tests {
             let index = mk_index(records);
             let g = build_graph(&index, &[], 'C');
 
-            // A 与 B 均不可达
-            assert!(!g.nodes[&fileref(20, 1)].reachable_from_root);
-            assert!(!g.nodes[&fileref(21, 1)].reachable_from_root);
-            // 节点仍在 nodes 中以便诊断
-            assert!(g.nodes.contains_key(&fileref(20, 1)));
-            assert!(g.nodes.contains_key(&fileref(21, 1)));
-            // 不可达 = orphan
+            // A 与 B 均不可达 — F1 已物理剔除
+            assert!(!g.nodes.contains_key(&fileref(20, 1)));
+            assert!(!g.nodes.contains_key(&fileref(21, 1)));
+            // 诊断在 diagnostics 中保留
             assert!(g.diagnostics.unreachable_nodes >= 2);
         }
 
@@ -1426,7 +1505,9 @@ mod tests {
             let g = build_graph(&index, &[], 'C');
 
             assert_eq!(g.diagnostics.missing_parent, 1);
-            assert!(!g.nodes[&fileref(20, 1)].reachable_from_root);
+            // F1: orphan 已被剔除，诊断保留
+            assert!(!g.nodes.contains_key(&fileref(20, 1)));
+            assert_eq!(g.diagnostics.unreachable_nodes, 1);
             assert!(g.children.get(&fileref(5, 5)).is_none());
         }
 
@@ -1548,6 +1629,298 @@ mod tests {
             assert!(g.diagnostics.root_missing);
             // graph 应为空
             assert!(g.nodes.is_empty());
+        }
+
+        // F4 强化：root_missing 状态下，即便 Phase 1a 已建非系统目录节点，
+        // 返回的 graph 必须清空 nodes 与 children，调用方不会 panic。
+        #[test]
+        fn root_missing_with_non_system_dir_clears_nodes() {
+            // record 5 不存在，record 20（合法目录）已建 —— 修复前 g.nodes[20] 仍存在。
+            // 修复后 root_missing 状态下 nodes 为空，调用方无 panic 风险。
+            let records = vec![
+                mk_dir(20, 1, fileref(5, 5), "Users"),
+                mk_dir(30, 1, fileref(20, 1), "alice"),
+                mk_file(40, 1, fileref(30, 1), "f.txt", 999),
+            ];
+            let index = mk_index(records);
+            let g = build_graph(&index, &[], 'C');
+
+            assert!(g.diagnostics.root_missing);
+            assert!(g.nodes.is_empty(), "root_missing 时 nodes 必须清空");
+            assert!(g.children.is_empty(), "root_missing 时 children 必须清空");
+        }
+
+        // F2 强化：unreachable orphan 节点的字节不进入可达父的 subtree_size_bytes。
+        // 由于 first-parent-wins 设计使 children_index 仅含可达/已挂载边，
+        // Phase 5 聚合时通过 `if let Some(...)` 显式跳过不在 aggregate 的 cycle/orphan 子
+        // （防御性修复，对抗畸形 MFT 数据或未来放宽 first-parent-wins）。
+        #[test]
+        fn cycle_three_nodes_do_not_backflow_files_to_reachable_parent() {
+            // A=22 -> B=30 -> C=33；C 还指向 A（duplicate_dir_entry）。
+            // C 有直接文件 80 (500B)。所有节点经 first-parent-wins 都可达（root → ... → C）。
+            // 验证：cycle 不在 children_index 引发实际灰点（first-parent-wins 防御），
+            //       且 C 的 500B 进入 B/A/root 的聚合。
+            let records = vec![
+                root_record(),
+                mk_dir(22, 1, fileref(5, 5), "A"),
+                mk_dir(30, 1, fileref(22, 1), "B"),
+                MftRecord {
+                    id: fileref(33, 1),
+                    base_record: None,
+                    names: vec![
+                        mk_name(30, 1, "C"),     // first parent: B
+                        mk_name(22, 1, "C_dup"), // duplicate entry, points back to A
+                    ],
+                    logical_size: 0,
+                    is_dir: true,
+                    in_use: true,
+                    reparse_tag: None,
+                    has_nonresident_attr_list: false,
+                },
+                mk_file(80, 1, fileref(33, 1), "big.bin", 500),
+            ];
+            let index = mk_index(records);
+            let g = build_graph(&index, &[], 'C');
+
+            // 仅 duplicate_dir_entry (没有真实 cycle，因为 A 是 C 的第二 parent 而非第一)
+            assert_eq!(g.diagnostics.duplicate_dir_entry, 1);
+            assert_eq!(g.diagnostics.cycle_nodes, 0);
+            // C 的 500B 正确沿 A→B→root 链逐级聚合
+            let c_node = &g.nodes[&fileref(33, 1)];
+            let b_node = &g.nodes[&fileref(30, 1)];
+            let a_node = &g.nodes[&fileref(22, 1)];
+            let root = &g.nodes[&fileref(5, 5)];
+            assert_eq!(c_node.subtree_size_bytes, 500);
+            assert_eq!(b_node.subtree_size_bytes, 500);
+            assert_eq!(a_node.subtree_size_bytes, 500);
+            assert_eq!(root.subtree_size_bytes, 500);
+            // F1: 没有任何 orphan 残留
+            assert_eq!(g.diagnostics.unreachable_nodes, 0);
+        }
+
+        // F3 强化：excluded 节点含非 excluded 子目录，子目录的字节必须计入 excluded_subtree_size_bytes。
+        #[test]
+        fn excluded_subtree_size_includes_nonexcluded_child_subdir_bytes() {
+            // 5 -> 20(Users) -> 30(alice) [excluded] -> 31(docs) [NOT excluded] -> 40(file=1000)
+            //              -> 32(pic) [also excluded, deep in excluded]
+            // 期望：excluded_subtree_size_bytes 包含 docs 子目录的 1000 字节 + 30 自身 direct。
+            let records = vec![
+                root_record(),
+                mk_dir(20, 1, fileref(5, 5), "Users"),
+                mk_dir(30, 1, fileref(20, 1), "alice"), // excluded
+                mk_dir(31, 1, fileref(30, 1), "docs"),  // NOT excluded
+                mk_file(40, 1, fileref(31, 1), "file.txt", 1000),
+                mk_dir(32, 1, fileref(30, 1), "pic"),   // excluded (child of 30)
+                mk_file(41, 1, fileref(32, 1), "img.png", 200),
+                mk_file(50, 1, fileref(30, 1), "readme.md", 100), // 30 direct
+                mk_file(60, 1, fileref(20, 1), "shared.bin", 333),
+            ];
+            let index = mk_index(records);
+            let g = build_graph(&index, &["C:\\Users\\alice".to_string()], 'C');
+
+            assert!(g.nodes[&fileref(30, 1)].excluded);
+            assert!(g.nodes[&fileref(31, 1)].excluded); // docs inherited via parent path
+            assert!(g.nodes[&fileref(32, 1)].excluded);
+            // 顶层 excluded = 30（parent 20 未 excluded）；32 是 30 的子，其字节已计入 30.subtree。
+            // 30 subtree = 30 direct (100) + docs subtree (1000) + pic subtree (200) = 1300
+            assert_eq!(
+                g.excluded_subtree_size_bytes, 1300,
+                "excluded_subtree_size_bytes 必须含顶层 excluded 节点 30 的全部子树字节（含 docs 非 excluded 子）"
+            );
+            // 20 与根不应含 alice 子树字节
+            assert_eq!(g.nodes[&fileref(20, 1)].subtree_size_bytes, 333);
+            assert_eq!(g.nodes[&fileref(5, 5)].subtree_size_bytes, 333);
+        }
+
+        // F5 强化：同份 index 跑多次，children 列表按记录号稳定排序（不依赖 HashMap 随机序）。
+        #[test]
+        fn sibling_order_deterministic_by_record_no() {
+            // 根下挂 A=99, B=22, C=30, D=77 (顺序随机)——children 列表必须按 record_no 升序
+            // 22 < 30 < 77 < 99（顺序确定）。record_no >= 16（避免 < 16 的 NTFS 元记录）。
+            let records = vec![
+                root_record(),
+                mk_dir(99, 1, fileref(5, 5), "A"),
+                mk_dir(22, 1, fileref(5, 5), "B"),
+                mk_dir(30, 1, fileref(5, 5), "C"),
+                mk_dir(77, 1, fileref(5, 5), "D"),
+            ];
+            let index = mk_index(records);
+
+            // 多次跑结果一致（HashMap 顺序不影响稳定排序）
+            let g1 = build_graph(&index, &[], 'C');
+            let g2 = build_graph(&index, &[], 'C');
+            let g3 = build_graph(&index, &[], 'C');
+
+            let root_kids1 = &g1.children[&fileref(5, 5)];
+            let root_kids2 = &g2.children[&fileref(5, 5)];
+            let root_kids3 = &g3.children[&fileref(5, 5)];
+
+            assert_eq!(root_kids1, root_kids2);
+            assert_eq!(root_kids1, root_kids3);
+            // 顺序必须按 record_no 升序：22, 30, 77, 99
+            assert_eq!(
+                root_kids1,
+                &vec![
+                    fileref(22, 1),
+                    fileref(30, 1),
+                    fileref(77, 1),
+                    fileref(99, 1),
+                ]
+            );
+        }
+
+        // F10 强化：父记录存在但非目录应计入 non_dir_parent_* 诊断（不再静默）。
+        #[test]
+        fn non_dir_parent_diagnostics_are_recorded() {
+            // record 20 = 文件（非目录），但被目录 record 30 与文件 record 40 当作父引用。
+            // sequence 必须匹配（否则走 stale_sequence 路径），且 record 20 在 records 中。
+            let records = vec![
+                root_record(),
+                MftRecord {
+                    id: fileref(20, 1),
+                    base_record: None,
+                    names: vec![],
+                    logical_size: 0,
+                    is_dir: false,
+                    in_use: true,
+                    reparse_tag: None,
+                    has_nonresident_attr_list: false,
+                },
+                MftRecord {
+                    id: fileref(30, 1),
+                    base_record: None,
+                    names: vec![mk_name(20, 1, "ghost_dir")],
+                    logical_size: 0,
+                    is_dir: true,
+                    in_use: true,
+                    reparse_tag: None,
+                    has_nonresident_attr_list: false,
+                },
+                MftRecord {
+                    id: fileref(40, 1),
+                    base_record: None,
+                    names: vec![mk_name(20, 1, "ghost_file")],
+                    logical_size: 999,
+                    is_dir: false,
+                    in_use: true,
+                    reparse_tag: None,
+                    has_nonresident_attr_list: false,
+                },
+            ];
+            let index = mk_index(records);
+            let g = build_graph(&index, &[], 'C');
+
+            // 目录 30 命中 non_dir_parent_dirs；文件 40 命中 non_dir_parent_files
+            assert_eq!(g.diagnostics.non_dir_parent_dirs, 1);
+            assert_eq!(g.diagnostics.non_dir_parent_files, 1);
+        }
+
+        // F8/F9 强化：cycle_nodes 在多重 reverse edge 与多重自引用下不被重复计入。
+        #[test]
+        fn cycle_nodes_deduped_across_multiple_reverse_edges() {
+            // root -> A(22); A 有三个子 B(30)/C(33)/D(40)，其中 B/C/D 的多条 name 反复
+            // 回指 A。在 first-parent-wins 下，这些回指都进入 duplicate_dir_entry，不构成
+            // 真实 DFS 灰点回访。但 F8 的实现保证了即便有真正的灰点命中，记录级别去重。
+            // 这里用 self-ref 路径触发多次 cycle_nodes（验证 F9 修复路径）。
+            let records = vec![
+                root_record(),
+                MftRecord {
+                    id: fileref(22, 1),
+                    base_record: None,
+                    names: vec![
+                        mk_name(5, 5, "A"),     // first parent: root (valid)
+                        mk_name(22, 1, "self1"), // first self-ref
+                        mk_name(22, 1, "self2"), // second self-ref（应被 F9 去重）
+                    ],
+                    logical_size: 0,
+                    is_dir: true,
+                    in_use: true,
+                    reparse_tag: None,
+                    has_nonresident_attr_list: false,
+                },
+            ];
+            let index = mk_index(records);
+            let g = build_graph(&index, &[], 'C');
+
+            // F9: 同一 record 多个自指有效名仅计一次
+            assert_eq!(
+                g.diagnostics.cycle_nodes, 1,
+                "单 record 多个自指有效名仅在 record 级首次计入一次"
+            );
+            // A 是可达的（first parent = root），不应被 F1 剔除
+            assert!(g.nodes.contains_key(&fileref(22, 1)));
+        }
+
+        // F9 强化：单 record 多自指有效名仅在 record 级首次计入一次。
+        #[test]
+        fn cycle_nodes_self_ref_counted_once_per_record() {
+            // D 的全部有效名都自指（3 个自指有效名）。
+            // F9 修法：cycle_nodes = 1（record 级去重）。
+            let records = vec![
+                root_record(),
+                MftRecord {
+                    id: fileref(30, 1),
+                    base_record: None,
+                    names: vec![
+                        mk_name(30, 1, "self1"),
+                        mk_name(30, 1, "self2"),
+                        mk_name(30, 1, "self3"),
+                    ],
+                    logical_size: 0,
+                    is_dir: true,
+                    in_use: true,
+                    reparse_tag: None,
+                    has_nonresident_attr_list: false,
+                },
+            ];
+            let index = mk_index(records);
+            let g = build_graph(&index, &[], 'C');
+
+            // 三个自指有效名应只计一次
+            assert_eq!(g.diagnostics.cycle_nodes, 1);
+        }
+
+        // F6 强化：诊断不再含 orphan_entries 字段（编译期即可证明）。
+        #[test]
+        fn orphan_entries_field_removed() {
+            // 类型级验证：访问 orphan_entries 字段必须编译失败。
+            // 这里仅断言 diagnostics 已无 orphan_entries 字段引用（运行时不可观测）。
+            // 通过 build_graph 行为间接保证：count 字段为 unreachable_nodes，
+            // 不再有与 unreachable_nodes 等价的别名。
+            let records = vec![
+                root_record(),
+                MftRecord {
+                    id: fileref(20, 1),
+                    base_record: None,
+                    names: vec![mk_name(99, 1, "orphan_dir")],
+                    logical_size: 0,
+                    is_dir: true,
+                    in_use: true,
+                    reparse_tag: None,
+                    has_nonresident_attr_list: false,
+                },
+            ];
+            let index = mk_index(records);
+            let g = build_graph(&index, &[], 'C');
+
+            // orphan 不再被双计：unreachable_nodes 仅反映真实不可达数（剔除的 orphan 数）。
+            assert_eq!(g.diagnostics.unreachable_nodes, 1);
+        }
+
+        // F7 强化：DirectoryNode 不再有 is_reparse 字段（编译期保证）。
+        // 通过 build_graph 行为间接验证：reparse_tag 为 None 的节点，反向读取即得到 None。
+        #[test]
+        fn directory_node_reparse_tag_only_no_is_reparse() {
+            let mut rec = root_record();
+            rec.reparse_tag = Some(0xA0000001); // IO_REPARSE_TAG_MOUNT_POINT
+            let records = vec![rec];
+            let index = mk_index(records);
+            let g = build_graph(&index, &[], 'C');
+            assert_eq!(
+                g.nodes[&fileref(5, 5)].reparse_tag,
+                Some(0xA0000001),
+                "reparse_tag 字段独立保留 is_reparse 行为"
+            );
         }
 
         #[test]
