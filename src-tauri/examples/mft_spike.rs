@@ -110,16 +110,6 @@ fn print_summary(s: &SpikeSummary) {
     }
 }
 
-/// 请求语义：传入"目标槽位号"（低 48 位），返回实际命中的记录号与字节。
-#[cfg(windows)]
-fn request_record(
-    vol: &dayu_disk_manager_lib::win32::VolumeHandle,
-    target_slot: u64,
-    record_segment_size: u32,
-) -> Result<dayu_disk_manager_lib::win32::RawFileRecord, VolumeError> {
-    read_mft_record(vol, target_slot, record_segment_size)
-}
-
 #[cfg(windows)]
 fn run_spike(drive: char) -> Result<SpikeSummary, VolumeError> {
     let vol = open_volume(drive)?;
@@ -127,11 +117,11 @@ fn run_spike(drive: char) -> Result<SpikeSummary, VolumeError> {
 
     let record_segment_size = vdata.bytes_per_file_record_segment;
     if record_segment_size == 0 {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
     let slot_count = vdata.slot_count;
     if slot_count == 0 {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
 
     let mut summary = SpikeSummary {
@@ -148,7 +138,7 @@ fn run_spike(drive: char) -> Result<SpikeSummary, VolumeError> {
     let mut next_request: u64 = slot_count - 1;
 
     loop {
-        let raw = match request_record(&vol, next_request, record_segment_size) {
+        let raw = match read_mft_record(&vol, next_request, record_segment_size) {
             Ok(raw) => raw,
             Err(VolumeError::Io { code, operation }) => {
                 // 简报 0.3：普通 I/O/句柄错误立即 no-go，不掩盖全局错误。

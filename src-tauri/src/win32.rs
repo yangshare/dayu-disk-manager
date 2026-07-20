@@ -221,7 +221,7 @@ pub enum VolumeError {
     /// 卷并非 NTFS（`fs_name` 为实际文件系统名称，例如 `fat32`）。
     UnsupportedFilesystem { actual: String },
     /// 输出缓冲返回的字节数或字段值不合法（截断、零填充被误当字段等）。
-    InvalidData,
+    InvalidVolumeData,
     /// 其它 Win32 I/O 错误，保留数值 code 与触发操作名。
     Io { code: u32, operation: &'static str },
 }
@@ -234,7 +234,7 @@ impl std::fmt::Display for VolumeError {
                 f,
                 "不支持的文件系统（仅支持 NTFS，实际为 {actual}）"
             ),
-            VolumeError::InvalidData => f.write_str("卷数据缓冲不合法或被截断"),
+            VolumeError::InvalidVolumeData => f.write_str("卷数据缓冲不合法或被截断"),
             VolumeError::Io { code, operation } => {
                 write!(f, "Win32 I/O 错误：操作={operation} code={code}")
             }
@@ -270,39 +270,86 @@ pub struct VolumeData {
 // 这些函数接收 &[u8] 或对齐缓冲，把可单测的校验逻辑从 Win32 调用中剥离。
 // 真正的 DeviceIoControl 只在 read_volume_data / read_mft_record 里调用。
 //
-// NTFS_VOLUME_DATA_BUFFER 字段偏移（按 windows crate 0.62 绑定的 repr(C)）：
-//   VolumeSerialNumber: i64 @ 0
-//   NumberSectors: i64 @ 8
-//   TotalClusters: i64 @ 16
-//   FreeClusters: i64 @ 24
+// 直接以字节读取字段，避免把任意 Vec<u8> 指针重解释成对齐结构造成 UB。
+
+// ===== NTFS_VOLUME_DATA_BUFFER 字段偏移（windows 0.62 绑定，repr(C)） =====
+//
+// 简报 0.1 要求"直接使用 `windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER`"，
+// 不能只把类型写在注释里。这里通过 `offset_of!` / `size_of!` 把字段名作为
+// 代码符号引用——若 windows crate 升级导致字段重排或重命名，本处会编译失败，
+// 而非静默用旧偏移读错字段。
+//
+// windows 0.62 实际绑定（与微软文档一致）：
+//   VolumeSerialNumber: i64 @ 0      NumberSectors: i64 @ 8
+//   TotalClusters: i64 @ 16          FreeClusters: i64 @ 24
 //   TotalReserved: i64 @ 32
-//   BytesPerSector: u32 @ 40
-//   BytesPerCluster: u32 @ 44
+//   BytesPerSector: u32 @ 40         BytesPerCluster: u32 @ 44
 //   BytesPerFileRecordSegment: u32 @ 48
 //   ClustersPerFileRecordSegment: u32 @ 52
-//   MftValidDataLength: i64 @ 56
-//   ... 后续字段本任务不读
-//
-// 直接以字节读取字段，避免把任意 Vec<u8> 指针重解释成对齐结构造成 UB。
+//   MftValidDataLength: i64 @ 56     MftStartLcn: i64 @ 64
+//   Mft2StartLcn: i64 @ 72           MftZoneStart: i64 @ 80
+//   MftZoneEnd: i64 @ 88
+// 合计 14 个字段 = 5*8 + 4*4 + 5*8 = 96 字节。
+
+#[cfg(windows)]
+const VOLUME_DATA_BYTES_PER_SECTOR_OFFSET: usize =
+    core::mem::offset_of!(windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER, BytesPerSector);
+#[cfg(not(windows))]
+const VOLUME_DATA_BYTES_PER_SECTOR_OFFSET: usize = 40;
+
+#[cfg(windows)]
+const VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET: usize =
+    core::mem::offset_of!(windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER, BytesPerCluster);
+#[cfg(not(windows))]
+const VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET: usize = 44;
+
+#[cfg(windows)]
+const VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET: usize =
+    core::mem::offset_of!(
+        windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER,
+        BytesPerFileRecordSegment
+    );
+#[cfg(not(windows))]
+const VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET: usize = 48;
+
+#[cfg(windows)]
+const VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET: usize =
+    core::mem::offset_of!(
+        windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER,
+        MftValidDataLength
+    );
+#[cfg(not(windows))]
+const VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET: usize = 56;
+
+/// `NTFS_VOLUME_DATA_BUFFER` 结构整体大小（bytes）。
+///
+/// windows 平台用 `size_of!` 直接从绑定类型取得；非 windows 平台回退到
+/// 与 windows 0.62 绑定一致的 96 字节字面量，仅用于让纯函数测试可编译。
+#[cfg(windows)]
+const VOLUME_DATA_BUFFER_SIZE: usize =
+    core::mem::size_of::<windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER>();
+#[cfg(not(windows))]
+const VOLUME_DATA_BUFFER_SIZE: usize = 96;
 
 /// 校验并解析 NTFS_VOLUME_DATA_BUFFER（无扩展）字节切片。
 ///
 /// `bytes_returned` 是 DeviceIoControl 实际写入的字节数，必须覆盖到
-/// 至少 MftValidDataLength 字段（offset 56 + 8 = 64 字节）。
+/// 至少 `MftValidDataLength` 字段末尾。
 fn parse_volume_data_buffer(bytes: &[u8]) -> Result<VolumeData, VolumeError> {
-    // 至少需要读到 MftValidDataLength 末尾（offset 56 + 8 = 64）。
-    const MIN_BYTES_FOR_VOLUME_DATA: usize = 64;
+    // 至少需要读到 MftValidDataLength 末尾（offset + 8）。
+    const MIN_BYTES_FOR_VOLUME_DATA: usize = VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8;
     if bytes.len() < MIN_BYTES_FOR_VOLUME_DATA {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
-    let bytes_per_sector = read_u32_at(bytes, 40)?;
-    let bytes_per_cluster = read_u32_at(bytes, 44)?;
-    let bytes_per_file_record_segment = read_u32_at(bytes, 48)?;
-    let mft_valid_data_length = read_u64_at(bytes, 56)?;
+    let bytes_per_sector = read_u32_at(bytes, VOLUME_DATA_BYTES_PER_SECTOR_OFFSET)?;
+    let bytes_per_cluster = read_u32_at(bytes, VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET)?;
+    let bytes_per_file_record_segment =
+        read_u32_at(bytes, VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET)?;
+    let mft_valid_data_length = read_u64_at(bytes, VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET)?;
 
     if bytes_per_file_record_segment == 0 {
         // 避免除零；只可能由零填充被误解析成字段触发。
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
 
     let slot_count = mft_valid_data_length
@@ -325,11 +372,11 @@ fn parse_volume_data_buffer(bytes: &[u8]) -> Result<VolumeData, VolumeError> {
 /// 关键事实（简报 0.1）：
 /// - `ByteCount` 位于 offset 0，版本号**不**在 offset 0。
 /// - 字段布局（windows 0.62 绑定）：
-///     ByteCount: u32 @ 0
-///     MajorVersion: u16 @ 4
-///     MinorVersion: u16 @ 6
-///     BytesPerPhysicalSector: u32 @ 8
-///     ...
+///   ByteCount: u32 @ 0
+///   MajorVersion: u16 @ 4
+///   MinorVersion: u16 @ 6
+///   BytesPerPhysicalSector: u32 @ 8
+///   ...
 /// - 必须按实际 `bytes_returned` 判断扩展结构是否完整，且校验 `ByteCount`
 ///   真实反映内容大小（不是预分配容量）。
 fn parse_extended_volume_data(
@@ -339,43 +386,78 @@ fn parse_extended_volume_data(
     // 至少要包含 ByteCount(4) + Major(2) + Minor(2) = 8 字节。
     const MIN_EXTENDED_BYTES: usize = 8;
     if bytes_returned < MIN_EXTENDED_BYTES {
-        // 扩展结构不完整——按简报：返回 InvalidData，不得把零填充区解析成版本号。
-        return Err(VolumeError::InvalidData);
+        // 扩展结构不完整——按简报：返回 InvalidVolumeData，不得把零填充区解析成版本号。
+        return Err(VolumeError::InvalidVolumeData);
     }
     if bytes.len() < bytes_returned {
         // bytes_returned 超过切片容量，本身就是错误契约。
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
     let byte_count = read_u32_at(bytes, 0)?;
     // ByteCount 是驱动实际写入的字节数（不含自身字段），用于校验完整性。
     // 我们要求它至少覆盖到 MinorVersion（4 字节）。
     if (byte_count as usize) < 4 {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
     // ByteCount + 4（自身头部）不能多于驱动实际返回的字节数。
     if (byte_count as usize + 4) > bytes_returned {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
     let major = read_u16_at(bytes, 4)?;
     let minor = read_u16_at(bytes, 6)?;
     Ok((major, minor))
 }
 
-/// 从字节切片读取小端 u16，越界返回 InvalidData。
+/// 从 `FSCTL_GET_NTFS_VOLUME_DATA` 的完整输出字节（基础结构 + 可选扩展结构）
+/// 组装 `VolumeData`。
+///
+/// 这是 `read_volume_data` 的纯函数对应物，使其组装逻辑可单测（无需真实
+/// DeviceIoControl）。简报 0.2 修复：扩展数据缺失或解析失败必须返回
+/// `InvalidVolumeData`，不得静默产出 NTFS 0.0 当合法版本号。
+///
+/// `bytes_returned` 是 DeviceIoControl 实际写入的字节数。
+fn assemble_volume_data(bytes: &[u8], bytes_returned: usize) -> Result<VolumeData, VolumeError> {
+    if bytes_returned > bytes.len() {
+        // bytes_returned 超过切片容量，本身就是错误契约。
+        return Err(VolumeError::InvalidVolumeData);
+    }
+    let bytes = &bytes[..bytes_returned];
+
+    let mut data = parse_volume_data_buffer(bytes)?;
+
+    // 扩展结构紧随基础结构之后；按实际返回长度判断是否存在。
+    // 简报 0.2："缺失/截断的扩展卷数据返回 InvalidVolumeData，不得把零填充区
+    // 解析成版本号"。NTFS 驱动在卷正常时总会返回 NTFS_EXTENDED_VOLUME_DATA
+    // （紧随 NTFS_VOLUME_DATA_BUFFER），扩展数据缺失即异常——这里不再静默
+    // 吞掉解析错误产出 0.0 版本号（NTFS 0.0 不是合法版本，T1 会"只接受明确的
+    // NTFS 3.1"，T0 不得产出看似合法但实际无依据的版本）。
+    if bytes_returned <= VOLUME_DATA_BUFFER_SIZE {
+        return Err(VolumeError::InvalidVolumeData);
+    }
+    let ext_bytes = &bytes[VOLUME_DATA_BUFFER_SIZE..];
+    let ext_returned = bytes_returned - VOLUME_DATA_BUFFER_SIZE;
+    let (major, minor) = parse_extended_volume_data(ext_bytes, ext_returned)?;
+    data.major_version = major;
+    data.minor_version = minor;
+
+    Ok(data)
+}
+
+/// 从字节切片读取小端 u16，越界返回 InvalidVolumeData。
 fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16, VolumeError> {
-    let slice = bytes.get(offset..offset + 2).ok_or(VolumeError::InvalidData)?;
+    let slice = bytes.get(offset..offset + 2).ok_or(VolumeError::InvalidVolumeData)?;
     Ok(u16::from_le_bytes([slice[0], slice[1]]))
 }
 
-/// 从字节切片读取小端 u32，越界返回 InvalidData。
+/// 从字节切片读取小端 u32，越界返回 InvalidVolumeData。
 fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, VolumeError> {
-    let slice = bytes.get(offset..offset + 4).ok_or(VolumeError::InvalidData)?;
+    let slice = bytes.get(offset..offset + 4).ok_or(VolumeError::InvalidVolumeData)?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
-/// 从字节切片读取小端 u64，越界返回 InvalidData。
+/// 从字节切片读取小端 u64，越界返回 InvalidVolumeData。
 fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64, VolumeError> {
-    let slice = bytes.get(offset..offset + 8).ok_or(VolumeError::InvalidData)?;
+    let slice = bytes.get(offset..offset + 8).ok_or(VolumeError::InvalidVolumeData)?;
     let mut arr = [0u8; 8];
     arr.copy_from_slice(slice);
     Ok(u64::from_le_bytes(arr))
@@ -419,17 +501,17 @@ fn parse_file_record_output(
     capacity: usize,
 ) -> Result<(u64, &[u8]), VolumeError> {
     if capacity == 0 || output_buf.len() < capacity {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
     let header_offset = file_record_buffer_offset();
     // output header 至少包含 8 字节 FileReferenceNumber + 4 字节 FileRecordLength。
     // 用 header_offset（>= 12）作为最小可用大小。
     if bytes_returned < header_offset {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
     // bytes_returned 不能超过容量。
     if bytes_returned > capacity {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
 
     let file_reference = read_u64_at(output_buf, 0)?;
@@ -438,17 +520,17 @@ fn parse_file_record_output(
 
     let end = header_offset
         .checked_add(file_record_length)
-        .ok_or(VolumeError::InvalidData)?;
+        .ok_or(VolumeError::InvalidVolumeData)?;
     if end > capacity {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
     if end > bytes_returned {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
 
     let record_bytes = output_buf
         .get(header_offset..end)
-        .ok_or(VolumeError::InvalidData)?;
+        .ok_or(VolumeError::InvalidVolumeData)?;
     // 仅保留低 48 位（记录号），丢弃高 16 位序列号。
     let file_ref_low48 = file_reference & 0x0000_FFFF_FFFF_FFFF;
     Ok((file_ref_low48, record_bytes))
@@ -498,7 +580,7 @@ pub fn open_volume(drive_letter: char) -> Result<VolumeHandle, VolumeError> {
     let drive = drive_letter.to_ascii_uppercase();
     if !drive.is_ascii_alphabetic() {
         return Err(VolumeError::Io {
-            code: 0,
+            code: u32::MAX,
             operation: "open_volume/parse_letter",
         });
     }
@@ -507,8 +589,13 @@ pub fn open_volume(drive_letter: char) -> Result<VolumeHandle, VolumeError> {
     // 通过现有 volume_info 路径（同盘符）取得实际文件系统名称，避免对非 NTFS 卷
     // 调用 NTFS 专属 IOCTL（简报 0.1 要求）。
     let fs_root = PathBuf::from(format!(r"{}:\", drive));
+    // volume_info 失败的真实原因（卷不存在 / 权限 / 其它）映射到一个明显非
+    // ERROR_SUCCESS 的占位 code（u32::MAX），避免上层把 code=0（ERROR_SUCCESS）
+    // 误读为成功（简报审查发现）。operation 字段是 &'static str 无法承载动态
+    // 错误信息——但占位 code 已足够让失败可被区分。原始错误诊断可后续 T1 整合
+    // 到全局 AppError 时通过日志补回。
     let (_, is_ntfs) = volume_info(&fs_root).map_err(|_e| VolumeError::Io {
-        code: 0,
+        code: u32::MAX,
         operation: "open_volume/volume_info",
     })?;
     // 重新查询一次拿到名称（volume_info 当前只回 bool；若非 NTFS 在此构造错误）。
@@ -594,30 +681,15 @@ pub fn read_volume_data(vol: &VolumeHandle) -> Result<VolumeData, VolumeError> {
     result.map_err(|e| map_win32_error(e, "DeviceIoControl/GET_NTFS_VOLUME_DATA"))?;
 
     if (bytes_returned as usize) > cap_bytes {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(out.as_ptr() as *const u8, bytes_returned as usize)
     };
 
-    let mut data = parse_volume_data_buffer(bytes)?;
-
-    // 扩展结构位于基础结构之后；按实际返回长度判断是否存在。
-    // NTFS_VOLUME_DATA_BUFFER 大小 = 10 个 i64(8) + 4 个 u32(4) = 96 字节
-    // （windows 0.62 绑定）。DeviceIoControl 在输出缓冲足够时紧随其后
-    // 追加 NTFS_EXTENDED_VOLUME_DATA（按微软文档）。
-    const BASE_VOLUME_DATA_SIZE: usize = 96;
-    if (bytes_returned as usize) > BASE_VOLUME_DATA_SIZE {
-        let ext_bytes = &bytes[BASE_VOLUME_DATA_SIZE..];
-        let ext_returned = (bytes_returned as usize) - BASE_VOLUME_DATA_SIZE;
-        // 扩展结构存在——尝试解析。失败不致命，回退到 0/0 版本。
-        if let Ok((major, minor)) = parse_extended_volume_data(ext_bytes, ext_returned) {
-            data.major_version = major;
-            data.minor_version = minor;
-        }
-    }
-
-    Ok(data)
+    // 组装逻辑（基础结构 + 扩展结构校验）已抽成纯函数 assemble_volume_data，
+    // 可单测覆盖"扩展数据缺失/截断"等场景（简报 0.2 修复）。
+    assemble_volume_data(bytes, bytes_returned as usize)
 }
 
 /// 读取指定文件参考号对应的 MFT 记录。
@@ -639,9 +711,9 @@ pub fn read_mft_record(
     let header_offset = file_record_buffer_offset();
     let buf_size = header_offset
         .checked_add(record_capacity_bytes as usize)
-        .ok_or(VolumeError::InvalidData)?;
+        .ok_or(VolumeError::InvalidVolumeData)?;
     if buf_size == 0 {
-        return Err(VolumeError::InvalidData);
+        return Err(VolumeError::InvalidVolumeData);
     }
     // Vec<u64> 保证 8 字节对齐，匹配 NTFS_FILE_RECORD_OUTPUT_BUFFER 的 i64 字段。
     let words = buf_size.div_ceil(8);
@@ -685,7 +757,7 @@ pub struct VolumeHandle;
 #[cfg(not(windows))]
 pub fn open_volume(_drive_letter: char) -> Result<VolumeHandle, VolumeError> {
     Err(VolumeError::Io {
-        code: 0,
+        code: u32::MAX,
         operation: "open_volume/not_windows",
     })
 }
@@ -693,7 +765,7 @@ pub fn open_volume(_drive_letter: char) -> Result<VolumeHandle, VolumeError> {
 #[cfg(not(windows))]
 pub fn read_volume_data(_vol: &VolumeHandle) -> Result<VolumeData, VolumeError> {
     Err(VolumeError::Io {
-        code: 0,
+        code: u32::MAX,
         operation: "read_volume_data/not_windows",
     })
 }
@@ -705,7 +777,7 @@ pub fn read_mft_record(
     _record_capacity_bytes: u32,
 ) -> Result<RawFileRecord, VolumeError> {
     Err(VolumeError::Io {
-        code: 0,
+        code: u32::MAX,
         operation: "read_mft_record/not_windows",
     })
 }
@@ -797,7 +869,7 @@ mod tests {
         let buf = vec![0u8; 8]; // 仅 8 字节，不足 header（需 >= offset 12）
         let result = parse_file_record_output(&buf, 8, 8);
         assert!(result.is_err(), "短于 header 的缓冲必须返回错误");
-        assert_eq!(result.unwrap_err(), VolumeError::InvalidData);
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
     /// 0.2-2b：FileRecordLength 越界（超出缓冲容量）。
@@ -810,7 +882,7 @@ mod tests {
         buf[8..12].copy_from_slice(&1024u32.to_le_bytes());
         let result = parse_file_record_output(&buf, 32, 32);
         assert!(result.is_err(), "FileRecordLength 越界必须返回错误");
-        assert_eq!(result.unwrap_err(), VolumeError::InvalidData);
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
     /// 0.2-2c：bytes_returned 不足（小于 header + FileRecordLength）。
@@ -824,7 +896,7 @@ mod tests {
         // bytes_returned = 20（仅覆盖 header + 8 字节记录，不够 32 字节）
         let result = parse_file_record_output(&buf, 20, 64);
         assert!(result.is_err(), "bytes_returned 不足必须返回错误");
-        assert_eq!(result.unwrap_err(), VolumeError::InvalidData);
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
     /// 0.2-2d：bytes_returned 超过容量。
@@ -833,7 +905,7 @@ mod tests {
         let buf = vec![0u8; 32];
         let result = parse_file_record_output(&buf, 64, 32);
         assert!(result.is_err(), "bytes_returned 超容量必须返回错误");
-        assert_eq!(result.unwrap_err(), VolumeError::InvalidData);
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
     /// 0.2-2e：合法输出正确解析。
@@ -875,13 +947,13 @@ mod tests {
         assert_eq!(file_ref, 42, "高位序列号应被剥离，仅保留低 48 位");
     }
 
-    /// 0.2-3a：给定缺失的扩展卷数据（bytes_returned < 8），返回 InvalidData。
+    /// 0.2-3a：给定缺失的扩展卷数据（bytes_returned < 8），返回 InvalidVolumeData。
     #[test]
     fn parse_extended_volume_data_too_short() {
         let bytes = vec![0u8; 4]; // 不足 8 字节
         let result = parse_extended_volume_data(&bytes, 4);
         assert!(result.is_err(), "截断扩展数据必须返回错误");
-        assert_eq!(result.unwrap_err(), VolumeError::InvalidData);
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
     /// 0.2-3b：给定截断的扩展卷数据（ByteCount 声称有版本号但 bytes_returned 不够）。
@@ -896,10 +968,10 @@ mod tests {
         // bytes_returned = 8（但 ByteCount + 4 = 104 > 8）
         let result = parse_extended_volume_data(&bytes, 8);
         assert!(result.is_err(), "ByteCount 超过实际返回必须返回错误");
-        assert_eq!(result.unwrap_err(), VolumeError::InvalidData);
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
-    /// 0.2-3c：零填充不得被解析成版本号（ByteCount=0 应返回 InvalidData）。
+    /// 0.2-3c：零填充不得被解析成版本号（ByteCount=0 应返回 InvalidVolumeData）。
     #[test]
     fn parse_extended_volume_data_zero_byte_count_is_invalid() {
         let mut bytes = vec![0u8; 16];
@@ -907,8 +979,8 @@ mod tests {
         bytes[0..4].copy_from_slice(&0u32.to_le_bytes());
         // 后续全零——如果 ByteCount=0 被错误跳过，就会把零当成版本号。
         let result = parse_extended_volume_data(&bytes, 16);
-        assert!(result.is_err(), "ByteCount=0 必须返回 InvalidData，不得把零填充当版本号");
-        assert_eq!(result.unwrap_err(), VolumeError::InvalidData);
+        assert!(result.is_err(), "ByteCount=0 必须返回 InvalidVolumeData，不得把零填充当版本号");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
     /// 0.2-3d：合法扩展卷数据正确解析。
@@ -933,7 +1005,7 @@ mod tests {
         let bytes = vec![0u8; 4]; // 切片只有 4 字节
         let result = parse_extended_volume_data(&bytes, 16); // 声称返回了 16 字节
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), VolumeError::InvalidData);
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
     /// 0.2-4a：ERROR_ACCESS_DENIED (5) 精确映射为 VolumeError::AccessDenied。
@@ -969,14 +1041,15 @@ mod tests {
     #[test]
     fn parse_volume_data_buffer_valid() {
         let mut bytes = vec![0u8; 128];
-        // BytesPerSector = 512
-        bytes[40..44].copy_from_slice(&512u32.to_le_bytes());
-        // BytesPerCluster = 4096
-        bytes[44..48].copy_from_slice(&4096u32.to_le_bytes());
-        // BytesPerFileRecordSegment = 1024
-        bytes[48..52].copy_from_slice(&1024u32.to_le_bytes());
-        // MftValidDataLength = 1048576 (1 MB)
-        bytes[56..64].copy_from_slice(&1_048_576u64.to_le_bytes());
+        // 用与生产代码同一组 const 写入字段——windows crate 升级时二者同步演化。
+        bytes[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1_048_576u64.to_le_bytes());
 
         let result = parse_volume_data_buffer(&bytes);
         assert!(result.is_ok());
@@ -989,38 +1062,48 @@ mod tests {
         assert_eq!(data.slot_count, 1024);
     }
 
-    /// 补充：parse_volume_data_buffer 截断缓冲返回 InvalidData。
+    /// 补充：parse_volume_data_buffer 截断缓冲返回 InvalidVolumeData。
     #[test]
     fn parse_volume_data_buffer_truncated() {
-        let bytes = vec![0u8; 32]; // 不足 64 字节
+        // 不足 MftValidDataLength 末尾（offset + 8）
+        let len = VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8 - 1;
+        let bytes = vec![0u8; len];
         let result = parse_volume_data_buffer(&bytes);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), VolumeError::InvalidData);
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
-    /// 补充：BytesPerFileRecordSegment = 0 返回 InvalidData（防除零）。
+    /// 补充：BytesPerFileRecordSegment = 0 返回 InvalidVolumeData（防除零）。
     #[test]
     fn parse_volume_data_buffer_zero_record_size() {
         let mut bytes = vec![0u8; 128];
-        bytes[40..44].copy_from_slice(&512u32.to_le_bytes());
-        bytes[44..48].copy_from_slice(&4096u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
         // BytesPerFileRecordSegment = 0
-        bytes[48..52].copy_from_slice(&0u32.to_le_bytes());
-        bytes[56..64].copy_from_slice(&1_048_576u64.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1_048_576u64.to_le_bytes());
 
         let result = parse_volume_data_buffer(&bytes);
-        assert!(result.is_err(), "零 BytesPerFileRecordSegment 必须返回 InvalidData");
+        assert!(result.is_err(), "零 BytesPerFileRecordSegment 必须返回 InvalidVolumeData");
     }
 
     /// 补充：slot_count 向上取整验证。
     #[test]
     fn parse_volume_data_buffer_slot_count_ceiling() {
         let mut bytes = vec![0u8; 128];
-        bytes[40..44].copy_from_slice(&512u32.to_le_bytes());
-        bytes[44..48].copy_from_slice(&4096u32.to_le_bytes());
-        bytes[48..52].copy_from_slice(&1024u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
         // MftValidDataLength = 1025（不能被 1024 整除）
-        bytes[56..64].copy_from_slice(&1025u64.to_le_bytes());
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1025u64.to_le_bytes());
 
         let data = parse_volume_data_buffer(&bytes).unwrap();
         // 1025 / 1024 向上取整 = 2
@@ -1035,5 +1118,140 @@ mod tests {
         };
         let msg = format!("{}", err);
         assert!(msg.contains("fat32"), "错误信息应包含实际文件系统名");
+    }
+
+    /// 重要 1 补充：硬编码偏移与 windows 0.62 绑定一致。
+    ///
+    /// 即使在非 windows 平台编译（const 回退到字面量），断言这些字面量
+    /// 与 windows 0.62 的实际字段布局一致——若升级后回退字面量未同步更新，
+    /// 此测试会在 windows 测试运行时暴露偏差。
+    #[cfg(windows)]
+    #[test]
+    fn volume_data_offsets_match_windows_binding() {
+        // 这些值来自 windows 0.62 实际绑定的 offset_of! / size_of!。
+        // 字段布局见模块顶部注释。
+        assert_eq!(VOLUME_DATA_BYTES_PER_SECTOR_OFFSET, 40);
+        assert_eq!(VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET, 44);
+        assert_eq!(VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET, 48);
+        assert_eq!(VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET, 56);
+        assert_eq!(VOLUME_DATA_BUFFER_SIZE, 96);
+    }
+
+    /// 重要 2 修复-a：assemble_volume_data 在扩展数据缺失（bytes_returned
+    /// 刚好等于基础结构大小）时返回 InvalidVolumeData，不产出 0.0 版本号。
+    #[test]
+    fn assemble_volume_data_missing_extension_returns_error() {
+        let mut bytes = vec![0u8; VOLUME_DATA_BUFFER_SIZE];
+        // 填入合法的基础字段值
+        bytes[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1_048_576u64.to_le_bytes());
+
+        // bytes_returned 恰好等于基础结构大小，没有扩展数据
+        let result = assemble_volume_data(&bytes, VOLUME_DATA_BUFFER_SIZE);
+        assert!(result.is_err(), "缺失扩展数据必须返回错误");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+    }
+
+    /// 重要 2 修复-b：assemble_volume_data 在扩展数据截断（基础结构后跟
+    /// 不足 8 字节）时返回 InvalidVolumeData。
+    #[test]
+    fn assemble_volume_data_truncated_extension_returns_error() {
+        let mut bytes = vec![0u8; VOLUME_DATA_BUFFER_SIZE + 4]; // 仅 4 字节扩展
+        bytes[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1_048_576u64.to_le_bytes());
+
+        let result = assemble_volume_data(&bytes, VOLUME_DATA_BUFFER_SIZE + 4);
+        assert!(result.is_err(), "截断扩展数据必须返回错误");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+    }
+
+    /// 重要 2 修复-c：assemble_volume_data 在零填充扩展（ByteCount=0）时
+    /// 返回 InvalidVolumeData，不得把零当版本号。
+    #[test]
+    fn assemble_volume_data_zero_padded_extension_returns_error() {
+        let mut bytes = vec![0u8; VOLUME_DATA_BUFFER_SIZE + 16];
+        bytes[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1_048_576u64.to_le_bytes());
+        // 扩展区全零（ByteCount=0）——不得被解析成 NTFS 0.0。
+
+        let result = assemble_volume_data(&bytes, VOLUME_DATA_BUFFER_SIZE + 16);
+        assert!(result.is_err(), "零填充扩展数据不得被当合法版本号");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+    }
+
+    /// 重要 2 修复-d：assemble_volume_data 在合法完整输入下产出含版本号的
+    /// VolumeData。
+    #[test]
+    fn assemble_volume_data_valid() {
+        let mut bytes = vec![0u8; VOLUME_DATA_BUFFER_SIZE + 16];
+        bytes[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1_048_576u64.to_le_bytes());
+        // 扩展结构：ByteCount=8, Major=3, Minor=1
+        let ext_off = VOLUME_DATA_BUFFER_SIZE;
+        bytes[ext_off..ext_off + 4].copy_from_slice(&8u32.to_le_bytes());
+        bytes[ext_off + 4..ext_off + 6].copy_from_slice(&3u16.to_le_bytes());
+        bytes[ext_off + 6..ext_off + 8].copy_from_slice(&1u16.to_le_bytes());
+
+        let data = assemble_volume_data(&bytes, VOLUME_DATA_BUFFER_SIZE + 16).unwrap();
+        assert_eq!(data.bytes_per_sector, 512);
+        assert_eq!(data.bytes_per_cluster, 4096);
+        assert_eq!(data.bytes_per_file_record_segment, 1024);
+        assert_eq!(data.mft_valid_data_length, 1_048_576);
+        assert_eq!(data.major_version, 3, "扩展数据中的版本号应被填入");
+        assert_eq!(data.minor_version, 1);
+        assert_eq!(data.slot_count, 1024);
+    }
+
+    /// 重要 2 修复-e：bytes_returned 超过切片容量时返回 InvalidVolumeData。
+    #[test]
+    fn assemble_volume_data_returned_exceeds_slice() {
+        let bytes = vec![0u8; 32];
+        let result = assemble_volume_data(&bytes, 128);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+    }
+
+    /// 次要补充：map_win32_error 对非标准 HRESULT（高位不是 0x80070000 模式）
+    /// 的 fallback 路径——保留 HRESULT 原值作为 code。
+    #[cfg(windows)]
+    #[test]
+    fn map_win32_error_nonstandard_hresult_falls_back() {
+        // 构造一个非 HRESULT_FROM_WIN32 模式的 HRESULT（高位不是 0x8007xxxx）
+        // 例如 0x80004003 E_POINTER —— 不属于 Win32 错误码家族。
+        let hr = windows::core::HRESULT(0x8000_4003u32 as i32);
+        let err = windows::core::Error::from_hresult(hr);
+        let mapped = map_win32_error(err, "nonstandard_op");
+        match mapped {
+            VolumeError::Io { code, operation } => {
+                // fallback 路径保留 HRESULT 整体值（& 0xFFFF 之外的部分）
+                assert_eq!(code, 0x8000_4003, "非标准 HRESULT 应回退为整体值");
+                assert_eq!(operation, "nonstandard_op");
+            }
+            other => panic!("期望 Io 变体，得到 {:?}", other),
+        }
     }
 }
