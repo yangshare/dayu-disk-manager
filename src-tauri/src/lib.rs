@@ -5,6 +5,7 @@ pub mod file_ops;
 pub mod history;
 pub mod journal;
 pub mod junction;
+pub mod mft;
 pub mod migrator;
 pub mod models;
 pub mod safety;
