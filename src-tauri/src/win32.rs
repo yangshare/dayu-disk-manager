@@ -371,7 +371,7 @@ fn parse_volume_data_buffer(bytes: &[u8]) -> Result<VolumeData, VolumeError> {
         read_u32_at(bytes, VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET)?;
     let mft_valid_data_length_i64 = read_i64_at(bytes, VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET)?;
 
-    if bytes_per_file_record_segment == 0 {
+    if bytes_per_sector == 0 || bytes_per_cluster == 0 || bytes_per_file_record_segment == 0 {
         // 避免除零；只可能由零填充被误解析成字段触发。
         return Err(VolumeError::InvalidVolumeData);
     }
@@ -873,6 +873,18 @@ pub fn read_volume_data(_vol: &VolumeHandle) -> Result<VolumeData, VolumeError> 
 }
 
 #[cfg(not(windows))]
+pub fn read_mft_record(
+    _vol: &VolumeHandle,
+    _file_reference: u64,
+    _record_capacity_bytes: u32,
+) -> Result<RawFileRecord, VolumeError> {
+    Err(VolumeError::Io {
+        code: u32::MAX,
+        operation: "read_mft_record/not_windows",
+    })
+}
+
+#[cfg(not(windows))]
 pub fn request_elevation() -> Result<ElevationOutcome, VolumeError> {
     Err(VolumeError::Io {
         code: u32::MAX,
@@ -1026,6 +1038,30 @@ mod tests {
         assert!(result.is_ok(), "合法缓冲应成功解析");
         let (file_ref, record_bytes) = result.unwrap();
         assert_eq!(file_ref, 42, "低 48 位记录号应为 42");
+        assert_eq!(record_bytes.len(), 1024);
+        assert!(record_bytes.iter().all(|&b| b == 0xAA), "记录体内容应全为 0xAA");
+    }
+
+    /// 0.2-2e-rec-zero：record 0 正确解析。
+    #[test]
+    fn parse_file_record_output_record_zero() {
+        let offset = file_record_buffer_offset();
+        let record_len = 1024usize;
+        let cap = offset + record_len;
+        let mut buf = vec![0u8; cap];
+        // FileReferenceNumber = 0（低 48 位保留为 0）
+        buf[0..8].copy_from_slice(&0u64.to_le_bytes());
+        // FileRecordLength = 1024
+        buf[8..12].copy_from_slice(&1024u32.to_le_bytes());
+        // 填充记录体为 0xAA
+        for b in buf.iter_mut().skip(offset).take(record_len) {
+            *b = 0xAA;
+        }
+        let bytes_returned = cap;
+        let result = parse_file_record_output(&buf, bytes_returned, cap);
+        assert!(result.is_ok(), "record 0 应成功解析");
+        let (file_ref, record_bytes) = result.unwrap();
+        assert_eq!(file_ref, 0, "低 48 位记录号应为 0");
         assert_eq!(record_bytes.len(), 1024);
         assert!(record_bytes.iter().all(|&b| b == 0xAA), "记录体内容应全为 0xAA");
     }
@@ -1189,6 +1225,39 @@ mod tests {
 
         let result = parse_volume_data_buffer(&bytes);
         assert!(result.is_err(), "零 BytesPerFileRecordSegment 必须返回 InvalidVolumeData");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+    }
+
+    /// 补充：BytesPerSector 或 BytesPerCluster 为 0 返回 InvalidVolumeData（防除零）。
+    #[test]
+    fn parse_volume_data_buffer_zero_sector_or_cluster() {
+        // bytes_per_sector = 0
+        let mut bytes_sector_zero = vec![0u8; 128];
+        bytes_sector_zero[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        bytes_sector_zero[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&4096u32.to_le_bytes());
+        bytes_sector_zero[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        bytes_sector_zero[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1_048_576u64.to_le_bytes());
+        let result = parse_volume_data_buffer(&bytes_sector_zero);
+        assert!(result.is_err(), "零 BytesPerSector 必须返回 InvalidVolumeData");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
+
+        // bytes_per_cluster = 0
+        let mut bytes_cluster_zero = vec![0u8; 128];
+        bytes_cluster_zero[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+            .copy_from_slice(&512u32.to_le_bytes());
+        bytes_cluster_zero[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        bytes_cluster_zero[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+            .copy_from_slice(&1024u32.to_le_bytes());
+        bytes_cluster_zero[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+            .copy_from_slice(&1_048_576u64.to_le_bytes());
+        let result = parse_volume_data_buffer(&bytes_cluster_zero);
+        assert!(result.is_err(), "零 BytesPerCluster 必须返回 InvalidVolumeData");
+        assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
     /// 补充：slot_count 向上取整验证。
