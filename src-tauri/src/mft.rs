@@ -518,8 +518,11 @@ pub fn apply_usa_fixup(
 pub fn decode_data_runs(bytes: &[u8]) -> Result<Vec<DataRun>, MftError> {
     let mut runs = Vec::new();
     let mut pos = 0usize;
-    // 累加偏移（前一尾 + 当前偏移）；首段为绝对 LCN。
-    let mut prev_end_lcn: i64 = 0;
+    // NTFS mapping pairs：每段起始 LCN 的偏移是相对"前一个 allocated 段的起始 LCN"
+    // 的有符号增量（flatcap/linux-ntfs 权威规范：this_LCN = previous_start_LCN +
+    // signed_offset）。首段 prev_start_lcn=0 即绝对 LCN；sparse 段无物理位置、
+    // 不推进 prev_start_lcn（下一段仍以最近一个 allocated 段起始 LCN 为基准）。
+    let mut prev_start_lcn: i64 = 0;
 
     while pos < bytes.len() {
         let header = bytes[pos];
@@ -567,17 +570,14 @@ pub fn decode_data_runs(bytes: &[u8]) -> Result<Vec<DataRun>, MftError> {
             // 数据不可能在 LCN 0），T2 读取时应跳过/补零。
             0
         } else {
-            prev_end_lcn.checked_add(signed_offset).ok_or(MftError::BadRecord {
+            prev_start_lcn.checked_add(signed_offset).ok_or(MftError::BadRecord {
                 ref_no: 0,
             })?
         };
-        // 累加位置用于下一段相对偏移。**sparse 段不推进 prev_end**（无物理位置），
-        // 下一段 allocated 段仍以最近一个 allocated 段尾部为基准；allocated 段
-        // 用本段 length 推进 prev_end。
+        // 推进基准为"本段起始 LCN"（不是结束 LCN）：下一段的偏移相对本段起始。
+        // sparse 段（off_size==0）不推进 prev_start_lcn，保持上一个 allocated 段的起始。
         if off_size != 0 {
-            prev_end_lcn = start_lcn
-                .checked_add(length_clusters as i64)
-                .ok_or(MftError::BadRecord { ref_no: 0 })?;
+            prev_start_lcn = start_lcn;
         }
 
         runs.push(DataRun {
@@ -731,6 +731,11 @@ fn parse_file_name(
         as usize;
     let value_length =
         read_u32_at(attr.bytes, ATTR_RESIDENT_VALUE_LENGTH_OFFSET, record_no)? as usize;
+    // value_offset 必须落在 resident 属性头之后（>= ATTR_RESIDENT_HEADER_LEN），
+    // 否则 malformed 记录会让 header 字节被当作 parent/name 解码。
+    if value_offset < ATTR_RESIDENT_HEADER_LEN {
+        return Err(MftError::BadRecord { ref_no: record_no });
+    }
     // value 起始是相对属性字节切片的 value_offset；value 的内容范围是
     // [value_offset, value_offset + value_length)，且必须落在 attr.bytes 内。
     let value_end = value_offset
@@ -1036,11 +1041,23 @@ pub fn parse_record(
                         accumulate_data_size(&mut logical_size, attr, logical, record_no)?;
                     }
                 } else if seen_data_streams.insert(key) {
-                    let value_length = read_u32_at(
+                    let value_offset = read_u16_at(
                         attr.bytes,
-                        ATTR_RESIDENT_VALUE_LENGTH_OFFSET,
+                        ATTR_RESIDENT_VALUE_OFFSET_FIELD,
                         record_no,
                     )? as u64;
+                    let value_length =
+                        read_u32_at(attr.bytes, ATTR_RESIDENT_VALUE_LENGTH_OFFSET, record_no)? as u64;
+                    // resident $DATA 边界校验：value 范围 [value_offset, value_offset+value_length)
+                    // 必须落在 attr.bytes 内（与 parse_file_name 同款），防止 malformed 记录
+                    // 声明超大 value_length 而虚高 logical_size。校验通过即丢弃，value_length
+                    // 本身即为逻辑大小。
+                    let value_end = value_offset
+                        .checked_add(value_length)
+                        .ok_or(MftError::BadRecord { ref_no: record_no })?;
+                    if value_end > attr.bytes.len() as u64 {
+                        return Err(MftError::BadRecord { ref_no: record_no });
+                    }
                     accumulate_data_size(&mut logical_size, attr, value_length, record_no)?;
                 }
             }
@@ -1222,7 +1239,9 @@ pub fn extract_mft_data_runs(
             let lowest_vcn = read_u64_at(attr.bytes, ATTR_NONRES_LOWEST_VCN_OFFSET, 0)?;
             if lowest_vcn == 0 {
                 let run_offset = read_u16_at(attr.bytes, ATTR_NONRES_RUN_OFFSET_FIELD, 0)? as usize;
-                if run_offset > attr.length {
+                // run_offset 必须落在 non-resident 属性头之后且不超过属性长度边界，
+                // 否则 malformed 记录会让 header 字节被当作 mapping pairs 解码。
+                if run_offset < ATTR_NONRESIDENT_HEADER_LEN || run_offset > attr.length {
                     return Err(MftError::BadRecord { ref_no: 0 });
                 }
                 let run_bytes = &attr.bytes[run_offset..attr.length];
@@ -1262,6 +1281,11 @@ impl MftFileReader {
         validate_volume_data(&volume_data)?;
         let record_size = volume_data.bytes_per_file_record_segment;
         let record0 = read_mft_record(vol, 0, record_size).map_err(MftError::from)?;
+        // FSCTL_GET_NTFS_FILE_RECORD 按 slot 递减枚举，可能返回邻近记录而非 slot 0。
+        // 生产 reader 必须拒绝非记录 0 的返回，否则会定位错 `$MFT` Data Run。
+        if record0.file_reference != 0 {
+            return Err(MftError::InvalidVolumeData);
+        }
         let runs = extract_mft_data_runs(&record0.bytes, volume_data.bytes_per_sector)?;
         if runs.is_empty() {
             return Err(MftError::BadRecord { ref_no: 0 });
@@ -1280,11 +1304,16 @@ impl MftFileReader {
                 .checked_mul(bpc)
                 .ok_or(MftError::InvalidVolumeData)?;
             let current_len = bytes.len() as u64;
-            if current_len + run_bytes > valid_len {
+            // checked_add 防溢出：run_bytes 来自不可信 Data Run length × cluster_size，
+            // 裸 + 在 u64 溢出时会绕过 > valid_len 比较。
+            let new_len = current_len
+                .checked_add(run_bytes)
+                .ok_or(MftError::InvalidVolumeData)?;
+            if new_len > valid_len {
                 return Err(MftError::InvalidVolumeData);
             }
             if run.start_lcn == 0 {
-                bytes.resize((current_len + run_bytes) as usize, 0);
+                bytes.resize(new_len as usize, 0);
             } else {
                 let offset = (run.start_lcn as u64)
                     .checked_mul(bpc)
@@ -1633,22 +1662,22 @@ mod tests {
 
     #[test]
     fn decode_data_runs_two_runs_accumulates_offset() {
-        // 第一段：len=10, off=100（绝对 LCN=100，覆盖 [100,110)）
-        // 第二段：len=20, off=50（绝对 LCN=110+50=160，覆盖 [160,180)）
+        // 第一段：len=10, off=100（绝对 LCN=100，起始 LCN=100）
+        // 第二段：len=20, off=50（相对前一段起始 LCN：100+50=150，覆盖 [150,170)）
         let runs_bytes = [0x11, 10, 100, 0x11, 20, 50, 0x00];
         let runs = decode_data_runs(&runs_bytes).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].start_lcn, 100);
         assert_eq!(runs[0].length_clusters, 10);
-        assert_eq!(runs[1].start_lcn, 160);
+        assert_eq!(runs[1].start_lcn, 150);
         assert_eq!(runs[1].length_clusters, 20);
     }
 
     #[test]
     fn decode_data_runs_negative_offset() {
-        // 第一段：header 0x21 = len_size=1, off_size=2；len=10, off=200（绝对 LCN=200）
+        // 第一段：header 0x21 = len_size=1, off_size=2；len=10, off=200（绝对 LCN=200，起始 200）
         //   200 fits in positive range of i16 (max 32767)。
-        // 第二段：header 0x21 = len_size=1, off_size=2；len=5, off=-100（绝对 LCN=210-100=110）
+        // 第二段：header 0x21 = len_size=1, off_size=2；len=5, off=-100（相对前一段起始：200-100=100）
         //   -100 as i16 LE = 0xFF9C。
         let neg_off_bytes = (-100i16).to_le_bytes();
         let runs_bytes = [
@@ -1659,7 +1688,7 @@ mod tests {
         let runs = decode_data_runs(&runs_bytes).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].start_lcn, 200);
-        assert_eq!(runs[1].start_lcn, 110);
+        assert_eq!(runs[1].start_lcn, 100);
     }
 
     #[test]
@@ -1688,11 +1717,11 @@ mod tests {
 
     #[test]
     fn decode_data_runs_sparse_extent() {
-        // header 0x21 = len_size=1, off_size=2（用 2 字节 off 让 200/310 在正数范围内）
-        // 第一段：len=10, off=100（绝对 LCN=100，prev_end=110）
+        // header 0x21 = len_size=1, off_size=2（用 2 字节 off 让 200/300 在正数范围内）
+        // 第一段：len=10, off=100（绝对 LCN=100，prev_start=100）
         // 第二段：sparse（header 0x01：len_size=1, off_size=0），len=5（start_lcn=0；
-        //   sparse 不推进 prev_end，仍为 110）
-        // 第三段：len=3, off=200（绝对 LCN = 110 + 200 = 310）
+        //   sparse 不推进 prev_start，仍为 100）
+        // 第三段：len=3, off=200（相对前一 allocated 段起始：100+200=300）
         let runs_bytes = [
             0x21, 10, 100, 0,
             0x01, 5,
@@ -1705,7 +1734,7 @@ mod tests {
         assert_eq!(runs[0].length_clusters, 10);
         assert_eq!(runs[1].start_lcn, 0); // sparse：无物理分配
         assert_eq!(runs[1].length_clusters, 5);
-        assert_eq!(runs[2].start_lcn, 310); // prev_end 仍为 110（sparse 不推进）
+        assert_eq!(runs[2].start_lcn, 300); // prev_start 仍为 100（sparse 不推进）
     }
 
     #[test]
@@ -1721,9 +1750,9 @@ mod tests {
     #[test]
     fn decode_data_runs_mixed_allocated_and_sparse() {
         // [allocated, sparse, allocated] 序列：
-        //   第一段 allocated：len=10, off=100 -> start_lcn=100, prev_end=110
-        //   第二段 sparse：len=5 -> start_lcn=0，prev_end 保持 110（不推进）
-        //   第三段 allocated：len=3, off=50 -> start_lcn=110+50=160, prev_end=163
+        //   第一段 allocated：len=10, off=100 -> start_lcn=100, prev_start=100
+        //   第二段 sparse：len=5 -> start_lcn=0，prev_start 保持 100（不推进）
+        //   第三段 allocated：len=3, off=50 -> start_lcn=100+50=150（相对前段起始）
         let runs_bytes = [
             0x11, 10, 100,
             0x01, 5,
@@ -1736,8 +1765,23 @@ mod tests {
         assert_eq!(runs[0].length_clusters, 10);
         assert_eq!(runs[1].start_lcn, 0);
         assert_eq!(runs[1].length_clusters, 5);
-        assert_eq!(runs[2].start_lcn, 160);
+        assert_eq!(runs[2].start_lcn, 150);
         assert_eq!(runs[2].length_clusters, 3);
+    }
+
+    #[test]
+    fn decode_data_runs_offset_base_is_start_not_end() {
+        // 钉死规范：偏移基准是前一 allocated 段的"起始 LCN"，不是"结束 LCN"。
+        // 第一段：len=10, off=100 -> start=100（起始），end=110。
+        // 第二段：len=5, off=20 -> 若基准为起始：100+20=120；若基准为结束：110+20=130。
+        // 规范要求 120。
+        let runs_bytes = [0x11, 10, 100, 0x11, 5, 20, 0x00];
+        let runs = decode_data_runs(&runs_bytes).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].start_lcn, 100);
+        assert_eq!(runs[0].length_clusters, 10);
+        assert_eq!(runs[1].start_lcn, 120, "偏移必须相对前段起始 LCN(100)，不是结束 LCN(110)");
+        assert_eq!(runs[1].length_clusters, 5);
     }
 
     // ===== sign_extend =====
