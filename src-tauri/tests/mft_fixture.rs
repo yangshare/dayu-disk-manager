@@ -16,7 +16,6 @@ const FIXTURE_DIR: &str = "tests/fixtures/ntfs_sample/raw";
 /// 卷几何参数（来自 volume_meta.txt）。
 const BYTES_PER_SECTOR: u32 = 512;
 const BYTES_PER_CLUSTER: u32 = 4096;
-const BYTES_PER_FILE_RECORD_SEGMENT: u32 = 1024;
 const MFT_VALID_DATA_LENGTH: u64 = 262144;
 
 /// 读取指定记录号的 fixture 二进制文件。
@@ -108,7 +107,10 @@ fn alpha_txt_resident_data_22_bytes() {
     assert!(!rec.is_dir);
     assert!(rec.base_record.is_none());
     // alpha.txt 有两个 FILE_NAME 入口（硬链接：alpha.txt + hardlink_to_alpha.txt）
-    assert!(rec.names.len() >= 2, "alpha.txt 应有至少 2 个 FILE_NAME 入口");
+    assert!(
+        rec.names.len() >= 2,
+        "alpha.txt 应有至少 2 个 FILE_NAME 入口"
+    );
     let effective = select_effective_names(&rec.names);
     assert_eq!(effective.len(), 2, "两个 Win32 入口都应保留");
     // 第一个入口：parent = mft_src (39)
@@ -118,7 +120,11 @@ fn alpha_txt_resident_data_22_bytes() {
     assert_eq!(effective[1].name, "hardlink_to_alpha.txt");
     assert_eq!(effective[1].parent.record_no, REC_SUB1);
     // 逻辑大小 = 22（resident $DATA）+ 16（custom_stream ADS）
-    assert_eq!(rec.logical_size, 22 + 16, "alpha.txt logical_size 应含默认流 + ADS");
+    assert_eq!(
+        rec.logical_size,
+        22 + 16,
+        "alpha.txt logical_size 应含默认流 + ADS"
+    );
 }
 
 // ===== non-resident $DATA（big.bin，1MB+5B = 1048576+5 = 1048581） =====
@@ -151,7 +157,10 @@ fn extension_record_has_base_and_no_file_name() {
     // extension record 的 base_record 非零
     assert!(rec.base_record.is_some());
     let base = rec.base_record.unwrap();
-    assert_eq!(base.record_no, REC_BIG, "extension 应指向 big.bin (record 41)");
+    assert_eq!(
+        base.record_no, REC_BIG,
+        "extension 应指向 big.bin (record 41)"
+    );
     // extension record 没有 $FILE_NAME
     assert!(rec.names.is_empty(), "extension record 不应有 FILE_NAME");
 }
@@ -269,14 +278,19 @@ fn record_0_mft_data_run_decode() {
 
     // 遍历属性找到 non-resident $DATA（未命名，attribute name 为空）
     let first_attr = u16::from_le_bytes([fixed[0x14], fixed[0x15]]) as usize;
-    let bytes_in_use = u32::from_le_bytes([fixed[0x18], fixed[0x19], fixed[0x1A], fixed[0x1B]])
-        as usize;
+    let bytes_in_use =
+        u32::from_le_bytes([fixed[0x18], fixed[0x19], fixed[0x1A], fixed[0x1B]]) as usize;
     let mut off = first_attr;
     let mut found_runs = None;
     while off + 16 <= bytes_in_use {
-        let attr_type = u32::from_le_bytes([fixed[off], fixed[off + 1], fixed[off + 2], fixed[off + 3]]);
-        let attr_len = u32::from_le_bytes([fixed[off + 4], fixed[off + 5], fixed[off + 6], fixed[off + 7]])
-            as usize;
+        let attr_type =
+            u32::from_le_bytes([fixed[off], fixed[off + 1], fixed[off + 2], fixed[off + 3]]);
+        let attr_len = u32::from_le_bytes([
+            fixed[off + 4],
+            fixed[off + 5],
+            fixed[off + 6],
+            fixed[off + 7],
+        ]) as usize;
         if attr_type == 0xFFFF_FFFF || attr_len == 0 {
             break;
         }
@@ -284,7 +298,8 @@ fn record_0_mft_data_run_decode() {
             // non-resident $DATA：检查是否为未命名（name_len == 0）
             let name_len = fixed[off + 9];
             if name_len == 0 {
-                let run_offset = u16::from_le_bytes([fixed[off + 0x20], fixed[off + 0x21]]) as usize;
+                let run_offset =
+                    u16::from_le_bytes([fixed[off + 0x20], fixed[off + 0x21]]) as usize;
                 let run_bytes = &fixed[off + run_offset..off + attr_len];
                 let runs = decode_data_runs(run_bytes).expect("Data Run 解码应成功");
                 found_runs = Some(runs);
@@ -298,11 +313,7 @@ fn record_0_mft_data_run_decode() {
     assert!(!runs.is_empty(), "Data Run 序列不应为空");
     // 每个 run 的 start_lcn >= 0 且 length_clusters > 0
     for run in &runs {
-        assert!(
-            run.start_lcn >= 0,
-            "Data Run start_lcn 应非负：{:?}",
-            run
-        );
+        assert!(run.start_lcn >= 0, "Data Run start_lcn 应非负：{:?}", run);
         assert!(
             run.length_clusters > 0,
             "Data Run length_clusters 应为正：{:?}",
@@ -395,7 +406,10 @@ fn alpha_txt_custom_stream_size() {
 fn extension_stream5_nonresident_102_bytes() {
     // stream5 在 extension record 49 上是 non-resident，logical size = 102
     let rec = parse_fixture_record(49);
-    assert!(rec.logical_size >= 102, "extension 49 应含 stream5 (102B non-resident)");
+    assert!(
+        rec.logical_size >= 102,
+        "extension 49 应含 stream5 (102B non-resident)"
+    );
 }
 
 // ===== 多硬链接精确测试 =====
@@ -408,7 +422,10 @@ fn alpha_txt_two_parents_hardlink() {
     assert_eq!(effective.len(), 2);
     let parents: Vec<u64> = effective.iter().map(|n| n.parent.record_no).collect();
     assert!(parents.contains(&REC_MFT_SRC), "应有 parent=mft_src(39)");
-    assert!(parents.contains(&REC_SUB1), "应有 parent=sub1(42)（硬链接）");
+    assert!(
+        parents.contains(&REC_SUB1),
+        "应有 parent=sub1(42)（硬链接）"
+    );
     // 两个入口的 sequence 都应非零
     for name in &effective {
         assert!(name.parent.sequence > 0, "parent sequence 应非零");
@@ -511,7 +528,9 @@ fn system_records_1_through_4_specific_assertions() {
             let effective = select_effective_names(&rec.names);
             let names: Vec<&str> = effective.iter().map(|n| n.name.as_str()).collect();
             assert!(
-                names.iter().any(|n| n.contains(&name_hint[1..]) || *n == name_hint),
+                names
+                    .iter()
+                    .any(|n| n.contains(&name_hint[1..]) || *n == name_hint),
                 "记录 {} 的 $FILE_NAME 应含 {}，实际={:?}",
                 rec_no,
                 name_hint,

@@ -8,10 +8,10 @@ pub mod junction;
 pub mod mft;
 pub mod migrator;
 pub mod models;
+pub mod process_probe;
 pub mod safety;
 pub mod scanner;
 pub mod store;
-pub mod process_probe;
 
 #[cfg(windows)]
 pub mod win32;
@@ -30,13 +30,18 @@ pub fn is_elevated_scan_start(args: &[impl AsRef<str>]) -> bool {
 pub fn run() {
     let data_dir = win32::local_appdata_dayu_dir().expect("无法解析 %LOCALAPPDATA%");
     let store = store::Store::new(&data_dir).expect("无法初始化 store");
-    let journal = journal::Journal::new(data_dir.join("operation_journal.jsonl")).expect("无法初始化 journal");
-    let history = history::History::new(data_dir.join("history.jsonl")).expect("无法初始化 history");
+    let journal = journal::Journal::new(data_dir.join("operation_journal.jsonl"))
+        .expect("无法初始化 journal");
+    let history =
+        history::History::new(data_dir.join("history.jsonl")).expect("无法初始化 history");
 
     // 启动恢复：读取未完成任务并记录到日志（前端 get_recovery_advice 读取展示）
     if let Ok(pending) = journal.recover_pending() {
         if !pending.is_empty() {
-            eprintln!("[dayu] 检测到 {} 个未完成任务，已就绪恢复建议", pending.len());
+            eprintln!(
+                "[dayu] 检测到 {} 个未完成任务，已就绪恢复建议",
+                pending.len()
+            );
         }
     }
 
@@ -86,20 +91,23 @@ mod tests {
 
     #[test]
     fn parse_elevated_scan_flag_present() {
-        assert!(is_elevated_scan_start(&["dayu".to_string(), "--elevated-scan".to_string()]
-        ));
+        assert!(is_elevated_scan_start(&[
+            "dayu".to_string(),
+            "--elevated-scan".to_string()
+        ]));
     }
 
     #[test]
     fn parse_elevated_scan_flag_absent() {
-        assert!(!is_elevated_scan_start(&["dayu".to_string()]
-        ));
+        assert!(!is_elevated_scan_start(&["dayu".to_string()]));
     }
 
     #[test]
     fn parse_elevated_scan_flag_mixed() {
-        assert!(is_elevated_scan_start(
-            &["dayu".to_string(), "--other".to_string(), "--elevated-scan".to_string()]
-        ));
+        assert!(is_elevated_scan_start(&[
+            "dayu".to_string(),
+            "--other".to_string(),
+            "--elevated-scan".to_string()
+        ]));
     }
 }

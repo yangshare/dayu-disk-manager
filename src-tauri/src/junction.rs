@@ -20,8 +20,7 @@ pub fn create(link: &Path, target: &Path) -> AppResult<()> {
 pub fn remove(link: &Path) -> AppResult<()> {
     #[cfg(windows)]
     {
-        junction::delete(link)
-            .map_err(|e| AppError::Junction(format!("remove 失败: {e}")))?;
+        junction::delete(link).map_err(|e| AppError::Junction(format!("remove 失败: {e}")))?;
         Ok(())
     }
     #[cfg(not(windows))]
@@ -35,9 +34,7 @@ pub fn remove(link: &Path) -> AppResult<()> {
 pub fn resolve(link: &Path) -> AppResult<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        junction::get_target(link)
-            .map_err(|e| AppError::Junction(format!("resolve 失败: {e}")))
-            .map(|p| p)
+        junction::get_target(link).map_err(|e| AppError::Junction(format!("resolve 失败: {e}")))
     }
     #[cfg(not(windows))]
     {

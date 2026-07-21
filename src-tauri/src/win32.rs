@@ -19,7 +19,8 @@ pub fn to_long_path(p: &str) -> String {
 }
 
 pub fn local_appdata_dayu_dir() -> AppResult<PathBuf> {
-    let base = dirs::data_local_dir().ok_or_else(|| AppError::Win32("无法解析 %LOCALAPPDATA%".into()))?;
+    let base =
+        dirs::data_local_dir().ok_or_else(|| AppError::Win32("无法解析 %LOCALAPPDATA%".into()))?;
     Ok(base.join("dayu-disk-manager"))
 }
 
@@ -41,7 +42,8 @@ pub fn disk_free_bytes(path: &Path) -> AppResult<u64> {
             Some(&mut free_to_caller as *mut u64),
             Some(&mut total as *mut u64),
             Some(&mut free as *mut u64),
-        ).map_err(|e| AppError::Win32(format!("GetDiskFreeSpaceExW: {e}")))?;
+        )
+        .map_err(|e| AppError::Win32(format!("GetDiskFreeSpaceExW: {e}")))?;
     }
     Ok(free_to_caller)
 }
@@ -70,7 +72,8 @@ pub fn volume_info(path: &Path) -> AppResult<(String, bool)> {
             Some(&mut max_component as *mut u32),
             Some(&mut flags as *mut u32),
             Some(&mut fs_name),
-        ).map_err(|e| AppError::Win32(format!("GetVolumeInformationW: {e}")))?;
+        )
+        .map_err(|e| AppError::Win32(format!("GetVolumeInformationW: {e}")))?;
     }
     let fs = from_wide(&fs_name).to_lowercase();
     let serial_hex = format!("{:08X}", serial);
@@ -98,7 +101,7 @@ fn volume_root(path: &Path) -> AppResult<String> {
 /// Restart Manager 检测哪些进程锁定了某路径。无占用返回 None。
 #[cfg(windows)]
 pub fn locked_processes(path: &Path) -> AppResult<Option<Vec<String>>> {
-    use windows::core::{PCWSTR, PWSTR, HSTRING};
+    use windows::core::{HSTRING, PCWSTR, PWSTR};
     use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
     use windows::Win32::System::RestartManager::{
         RmEndSession, RmGetList, RmRegisterResources, RmStartSession, RM_PROCESS_INFO,
@@ -121,7 +124,13 @@ pub fn locked_processes(path: &Path) -> AppResult<Option<Vec<String>>> {
             let mut nprocs: u32 = 64;
             let mut reason: u32 = 0;
             let mut buf = [RM_PROCESS_INFO::default(); 64];
-            let rc2 = RmGetList(handle, &mut nprocs_needed, &mut nprocs, Some(buf.as_mut_ptr()), &mut reason);
+            let rc2 = RmGetList(
+                handle,
+                &mut nprocs_needed,
+                &mut nprocs,
+                Some(buf.as_mut_ptr()),
+                &mut reason,
+            );
             if rc2 == ERROR_ACCESS_DENIED {
                 // Restart Manager 只对文件路径有效，对目录路径 RmGetList 会返回
                 // ERROR_ACCESS_DENIED（Win32 已知限制，目录可能含万级文件无法下钻）。
@@ -178,7 +187,9 @@ fn path_to_str(p: &Path) -> String {
 fn existing_path_for_probe(path: &Path) -> PathBuf {
     let mut candidate = path.to_path_buf();
     while !candidate.exists() {
-        let Some(parent) = candidate.parent() else { break };
+        let Some(parent) = candidate.parent() else {
+            break;
+        };
         if parent == candidate {
             break;
         }
@@ -230,10 +241,9 @@ impl std::fmt::Display for VolumeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VolumeError::AccessDenied => f.write_str("访问被拒绝（需要管理员权限或卷被独占）"),
-            VolumeError::UnsupportedFilesystem { actual } => write!(
-                f,
-                "不支持的文件系统（仅支持 NTFS，实际为 {actual}）"
-            ),
+            VolumeError::UnsupportedFilesystem { actual } => {
+                write!(f, "不支持的文件系统（仅支持 NTFS，实际为 {actual}）")
+            }
             VolumeError::InvalidVolumeData => f.write_str("卷数据缓冲不合法或被截断"),
             VolumeError::Io { code, operation } => {
                 write!(f, "Win32 I/O 错误：操作={operation} code={code}")
@@ -316,32 +326,34 @@ pub struct VolumeData {
 // 合计 14 个字段 = 5*8 + 4*4 + 5*8 = 96 字节。
 
 #[cfg(windows)]
-const VOLUME_DATA_BYTES_PER_SECTOR_OFFSET: usize =
-    core::mem::offset_of!(windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER, BytesPerSector);
+const VOLUME_DATA_BYTES_PER_SECTOR_OFFSET: usize = core::mem::offset_of!(
+    windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER,
+    BytesPerSector
+);
 #[cfg(not(windows))]
 const VOLUME_DATA_BYTES_PER_SECTOR_OFFSET: usize = 40;
 
 #[cfg(windows)]
-const VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET: usize =
-    core::mem::offset_of!(windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER, BytesPerCluster);
+const VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET: usize = core::mem::offset_of!(
+    windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER,
+    BytesPerCluster
+);
 #[cfg(not(windows))]
 const VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET: usize = 44;
 
 #[cfg(windows)]
-const VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET: usize =
-    core::mem::offset_of!(
-        windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER,
-        BytesPerFileRecordSegment
-    );
+const VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET: usize = core::mem::offset_of!(
+    windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER,
+    BytesPerFileRecordSegment
+);
 #[cfg(not(windows))]
 const VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET: usize = 48;
 
 #[cfg(windows)]
-const VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET: usize =
-    core::mem::offset_of!(
-        windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER,
-        MftValidDataLength
-    );
+const VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET: usize = core::mem::offset_of!(
+    windows::Win32::System::Ioctl::NTFS_VOLUME_DATA_BUFFER,
+    MftValidDataLength
+);
 #[cfg(not(windows))]
 const VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET: usize = 56;
 
@@ -487,19 +499,25 @@ fn assemble_volume_data(bytes: &[u8], bytes_returned: usize) -> Result<VolumeDat
 
 /// 从字节切片读取小端 u16，越界返回 InvalidVolumeData。
 fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16, VolumeError> {
-    let slice = bytes.get(offset..offset + 2).ok_or(VolumeError::InvalidVolumeData)?;
+    let slice = bytes
+        .get(offset..offset + 2)
+        .ok_or(VolumeError::InvalidVolumeData)?;
     Ok(u16::from_le_bytes([slice[0], slice[1]]))
 }
 
 /// 从字节切片读取小端 u32，越界返回 InvalidVolumeData。
 fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32, VolumeError> {
-    let slice = bytes.get(offset..offset + 4).ok_or(VolumeError::InvalidVolumeData)?;
+    let slice = bytes
+        .get(offset..offset + 4)
+        .ok_or(VolumeError::InvalidVolumeData)?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 /// 从字节切片读取小端 u64，越界返回 InvalidVolumeData。
 fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64, VolumeError> {
-    let slice = bytes.get(offset..offset + 8).ok_or(VolumeError::InvalidVolumeData)?;
+    let slice = bytes
+        .get(offset..offset + 8)
+        .ok_or(VolumeError::InvalidVolumeData)?;
     let mut arr = [0u8; 8];
     arr.copy_from_slice(slice);
     Ok(u64::from_le_bytes(arr))
@@ -507,7 +525,9 @@ fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64, VolumeError> {
 
 /// 从字节切片读取小端 i64，越界返回 InvalidVolumeData。
 fn read_i64_at(bytes: &[u8], offset: usize) -> Result<i64, VolumeError> {
-    let slice = bytes.get(offset..offset + 8).ok_or(VolumeError::InvalidVolumeData)?;
+    let slice = bytes
+        .get(offset..offset + 8)
+        .ok_or(VolumeError::InvalidVolumeData)?;
     let mut arr = [0u8; 8];
     arr.copy_from_slice(slice);
     Ok(i64::from_le_bytes(arr))
@@ -620,13 +640,12 @@ fn map_win32_error(e: windows::core::Error, operation: &'static str) -> VolumeEr
 /// 触发提权流程。`dwShareMode` 保留 READ|WRITE|DELETE 共享。
 #[cfg(windows)]
 pub fn open_volume(drive_letter: char) -> Result<VolumeHandle, VolumeError> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES,
-        FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE, OPEN_EXISTING,
-
+        FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
-    use windows::core::PCWSTR;
-use windows::Win32::Foundation::GENERIC_READ;
 
     let drive = drive_letter.to_ascii_uppercase();
     if !drive.is_ascii_alphabetic() {
@@ -640,14 +659,16 @@ use windows::Win32::Foundation::GENERIC_READ;
     // 通过现有 volume_info 路径（同盘符）取得实际文件系统名称，避免对非 NTFS 卷
     // 调用 NTFS 专属 IOCTL（简报 0.1 要求）。
     let fs_root = PathBuf::from(format!(r"{}:\", drive));
-    // volume_info 失败的真实原因（卷不存在 / 权限 / 其它）映射到一个明显非
-    // ERROR_SUCCESS 的占位 code（u32::MAX），避免上层把 code=0（ERROR_SUCCESS）
-    // 误读为成功（简报审查发现）。operation 字段是 &'static str 无法承载动态
-    // 错误信息——但占位 code 已足够让失败可被区分。原始错误诊断可后续 T1 整合
-    // 到全局 AppError 时通过日志补回。
-    let (_, is_ntfs) = volume_info(&fs_root).map_err(|_e| VolumeError::Io {
-        code: u32::MAX,
-        operation: "open_volume/volume_info",
+    // volume_info 失败的真实原因（卷不存在 / 权限 / 其它）写到 stderr，避免上层把
+    // code=0（ERROR_SUCCESS）误读为成功（简报审查发现）。VolumeError::Io 的
+    // `code` / `operation` 字段不承载动态 error message，因此原始原因用 eprintln
+    // 落日志；u32::MAX 作为占位 code 让失败仍可被上层按 code 区分。
+    let (_, is_ntfs) = volume_info(&fs_root).map_err(|e| {
+        eprintln!("[dayu] open_volume/volume_info 失败: {}", e);
+        VolumeError::Io {
+            code: u32::MAX,
+            operation: "open_volume/volume_info",
+        }
     })?;
     // 重新查询一次拿到名称（volume_info 当前只回 bool；若非 NTFS 在此构造错误）。
     let fs_name = if is_ntfs {
@@ -707,8 +728,8 @@ fn query_fs_name(path: &Path) -> Option<String> {
 /// 读取卷几何 + NTFS 扩展版本。返回 `VolumeData`（已校验）。
 #[cfg(windows)]
 pub fn read_volume_data(vol: &VolumeHandle) -> Result<VolumeData, VolumeError> {
-    use windows::Win32::System::IO::DeviceIoControl;
     use windows::Win32::System::Ioctl::FSCTL_GET_NTFS_VOLUME_DATA;
+    use windows::Win32::System::IO::DeviceIoControl;
 
     // 用对齐到 i64（8 字节）的缓冲区存放输出。
     // NTFS_VOLUME_DATA_BUFFER + NTFS_EXTENDED_VOLUME_DATA 可能都被写到这里。
@@ -734,9 +755,8 @@ pub fn read_volume_data(vol: &VolumeHandle) -> Result<VolumeData, VolumeError> {
     if (bytes_returned as usize) > cap_bytes {
         return Err(VolumeError::InvalidVolumeData);
     }
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(out.as_ptr() as *const u8, bytes_returned as usize)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, bytes_returned as usize) };
 
     // 组装逻辑（基础结构 + 扩展结构校验）已抽成纯函数 assemble_volume_data，
     // 可单测覆盖"扩展数据缺失/截断"等场景（简报 0.2 修复）。
@@ -754,10 +774,10 @@ pub fn read_mft_record(
     file_reference: u64,
     record_capacity_bytes: u32,
 ) -> Result<RawFileRecord, VolumeError> {
-    use windows::Win32::System::IO::DeviceIoControl;
     use windows::Win32::System::Ioctl::{
         FSCTL_GET_NTFS_FILE_RECORD, NTFS_FILE_RECORD_INPUT_BUFFER,
     };
+    use windows::Win32::System::IO::DeviceIoControl;
 
     let header_offset = file_record_buffer_offset();
     let buf_size = header_offset
@@ -789,8 +809,7 @@ pub fn read_mft_record(
     };
     result.map_err(|e| map_win32_error(e, "DeviceIoControl/GET_NTFS_FILE_RECORD"))?;
 
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, cap_bytes) };
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, cap_bytes) };
     let (file_ref_low48, record_bytes) =
         parse_file_record_output(bytes, bytes_returned as usize, cap_bytes)?;
 
@@ -813,8 +832,8 @@ pub fn read_volume_bytes_at(
     start_byte_offset: u64,
     byte_count: u64,
 ) -> Result<Vec<u8>, VolumeError> {
-    use windows::Win32::Storage::FileSystem::{ReadFile, SetFilePointerEx};
     use windows::Win32::Storage::FileSystem::FILE_BEGIN;
+    use windows::Win32::Storage::FileSystem::{ReadFile, SetFilePointerEx};
 
     if byte_count == 0 {
         return Ok(Vec::new());
@@ -823,15 +842,8 @@ pub fn read_volume_bytes_at(
         return Err(VolumeError::InvalidVolumeData);
     }
 
-    unsafe {
-        SetFilePointerEx(
-            vol.handle,
-            start_byte_offset as i64,
-            None,
-            FILE_BEGIN,
-        )
-    }
-    .map_err(|e| map_win32_error(e, "SetFilePointerEx"))?;
+    unsafe { SetFilePointerEx(vol.handle, start_byte_offset as i64, None, FILE_BEGIN) }
+        .map_err(|e| map_win32_error(e, "SetFilePointerEx"))?;
 
     let mut out = Vec::with_capacity(byte_count as usize);
     let mut remaining = byte_count as usize;
@@ -898,17 +910,24 @@ pub fn classify_shell_result(hinst: isize) -> ElevationOutcome {
 #[cfg(windows)]
 pub fn request_elevation(params: &str) -> Result<ElevationOutcome, VolumeError> {
     use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    use windows::core::PCWSTR;
 
     let exe = std::env::current_exe().map_err(|e| VolumeError::Io {
         code: e.raw_os_error().map(|c| c as u32).unwrap_or(u32::MAX),
         operation: "request_elevation/current_exe",
     })?;
-    let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let exe_wide: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let verb = to_wide("runas");
-    let params_wide: Vec<u16> = to_wide(params).into_iter().chain(std::iter::once(0)).collect();
+    let params_wide: Vec<u16> = to_wide(params)
+        .into_iter()
+        .chain(std::iter::once(0))
+        .collect();
 
     let hinst = unsafe {
         ShellExecuteW(
@@ -1010,7 +1029,10 @@ mod tests {
         // 验证磁盘根经 to_long_path 转为 \\?\C:\（单尾随反斜杠）后，
         // GetVolumeInformationW 能成功返回——确认不再因双斜杠被 Win32 API 拒绝。
         let (serial, _is_ntfs) = volume_info(Path::new("C:\\")).unwrap();
-        assert!(!serial.is_empty(), "volume_info on C:\\ returned empty serial");
+        assert!(
+            !serial.is_empty(),
+            "volume_info on C:\\ returned empty serial"
+        );
     }
 
     #[test]
@@ -1043,7 +1065,10 @@ mod tests {
         let offset = file_record_buffer_offset();
         // repr(C) 下 FileReferenceNumber(8) + FileRecordLength(4) = 12
         // [u8; 1] 对齐为 1，无额外填充
-        assert_eq!(offset, 12, "FileRecordBuffer offset 必须为 12（FileReferenceNumber(8) + FileRecordLength(4)）");
+        assert_eq!(
+            offset, 12,
+            "FileRecordBuffer offset 必须为 12（FileReferenceNumber(8) + FileRecordLength(4)）"
+        );
     }
 
     /// 0.2-2a：给定短于 output header 的缓冲，返回错误且不 panic。
@@ -1112,7 +1137,10 @@ mod tests {
         let (file_ref, record_bytes) = result.unwrap();
         assert_eq!(file_ref, 42, "低 48 位记录号应为 42");
         assert_eq!(record_bytes.len(), 1024);
-        assert!(record_bytes.iter().all(|&b| b == 0xAA), "记录体内容应全为 0xAA");
+        assert!(
+            record_bytes.iter().all(|&b| b == 0xAA),
+            "记录体内容应全为 0xAA"
+        );
     }
 
     /// 0.2-2e-rec-zero：record 0 正确解析。
@@ -1136,7 +1164,10 @@ mod tests {
         let (file_ref, record_bytes) = result.unwrap();
         assert_eq!(file_ref, 0, "低 48 位记录号应为 0");
         assert_eq!(record_bytes.len(), 1024);
-        assert!(record_bytes.iter().all(|&b| b == 0xAA), "记录体内容应全为 0xAA");
+        assert!(
+            record_bytes.iter().all(|&b| b == 0xAA),
+            "记录体内容应全为 0xAA"
+        );
     }
 
     /// 0.2-2f：FileReferenceNumber 高位（序列号）被剥离，只保留低 48 位。
@@ -1186,7 +1217,10 @@ mod tests {
         bytes[0..4].copy_from_slice(&0u32.to_le_bytes());
         // 后续全零——如果 ByteCount=0 被错误跳过，就会把零当成版本号。
         let result = parse_extended_volume_data(&bytes, 16);
-        assert!(result.is_err(), "ByteCount=0 必须返回 InvalidVolumeData，不得把零填充当版本号");
+        assert!(
+            result.is_err(),
+            "ByteCount=0 必须返回 InvalidVolumeData，不得把零填充当版本号"
+        );
         assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
@@ -1255,9 +1289,11 @@ mod tests {
             .copy_from_slice(&512u32.to_le_bytes());
         bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
 
         let result = parse_volume_data_buffer(&bytes);
@@ -1291,13 +1327,18 @@ mod tests {
         bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
         // BytesPerFileRecordSegment = 0
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&0u32.to_le_bytes());
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
 
         let result = parse_volume_data_buffer(&bytes);
-        assert!(result.is_err(), "零 BytesPerFileRecordSegment 必须返回 InvalidVolumeData");
+        assert!(
+            result.is_err(),
+            "零 BytesPerFileRecordSegment 必须返回 InvalidVolumeData"
+        );
         assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
@@ -1306,30 +1347,44 @@ mod tests {
     fn parse_volume_data_buffer_zero_sector_or_cluster() {
         // bytes_per_sector = 0
         let mut bytes_sector_zero = vec![0u8; 128];
-        bytes_sector_zero[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+        bytes_sector_zero
+            [VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
             .copy_from_slice(&0u32.to_le_bytes());
-        bytes_sector_zero[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+        bytes_sector_zero
+            [VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        bytes_sector_zero[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes_sector_zero[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
-        bytes_sector_zero[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes_sector_zero[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
         let result = parse_volume_data_buffer(&bytes_sector_zero);
-        assert!(result.is_err(), "零 BytesPerSector 必须返回 InvalidVolumeData");
+        assert!(
+            result.is_err(),
+            "零 BytesPerSector 必须返回 InvalidVolumeData"
+        );
         assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
 
         // bytes_per_cluster = 0
         let mut bytes_cluster_zero = vec![0u8; 128];
-        bytes_cluster_zero[VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
+        bytes_cluster_zero
+            [VOLUME_DATA_BYTES_PER_SECTOR_OFFSET..VOLUME_DATA_BYTES_PER_SECTOR_OFFSET + 4]
             .copy_from_slice(&512u32.to_le_bytes());
-        bytes_cluster_zero[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
+        bytes_cluster_zero
+            [VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&0u32.to_le_bytes());
-        bytes_cluster_zero[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes_cluster_zero[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
-        bytes_cluster_zero[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes_cluster_zero[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
         let result = parse_volume_data_buffer(&bytes_cluster_zero);
-        assert!(result.is_err(), "零 BytesPerCluster 必须返回 InvalidVolumeData");
+        assert!(
+            result.is_err(),
+            "零 BytesPerCluster 必须返回 InvalidVolumeData"
+        );
         assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
@@ -1341,10 +1396,12 @@ mod tests {
             .copy_from_slice(&512u32.to_le_bytes());
         bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
         // MftValidDataLength = 1025（不能被 1024 整除）
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1025u64.to_le_bytes());
 
         let data = parse_volume_data_buffer(&bytes).unwrap();
@@ -1389,9 +1446,11 @@ mod tests {
             .copy_from_slice(&512u32.to_le_bytes());
         bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
 
         // bytes_returned 恰好等于基础结构大小，没有扩展数据
@@ -1409,9 +1468,11 @@ mod tests {
             .copy_from_slice(&512u32.to_le_bytes());
         bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
 
         let result = assemble_volume_data(&bytes, VOLUME_DATA_BUFFER_SIZE + 4);
@@ -1428,9 +1489,11 @@ mod tests {
             .copy_from_slice(&512u32.to_le_bytes());
         bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
         // 扩展区全零（ByteCount=0）——不得被解析成 NTFS 0.0。
 
@@ -1450,9 +1513,11 @@ mod tests {
             .copy_from_slice(&512u32.to_le_bytes());
         bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
         // 扩展结构：ByteCount=16（含自身）, Major=3, Minor=1
         let ext_off = VOLUME_DATA_BUFFER_SIZE;
@@ -1499,10 +1564,12 @@ mod tests {
             .copy_from_slice(&512u32.to_le_bytes());
         bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
         // 1024 个文件记录段 -> slot_count = 1024
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&(1024u64 * 1024u64).to_le_bytes());
 
         let ext_off = VOLUME_DATA_BUFFER_SIZE;
@@ -1560,9 +1627,11 @@ mod tests {
             .copy_from_slice(&512u32.to_le_bytes());
         bytes[VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET..VOLUME_DATA_BYTES_PER_CLUSTER_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&1024u32.to_le_bytes());
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&1_048_576u64.to_le_bytes());
         let ext_off = VOLUME_DATA_BUFFER_SIZE;
         bytes[ext_off..ext_off + 4].copy_from_slice(&16u32.to_le_bytes());
@@ -1583,11 +1652,15 @@ mod tests {
     #[test]
     fn parse_volume_data_buffer_negative_valid_data_length() {
         let mut bytes = valid_volume_data_bytes();
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&(-1i64).to_le_bytes());
 
         let result = parse_volume_data_buffer(&bytes);
-        assert!(result.is_err(), "负 MftValidDataLength 必须返回 InvalidVolumeData");
+        assert!(
+            result.is_err(),
+            "负 MftValidDataLength 必须返回 InvalidVolumeData"
+        );
         assert_eq!(result.unwrap_err(), VolumeError::InvalidVolumeData);
     }
 
@@ -1595,9 +1668,11 @@ mod tests {
     #[test]
     fn parse_volume_data_buffer_slot_count_no_overflow() {
         let mut bytes = valid_volume_data_bytes();
-        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
+        bytes[VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET
+            ..VOLUME_DATA_BYTES_PER_FILE_RECORD_SEGMENT_OFFSET + 4]
             .copy_from_slice(&2u32.to_le_bytes());
-        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
+        bytes[VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET
+            ..VOLUME_DATA_MFT_VALID_DATA_LENGTH_OFFSET + 8]
             .copy_from_slice(&u64::MAX.to_le_bytes());
 
         let result = parse_volume_data_buffer(&bytes);
@@ -1643,9 +1718,18 @@ mod tests {
 
     #[test]
     fn classify_shell_result_failed() {
-        assert_eq!(classify_shell_result(0), ElevationOutcome::Failed { code: 0 });
-        assert_eq!(classify_shell_result(2), ElevationOutcome::Failed { code: 2 });
-        assert_eq!(classify_shell_result(31), ElevationOutcome::Failed { code: 31 });
+        assert_eq!(
+            classify_shell_result(0),
+            ElevationOutcome::Failed { code: 0 }
+        );
+        assert_eq!(
+            classify_shell_result(2),
+            ElevationOutcome::Failed { code: 2 }
+        );
+        assert_eq!(
+            classify_shell_result(31),
+            ElevationOutcome::Failed { code: 31 }
+        );
     }
 
     /// T1：request_elevation 真实 Win32 调用手动 gate 测试。
@@ -1659,7 +1743,8 @@ mod tests {
             eprintln!("跳过 request_elevation 手动测试；设置 DAYU_MANUAL_ELEVATION_TEST=1 以启用");
             return;
         }
-        let outcome = request_elevation("--elevated-scan").expect("request_elevation 在 current_exe 失败时不应 panic");
+        let outcome = request_elevation("--elevated-scan")
+            .expect("request_elevation 在 current_exe 失败时不应 panic");
         println!("request_elevation outcome: {}", outcome);
     }
 }

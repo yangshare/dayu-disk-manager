@@ -16,12 +16,24 @@ impl Store {
         Ok(Store { data_dir })
     }
 
-    pub fn config_path(&self) -> PathBuf { self.data_dir.join("config.json") }
-    pub fn config_tmp(&self) -> PathBuf { self.data_dir.join("config.json.tmp") }
-    pub fn config_bak(&self) -> PathBuf { self.data_dir.join("config.json.bak") }
-    pub fn mig_path(&self) -> PathBuf { self.data_dir.join("migrations.json") }
-    pub fn mig_tmp(&self) -> PathBuf { self.data_dir.join("migrations.json.tmp") }
-    pub fn mig_bak(&self) -> PathBuf { self.data_dir.join("migrations.json.bak") }
+    pub fn config_path(&self) -> PathBuf {
+        self.data_dir.join("config.json")
+    }
+    pub fn config_tmp(&self) -> PathBuf {
+        self.data_dir.join("config.json.tmp")
+    }
+    pub fn config_bak(&self) -> PathBuf {
+        self.data_dir.join("config.json.bak")
+    }
+    pub fn mig_path(&self) -> PathBuf {
+        self.data_dir.join("migrations.json")
+    }
+    pub fn mig_tmp(&self) -> PathBuf {
+        self.data_dir.join("migrations.json.tmp")
+    }
+    pub fn mig_bak(&self) -> PathBuf {
+        self.data_dir.join("migrations.json.bak")
+    }
 
     pub fn load_config(&self) -> AppResult<Config> {
         match fs::read(self.config_path()) {
@@ -47,7 +59,12 @@ impl Store {
     }
 
     pub fn save_config(&self, cfg: &Config) -> AppResult<()> {
-        atomic_write_json(&self.config_path(), &self.config_tmp(), &self.config_bak(), cfg)
+        atomic_write_json(
+            &self.config_path(),
+            &self.config_tmp(),
+            &self.config_bak(),
+            cfg,
+        )
     }
 
     pub fn load_migrations(&self) -> AppResult<Vec<Migration>> {
@@ -127,50 +144,132 @@ pub fn default_presets() -> Vec<Preset> {
     macro_rules! p {
         ($id:expr, $name:expr, $cat:expr, $auto:expr, $sub:expr, $paths:expr, $procs:expr) => {
             Preset {
-                id: $id.into(), name: $name.into(), category: $cat,
-                auto_migrate: $auto, target_subdir: $sub.into(),
-                match_paths: $paths, match_processes: $procs,
+                id: $id.into(),
+                name: $name.into(),
+                category: $cat,
+                auto_migrate: $auto,
+                target_subdir: $sub.into(),
+                match_paths: $paths,
+                match_processes: $procs,
             }
         };
     }
     vec![
-        p!("wechat", "微信文件", PresetCategory::Communication, true, "wechat",
-           vec!["%USERPROFILE%/Documents/WeChat Files".into(), "%APPDATA%/Tencent/WeChat".into()],
-           vec!["wechat".into()]),
-        p!("qq", "QQ 文件", PresetCategory::Communication, true, "qq",
-           vec!["%USERPROFILE%/Documents/Tencent Files".into()],
-           vec!["qq".into()]),
-        p!("dingtalk", "钉钉", PresetCategory::Communication, true, "dingtalk",
-           vec!["%APPDATA%/DingTalk".into()],
-           vec!["dingtalk".into()]),
-        p!("wxwork", "企业微信", PresetCategory::Communication, true, "wxwork",
-           vec!["%USERPROFILE%/Documents/WXWork".into()],
-           vec!["wxwork".into()]),
-        p!("npm-cache", "npm 缓存", PresetCategory::DevCache, true, "npm-cache",
-           vec!["%LOCALAPPDATA%/npm-cache".into(), "%APPDATA%/npm-cache".into()],
-           vec![]),
-        p!("maven", "Maven 仓库", PresetCategory::DevCache, true, "maven",
-           vec!["%USERPROFILE%/.m2/repository".into()],
-           vec![]),
-        p!("gradle", "Gradle 缓存", PresetCategory::DevCache, true, "gradle",
-           vec!["%USERPROFILE%/.gradle".into()],
-           vec![]),
-        p!("pip-cache", "pip 缓存", PresetCategory::DevCache, true, "pip-cache",
-           vec!["%LOCALAPPDATA%/pip/Cache".into()],
-           vec![]),
-        p!("jetbrains", "JetBrains 配置", PresetCategory::Ide, true, "jetbrains",
-           vec!["%APPDATA%/JetBrains".into()],
-           vec![]),
-        p!("vscode", "VS Code 用户数据", PresetCategory::Ide, true, "vscode",
-           vec!["%APPDATA%/Code".into(), "%USERPROFILE%/.vscode".into()],
-           vec!["code".into()]),
+        p!(
+            "wechat",
+            "微信文件",
+            PresetCategory::Communication,
+            true,
+            "wechat",
+            vec![
+                "%USERPROFILE%/Documents/WeChat Files".into(),
+                "%APPDATA%/Tencent/WeChat".into()
+            ],
+            vec!["wechat".into()]
+        ),
+        p!(
+            "qq",
+            "QQ 文件",
+            PresetCategory::Communication,
+            true,
+            "qq",
+            vec!["%USERPROFILE%/Documents/Tencent Files".into()],
+            vec!["qq".into()]
+        ),
+        p!(
+            "dingtalk",
+            "钉钉",
+            PresetCategory::Communication,
+            true,
+            "dingtalk",
+            vec!["%APPDATA%/DingTalk".into()],
+            vec!["dingtalk".into()]
+        ),
+        p!(
+            "wxwork",
+            "企业微信",
+            PresetCategory::Communication,
+            true,
+            "wxwork",
+            vec!["%USERPROFILE%/Documents/WXWork".into()],
+            vec!["wxwork".into()]
+        ),
+        p!(
+            "npm-cache",
+            "npm 缓存",
+            PresetCategory::DevCache,
+            true,
+            "npm-cache",
+            vec![
+                "%LOCALAPPDATA%/npm-cache".into(),
+                "%APPDATA%/npm-cache".into()
+            ],
+            vec![]
+        ),
+        p!(
+            "maven",
+            "Maven 仓库",
+            PresetCategory::DevCache,
+            true,
+            "maven",
+            vec!["%USERPROFILE%/.m2/repository".into()],
+            vec![]
+        ),
+        p!(
+            "gradle",
+            "Gradle 缓存",
+            PresetCategory::DevCache,
+            true,
+            "gradle",
+            vec!["%USERPROFILE%/.gradle".into()],
+            vec![]
+        ),
+        p!(
+            "pip-cache",
+            "pip 缓存",
+            PresetCategory::DevCache,
+            true,
+            "pip-cache",
+            vec!["%LOCALAPPDATA%/pip/Cache".into()],
+            vec![]
+        ),
+        p!(
+            "jetbrains",
+            "JetBrains 配置",
+            PresetCategory::Ide,
+            true,
+            "jetbrains",
+            vec!["%APPDATA%/JetBrains".into()],
+            vec![]
+        ),
+        p!(
+            "vscode",
+            "VS Code 用户数据",
+            PresetCategory::Ide,
+            true,
+            "vscode",
+            vec!["%APPDATA%/Code".into(), "%USERPROFILE%/.vscode".into()],
+            vec!["code".into()]
+        ),
         // 需确认风险场景
-        p!("steam", "Steam 游戏库", PresetCategory::GameLibrary, false, "steam",
-           vec!["steamapps".into()],
-           vec!["steam".into()]),
-        p!("docker", "Docker 数据", PresetCategory::Container, false, "docker",
-           vec!["%LOCALAPPDATA%/Docker".into()],
-           vec!["dockerd".into()]),
+        p!(
+            "steam",
+            "Steam 游戏库",
+            PresetCategory::GameLibrary,
+            false,
+            "steam",
+            vec!["steamapps".into()],
+            vec!["steam".into()]
+        ),
+        p!(
+            "docker",
+            "Docker 数据",
+            PresetCategory::Container,
+            false,
+            "docker",
+            vec!["%LOCALAPPDATA%/Docker".into()],
+            vec!["dockerd".into()]
+        ),
     ]
 }
 
@@ -234,7 +333,11 @@ mod tests {
         s.upsert_migration(sample.clone()).unwrap();
         assert!(s.mig_path().exists());
         assert!(!s.mig_bak().exists(), "首次写入不应有 bak");
-        s.upsert_migration(Migration { id: "u2".into(), ..sample }).unwrap();
+        s.upsert_migration(Migration {
+            id: "u2".into(),
+            ..sample
+        })
+        .unwrap();
         assert!(s.mig_bak().exists(), "第二次写入应生成 bak");
         let loaded = s.load_migrations().unwrap();
         assert_eq!(loaded.len(), 2);

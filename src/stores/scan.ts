@@ -1,96 +1,18 @@
 import { defineStore } from 'pinia'
-import { computed, onScopeDispose, ref } from 'vue'
+import { onScopeDispose, ref } from 'vue'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { ipc } from '../ipc/invoke'
 import { onScanInvalidated, onScanProgress } from '../ipc/events'
 import type {
-  AccessState, ChildPage, FastScanFailure, RootFileSummary, ScanDriveResult,
-  ScanItem, ScanInvalidatedEvent, ScanMode, ScanProgressEvent, ScanSnapshot,
-  ScanSource, TreeNode,
+  FastScanFailure, RootFileSummary, ScanInvalidatedEvent, ScanMode,
+  ScanProgressEvent, ScanSnapshot, ScanSource, TreeNode, ChildPage,
 } from '../ipc/types'
 import { isStaleScanError } from '../ipc/types'
 
 const PAGE_SIZE = 200
 const appWindow = isTauri() ? getCurrentWindow() : null
-
-type ScanResponse = ScanDriveResult | ScanItem[]
-type ScanDriveInvoker = (mode: ScanMode) => Promise<ScanResponse>
-type LegacyScanInvoker = () => Promise<ScanItem[]>
-
-function asLegacyInvoker(): LegacyScanInvoker | undefined {
-  const legacy = (ipc as unknown as { scanDrives?: LegacyScanInvoker }).scanDrives
-  return typeof legacy === 'function' ? legacy : undefined
-}
-
-function asScanInvoker(): ScanDriveInvoker | undefined {
-  const current = (ipc as unknown as { scanDrive?: ScanDriveInvoker }).scanDrive
-  return typeof current === 'function' ? current : undefined
-}
-
-function treeNodeToScanItem(node: TreeNode): ScanItem {
-  return {
-    path: node.path,
-    displayName: node.displayName,
-    sizeBytes: node.sizeBytes,
-    matchedPreset: node.matchedPreset,
-    category: node.category,
-    autoMigrate: node.autoMigrate,
-    isJunction: node.isJunction,
-    inaccessible: node.accessState === 'inaccessible',
-    scanStatus: node.scanStatus,
-    migrationId: node.migrationId,
-  }
-}
-
-function scanItemToTreeNode(item: ScanItem, index: number): TreeNode {
-  const accessState: AccessState = item.inaccessible ? 'inaccessible' : 'accessible'
-  return {
-    path: item.path,
-    displayName: item.displayName,
-    sizeBytes: item.sizeBytes,
-    linkedTargetSizeBytes: null,
-    fileCount: 0,
-    dirCount: 0,
-    depth: 0,
-    isReparse: item.isJunction,
-    reparseTag: null,
-    isJunction: item.isJunction,
-    accessState,
-    matchedPreset: item.matchedPreset,
-    category: item.category,
-    autoMigrate: item.autoMigrate,
-    scanStatus: item.scanStatus,
-    migrationId: item.migrationId,
-    childCount: 0,
-    filteredChildCount: index,
-  }
-}
-
-function legacySnapshot(items: ScanItem[]): ScanSnapshot {
-  return {
-    scanId: `legacy-${Date.now()}`,
-    source: 'filesystem',
-    roots: items.map(scanItemToTreeNode),
-    filteredRootCount: items.length,
-    rootFileSummary: {
-      directFileSizeBytes: 0,
-      directFileCount: 0,
-      systemMetadataSizeBytes: null,
-      totalKnownSizeBytes: 0,
-      incomplete: true,
-    },
-    diagnostics: {
-      scannedRecords: 0,
-      scannedDirs: 0,
-      scannedFiles: 0,
-      skippedRecords: 0,
-      orphanEntries: 0,
-      hardLinkEntries: 0,
-    },
-  }
-}
 
 function failureDescription(reason: FastScanFailure): string {
   switch (reason.kind) {
@@ -145,17 +67,12 @@ export const useScanStore = defineStore('scan', () => {
   const progress = ref<ScanProgressEvent | null>(null)
   const error = ref<string | null>(null)
   const hasScanned = ref(false)
-  const legacyItems = ref<ScanItem[]>([])
   const initialized = ref(false)
   const pendingAutoRescan = ref(false)
   const autoRescanScheduled = ref(false)
   const pageRequests = new Map<string, Promise<ChildPage | null>>()
   let progressUnlisten: UnlistenFn | undefined
   let invalidatedUnlisten: UnlistenFn | undefined
-
-  const items = computed(() => legacyItems.value)
-  const expandedPages = pages
-  const locatingPath = highlightedPath
 
   function clearSnapshot() {
     roots.value = []
@@ -169,7 +86,6 @@ export const useScanStore = defineStore('scan', () => {
     expandedKeys.value = new Set()
     loadingPages.value = new Set()
     highlightedPath.value = null
-    legacyItems.value = []
     progress.value = null
     error.value = null
     invalidated.value = true
@@ -187,7 +103,6 @@ export const useScanStore = defineStore('scan', () => {
     expandedKeys.value = new Set()
     loadingPages.value = new Set()
     highlightedPath.value = null
-    legacyItems.value = snapshot.roots.map(treeNodeToScanItem)
     invalidated.value = false
     error.value = null
   }
@@ -241,14 +156,6 @@ export const useScanStore = defineStore('scan', () => {
     }
   }
 
-  async function invokeScan(mode: ScanMode): Promise<ScanResponse> {
-    const current = asScanInvoker()
-    if (current) return current(mode)
-    const legacy = asLegacyInvoker()
-    if (legacy) return legacy()
-    throw new Error('扫描 IPC 不可用')
-  }
-
   async function scan(requestedMode: ScanMode = 'auto') {
     if (loading.value) return
     hasScanned.value = true
@@ -261,11 +168,7 @@ export const useScanStore = defineStore('scan', () => {
       await initialize()
       let mode = requestedMode
       while (true) {
-        const result = await invokeScan(mode)
-        if (Array.isArray(result)) {
-          applySnapshot(legacySnapshot(result))
-          return
-        }
+        const result = await ipc.scanDrive(mode)
         if (result.kind === 'complete') {
           // 失效事件优先于迟到的 scan 响应，不能复活旧树。
           if (!invalidated.value) {
@@ -446,11 +349,6 @@ export const useScanStore = defineStore('scan', () => {
     }
   }
 
-  const toggle = toggleNode
-  const expandNode = toggleNode
-  const revealNode = reveal
-  const fetchRecommended = listRecommended
-
   onScopeDispose(() => {
     progressUnlisten?.()
     invalidatedUnlisten?.()
@@ -461,10 +359,10 @@ export const useScanStore = defineStore('scan', () => {
 
   return {
     roots, scanId, source, filteredRootCount, rootFileSummary, recommended,
-    pages, expanded, expandedPages, expandedKeys, loadingPages, highlightedPath, locatingPath,
-    invalidated, loading, cancelling, progress, error, hasScanned, items,
-    initialize, clearSnapshot, scan, cancelScan, toggleNode, toggle, expandNode,
-    loadMore, reveal, revealNode, listRecommended, fetchRecommended,
+    pages, expanded, expandedKeys, loadingPages, highlightedPath,
+    invalidated, loading, cancelling, progress, error, hasScanned,
+    initialize, clearSnapshot, scan, cancelScan, toggleNode,
+    loadMore, reveal, listRecommended,
   }
 })
 

@@ -14,7 +14,8 @@ use crate::error::{AppError, AppResult};
 pub fn running_process_names() -> AppResult<Vec<String>> {
     use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
     };
 
     let mut out = Vec::new();

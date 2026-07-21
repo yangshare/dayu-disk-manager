@@ -28,7 +28,11 @@ impl CopyProgress {
         if let Some(total) = self.total_files.filter(|total| *total > 0) {
             return ((self.completed_files.saturating_mul(100) / total).min(100)) as u8;
         }
-        if self.phase == CopyPhase::Copying { 100 } else { 0 }
+        if self.phase == CopyPhase::Copying {
+            100
+        } else {
+            0
+        }
     }
 }
 
@@ -244,12 +248,17 @@ impl FileOps for RealFileOps {
         let mut entries = Vec::new();
         let mut stack = vec![src.to_path_buf()];
         while let Some(cur) = stack.pop() {
-            if !cur.exists() { continue; }
+            if !cur.exists() {
+                continue;
+            }
             if self.is_reparse_point(&cur) && cur != *src {
                 // 记录 reparse point 为目录占位，不进入
                 entries.push(ManifestEntry {
                     rel_path: rel_under(src, &cur),
-                    is_dir: true, size: 0, mtime: 0, attrs: 0,
+                    is_dir: true,
+                    size: 0,
+                    mtime: 0,
+                    attrs: 0,
                 });
                 continue;
             }
@@ -264,13 +273,18 @@ impl FileOps for RealFileOps {
                 entries.push(entry_for(&cur, src, false)?);
             }
         }
-        Ok(Manifest { root: src.to_string_lossy().into(), entries })
+        Ok(Manifest {
+            root: src.to_string_lossy().into(),
+            entries,
+        })
     }
 
     fn diff_manifests(&self, a: &Manifest, b: &Manifest) -> Vec<String> {
         use std::collections::HashMap;
-        let map_a: HashMap<&str, &ManifestEntry> = a.entries.iter().map(|e| (e.rel_path.as_str(), e)).collect();
-        let map_b: HashMap<&str, &ManifestEntry> = b.entries.iter().map(|e| (e.rel_path.as_str(), e)).collect();
+        let map_a: HashMap<&str, &ManifestEntry> =
+            a.entries.iter().map(|e| (e.rel_path.as_str(), e)).collect();
+        let map_b: HashMap<&str, &ManifestEntry> =
+            b.entries.iter().map(|e| (e.rel_path.as_str(), e)).collect();
         let mut diffs = Vec::new();
         let mut keys: std::collections::HashSet<&str> = map_a.keys().copied().collect();
         keys.extend(map_b.keys().copied());
@@ -357,18 +371,25 @@ impl FileOps for RealFileOps {
 fn entry_for(p: &Path, root: &Path, is_dir: bool) -> AppResult<ManifestEntry> {
     let meta = std::fs::symlink_metadata(p)?;
     let size = if is_dir { 0 } else { meta.len() };
-    let mtime = meta.modified()
+    let mtime = meta
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     #[cfg(windows)]
-    let attrs = { use std::os::windows::fs::MetadataExt; meta.file_attributes() };
+    let attrs = {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes()
+    };
     #[cfg(not(windows))]
     let attrs = 0u32;
     Ok(ManifestEntry {
         rel_path: rel_under(root, p),
-        is_dir, size, mtime, attrs,
+        is_dir,
+        size,
+        mtime,
+        attrs,
     })
 }
 
@@ -433,7 +454,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn ops() -> RealFileOps { RealFileOps }
+    fn ops() -> RealFileOps {
+        RealFileOps
+    }
 
     #[test]
     fn copy_tree_copies_files_and_preserves_content() {
@@ -458,16 +481,21 @@ mod tests {
         let dst = root.path().join("dst");
         let events = std::cell::RefCell::new(Vec::new());
 
-        ops().copy_tree(
-            &src,
-            &dst,
-            &|progress| events.borrow_mut().push(progress.clone()),
-            &|| false,
-        ).unwrap();
+        ops()
+            .copy_tree(
+                &src,
+                &dst,
+                &|progress| events.borrow_mut().push(progress.clone()),
+                &|| false,
+            )
+            .unwrap();
 
         let events = events.into_inner();
-        assert!(events.iter().any(|event| event.phase == CopyPhase::Preparing));
-        let last = events.iter()
+        assert!(events
+            .iter()
+            .any(|event| event.phase == CopyPhase::Preparing));
+        let last = events
+            .iter()
             .rev()
             .find(|event| event.phase == CopyPhase::Copying)
             .unwrap();
@@ -522,7 +550,10 @@ mod tests {
         ops().copy_tree(&src, &dst, &|_| {}, &|| false).unwrap();
         let m1 = ops().manifest(&src).unwrap();
         let m2 = ops().manifest(&dst).unwrap();
-        assert!(ops().diff_manifests(&m1, &m2).is_empty(), "复制后 manifest 应一致");
+        assert!(
+            ops().diff_manifests(&m1, &m2).is_empty(),
+            "复制后 manifest 应一致"
+        );
     }
 
     #[test]

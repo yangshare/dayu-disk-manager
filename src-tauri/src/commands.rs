@@ -3,8 +3,8 @@ use crate::error::{AppError, AppResult};
 use crate::file_ops::RealFileOps;
 use crate::migrator::{self, MigratePlan};
 use crate::models::*;
-use crate::scanner::{self, ScanDriveError, TreeStore};
 use crate::safety::{migration_conflict, precheck, Win32Probe};
+use crate::scanner::{self, ScanDriveError, TreeStore};
 use crate::win32::{ElevationOutcome, VolumeError};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,11 +42,8 @@ fn invalidate_scan_tree(app: &AppHandle, state: &AppState, outcome: &OperationOu
 /// take_fn 在调用方提供的 current_scan 上取 Option<Arc<TreeStore>>；
 /// emit_fn 接收 (reason, auto_rescan) 元组用于断言（emit 抛错时 fn 内部决定）。
 #[cfg(test)]
-fn invalidate_scan_tree_impl<F, G>(
-    outcome: &OperationOutcome,
-    take_fn: F,
-    mut emit_fn: G,
-) where
+fn invalidate_scan_tree_impl<F, G>(outcome: &OperationOutcome, take_fn: F, mut emit_fn: G)
+where
     F: FnOnce() -> Option<Arc<TreeStore>>,
     G: FnMut(&str, bool) -> Result<(), ()>,
 {
@@ -131,7 +128,10 @@ async fn scan_drive_impl(
 
     {
         let mut active = scan_slot.lock().unwrap();
-        if active.as_ref().is_some_and(|current| Arc::ptr_eq(current, &cancel)) {
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+        {
             *active = None;
         }
     }
@@ -235,12 +235,21 @@ fn acquire_store(state: &AppState, scan_id: &str) -> AppResult<Arc<TreeStore>> {
 }
 
 #[tauri::command]
-pub async fn precheck_migrate(src: String, state: State<'_, AppState>) -> AppResult<PrecheckReport> {
+pub async fn precheck_migrate(
+    src: String,
+    state: State<'_, AppState>,
+) -> AppResult<PrecheckReport> {
     let cfg = state.store.load_config()?;
     let existing = state.store.load_migrations()?;
     tauri::async_runtime::spawn_blocking(move || {
         let src_size = scanner::dir_size(std::path::Path::new(&src));
-        Ok(precheck(std::path::Path::new(&src), &cfg, &existing, src_size, &Win32Probe))
+        Ok(precheck(
+            std::path::Path::new(&src),
+            &cfg,
+            &existing,
+            src_size,
+            &Win32Probe,
+        ))
     })
     .await
     .map_err(|e| AppError::Store(format!("预检任务失败: {e}")))?
@@ -248,8 +257,11 @@ pub async fn precheck_migrate(src: String, state: State<'_, AppState>) -> AppRes
 
 #[tauri::command]
 pub async fn start_migrate(
-    migration_id: String, src: String, preset_id: Option<String>,
-    app: AppHandle, state: State<'_, AppState>,
+    migration_id: String,
+    src: String,
+    preset_id: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
 ) -> AppResult<Migration> {
     let cfg = state.store.load_config()?;
     let src_path = PathBuf::from(&src);
@@ -257,20 +269,35 @@ pub async fn start_migrate(
     if let Some(conflict) = migration_conflict(&src_path, &existing) {
         return Err(AppError::Conflict(conflict));
     }
-    let preset = preset_id.as_ref().and_then(|id| cfg.presets.iter().find(|p| &p.id == id));
-    let subdir = preset.map(|p| p.target_subdir.clone()).unwrap_or_else(|| "custom".into());
-    let target = format!("{}/{}/{}/data", cfg.repository.trim_end_matches('/'), subdir, migration_id);
+    let preset = preset_id
+        .as_ref()
+        .and_then(|id| cfg.presets.iter().find(|p| &p.id == id));
+    let subdir = preset
+        .map(|p| p.target_subdir.clone())
+        .unwrap_or_else(|| "custom".into());
+    let target = format!(
+        "{}/{}/{}/data",
+        cfg.repository.trim_end_matches('/'),
+        subdir,
+        migration_id
+    );
     let tmp = format!("{}.tmp", target);
     let old_path = format!("{}.dayu-old-{}", src.replace('/', "\\"), migration_id);
     let task_id = format!("task-{migration_id}");
     let (src_serial, _) = crate::win32::volume_info(&src_path).unwrap_or((String::new(), false));
-    let (tgt_serial, _) = crate::win32::volume_info(std::path::Path::new(&target)).unwrap_or((String::new(), false));
+    let (tgt_serial, _) =
+        crate::win32::volume_info(std::path::Path::new(&target)).unwrap_or((String::new(), false));
 
     let plan = MigratePlan {
-        task_id: task_id.clone(), migration_id: migration_id.clone(),
-        src: src_path, target: target.into(), tmp: tmp.into(), old_path: old_path.into(),
+        task_id: task_id.clone(),
+        migration_id: migration_id.clone(),
+        src: src_path,
+        target: target.into(),
+        tmp: tmp.into(),
+        old_path: old_path.into(),
         preset_id: preset_id.clone(),
-        source_volume_serial: src_serial, target_volume_serial: tgt_serial,
+        source_volume_serial: src_serial,
+        target_volume_serial: tgt_serial,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_slot = state.cancel_token.clone();
@@ -288,8 +315,14 @@ pub async fn start_migrate(
     let history = state.history.clone();
     let task_result = tauri::async_runtime::spawn_blocking(move || {
         migrator::migrate(
-            &RealFileOps, &store, &journal, &history, &plan,
-            &move |e: ProgressEvent| { let _ = app2.emit("dayu://progress", e); },
+            &RealFileOps,
+            &store,
+            &journal,
+            &history,
+            &plan,
+            &move |e: ProgressEvent| {
+                let _ = app2.emit("dayu://progress", e);
+            },
             &task_cancel,
         )
     })
@@ -298,7 +331,10 @@ pub async fn start_migrate(
 
     {
         let mut active = cancel_slot.lock().unwrap();
-        if active.as_ref().is_some_and(|current| Arc::ptr_eq(current, &cancel)) {
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+        {
             *active = None;
         }
     }
@@ -326,10 +362,14 @@ pub fn cancel_migrate(state: State<AppState>) -> bool {
 
 #[tauri::command]
 pub async fn start_restore(
-    migration_id: String, app: AppHandle, state: State<'_, AppState>,
+    migration_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
 ) -> AppResult<bool> {
     let migs = state.store.load_migrations()?;
-    let mig = migs.into_iter().find(|m| m.id == migration_id)
+    let mig = migs
+        .into_iter()
+        .find(|m| m.id == migration_id)
         .ok_or_else(|| AppError::Store("迁移记录不存在".into()))?;
     let app2 = app.clone();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -347,8 +387,14 @@ pub async fn start_restore(
     let history = state.history.clone();
     let task_result = tauri::async_runtime::spawn_blocking(move || {
         migrator::restore(
-            &RealFileOps, &store, &journal, &history, &mig,
-            &move |e: ProgressEvent| { let _ = app2.emit("dayu://progress", e); },
+            &RealFileOps,
+            &store,
+            &journal,
+            &history,
+            &mig,
+            &move |e: ProgressEvent| {
+                let _ = app2.emit("dayu://progress", e);
+            },
             &task_cancel,
         )
     })
@@ -357,7 +403,10 @@ pub async fn start_restore(
 
     {
         let mut active = cancel_slot.lock().unwrap();
-        if active.as_ref().is_some_and(|current| Arc::ptr_eq(current, &cancel)) {
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+        {
             *active = None;
         }
     }
@@ -378,16 +427,26 @@ pub async fn start_restore(
 pub fn list_links(state: State<AppState>) -> AppResult<Vec<crate::app_state::LinkItem>> {
     use crate::app_state::LinkItem;
     let migs = state.store.load_migrations()?;
-    Ok(migs.into_iter().map(|m| {
-        let valid = crate::junction::verify(std::path::Path::new(&m.source));
-        let target_exists = std::path::Path::new(&m.target).exists();
-        LinkItem {
-            id: m.id.clone(), source: m.source.clone(), target: m.target.clone(),
-            preset: m.preset.clone(), created_at: m.created_at.clone(),
-            status: serde_json::to_string(&m.status).unwrap_or_default().trim_matches('"').into(),
-            valid, broken: !target_exists,
-        }
-    }).collect())
+    Ok(migs
+        .into_iter()
+        .map(|m| {
+            let valid = crate::junction::verify(std::path::Path::new(&m.source));
+            let target_exists = std::path::Path::new(&m.target).exists();
+            LinkItem {
+                id: m.id.clone(),
+                source: m.source.clone(),
+                target: m.target.clone(),
+                preset: m.preset.clone(),
+                created_at: m.created_at.clone(),
+                status: serde_json::to_string(&m.status)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .into(),
+                valid,
+                broken: !target_exists,
+            }
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -397,7 +456,9 @@ pub fn break_link_cmd(
     state: State<AppState>,
 ) -> AppResult<bool> {
     let migs = state.store.load_migrations()?;
-    let mig = migs.into_iter().find(|m| m.id == migration_id)
+    let mig = migs
+        .into_iter()
+        .find(|m| m.id == migration_id)
         .ok_or_else(|| AppError::Store("迁移记录不存在".into()))?;
     match migrator::break_link(&RealFileOps, &state.store, &state.history, &mig) {
         Ok(outcome) => {
@@ -411,7 +472,12 @@ pub fn break_link_cmd(
 }
 
 #[tauri::command]
-pub fn list_history(op: Option<String>, from: Option<String>, to: Option<String>, state: State<AppState>) -> AppResult<Vec<HistoryEntry>> {
+pub fn list_history(
+    op: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    state: State<AppState>,
+) -> AppResult<Vec<HistoryEntry>> {
     let range = match (from.as_ref(), to.as_ref()) {
         (Some(a), Some(b)) => Some((a.as_str(), b.as_str())),
         _ => None,
@@ -456,7 +522,9 @@ async fn restart_elevated_impl(
     match outcome {
         ElevationOutcome::Launched => Ok(true),
         ElevationOutcome::Cancelled => Err(AppError::Win32("用户取消 UAC 提权".into())),
-        ElevationOutcome::Failed { code } => Err(AppError::Win32(format!("UAC 提权启动失败，code={code}"))),
+        ElevationOutcome::Failed { code } => {
+            Err(AppError::Win32(format!("UAC 提权启动失败，code={code}")))
+        }
     }
     // 关键：后端任何分支都不退出当前进程。"成功后关闭旧窗口"由前端 T11 处理。
 }
@@ -476,8 +544,8 @@ fn take_startup_scan_intent_impl(state: &AppState) -> AppResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{RootFileSummary, ScanDiagnostics, ScanSource};
     use crate::scanner::{ScanEngine, ScanOutcome};
-    use crate::models::{RootFileSummary, ScanSource, ScanDiagnostics};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, RwLock};
 
@@ -522,7 +590,11 @@ mod tests {
             _cancel: Arc<AtomicBool>,
             _on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
         ) -> Result<ScanOutcome, ScanDriveError> {
-            self.result.lock().unwrap().take().expect("MockScanEngine 只能使用一次")
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("MockScanEngine 只能使用一次")
         }
     }
 
@@ -585,7 +657,9 @@ mod tests {
     fn fast_scan_failure_preserves_old_snapshot() {
         let old_store = empty_store("old");
         let state = temp_app_state(Arc::new(MockScanEngine::fast_scan_failure(
-            FastScanFailure::UnsupportedFilesystem { actual: "fat32".into() },
+            FastScanFailure::UnsupportedFilesystem {
+                actual: "fat32".into(),
+            },
         )));
         *state.current_scan.write().unwrap() = Some(old_store.clone());
 
@@ -596,11 +670,19 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(
-            matches!(result, ScanDriveResult::FastScanUnavailable { reason: FastScanFailure::UnsupportedFilesystem { .. } })
-        );
+        assert!(matches!(
+            result,
+            ScanDriveResult::FastScanUnavailable {
+                reason: FastScanFailure::UnsupportedFilesystem { .. }
+            }
+        ));
         assert_eq!(
-            state.current_scan.read().unwrap().as_ref().map(|s| s.scan_id().to_string()),
+            state
+                .current_scan
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|s| s.scan_id().to_string()),
             Some("old".to_string())
         );
         assert!(state.scan_cancel_token.lock().unwrap().is_none());
@@ -620,7 +702,12 @@ mod tests {
 
         assert!(matches!(result, Err(AppError::Cancelled)));
         assert_eq!(
-            state.current_scan.read().unwrap().as_ref().map(|s| s.scan_id().to_string()),
+            state
+                .current_scan
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|s| s.scan_id().to_string()),
             Some("old".to_string())
         );
     }
@@ -658,7 +745,12 @@ mod tests {
             _ => panic!("期望 Complete"),
         }
         assert_eq!(
-            state.current_scan.read().unwrap().as_ref().map(|s| s.scan_id().to_string()),
+            state
+                .current_scan
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|s| s.scan_id().to_string()),
             Some("new".to_string())
         );
     }
@@ -917,21 +1009,41 @@ mod tests {
         let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
             .expect("读取 tauri.conf.json 失败");
         let conf: serde_json::Value = serde_json::from_str(&raw).expect("tauri.conf.json 解析失败");
-        let csp = conf["app"]["security"]["csp"].as_str().expect("CSP 必须是非空字符串");
-        assert!(csp.contains("default-src 'self'"), "CSP 必须限制 default-src 为 'self': {csp}");
-        assert!(!csp.contains("http://"), "CSP 不得包含 http:// 远程源: {csp}");
-        assert!(!csp.contains("https://"), "CSP 不得包含 https:// 远程源: {csp}");
+        let csp = conf["app"]["security"]["csp"]
+            .as_str()
+            .expect("CSP 必须是非空字符串");
+        assert!(
+            csp.contains("default-src 'self'"),
+            "CSP 必须限制 default-src 为 'self': {csp}"
+        );
+        assert!(
+            !csp.contains("http://"),
+            "CSP 不得包含 http:// 远程源: {csp}"
+        );
+        assert!(
+            !csp.contains("https://"),
+            "CSP 不得包含 https:// 远程源: {csp}"
+        );
     }
 
     #[test]
     fn no_shell_execute_permission() {
-        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/capabilities/default.json"))
-            .expect("读取 capabilities/default.json 失败");
-        let cap: serde_json::Value = serde_json::from_str(&raw).expect("capabilities/default.json 解析失败");
-        let perms = cap["permissions"].as_array().expect("capabilities 必须有 permissions 数组");
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/capabilities/default.json"
+        ))
+        .expect("读取 capabilities/default.json 失败");
+        let cap: serde_json::Value =
+            serde_json::from_str(&raw).expect("capabilities/default.json 解析失败");
+        let perms = cap["permissions"]
+            .as_array()
+            .expect("capabilities 必须有 permissions 数组");
         for p in perms {
             let s = p.as_str().unwrap_or("");
-            assert!(!s.contains("shell:allow-execute"), "禁止 shell:allow-execute: {s}");
+            assert!(
+                !s.contains("shell:allow-execute"),
+                "禁止 shell:allow-execute: {s}"
+            );
             assert!(!s.contains("shell:default"), "禁止 shell:default: {s}");
             assert!(!s.contains("process:"), "禁止 process 类 permission: {s}");
         }
@@ -975,7 +1087,10 @@ mod tests {
             &outcome,
             move || current_scan.write().unwrap().take(),
             move |reason, auto_rescan| {
-                emitted_c.lock().unwrap().push((reason.to_string(), auto_rescan));
+                emitted_c
+                    .lock()
+                    .unwrap()
+                    .push((reason.to_string(), auto_rescan));
                 Ok(())
             },
         );
@@ -1005,7 +1120,10 @@ mod tests {
             &outcome,
             move || current_scan.write().unwrap().take(),
             move |reason, auto_rescan| {
-                emitted_c.lock().unwrap().push((reason.to_string(), auto_rescan));
+                emitted_c
+                    .lock()
+                    .unwrap()
+                    .push((reason.to_string(), auto_rescan));
                 Ok(())
             },
         );
@@ -1032,7 +1150,10 @@ mod tests {
             &outcome,
             move || current_scan.write().unwrap().take(),
             move |reason, auto_rescan| {
-                emitted_c.lock().unwrap().push((reason.to_string(), auto_rescan));
+                emitted_c
+                    .lock()
+                    .unwrap()
+                    .push((reason.to_string(), auto_rescan));
                 Ok(())
             },
         );
@@ -1059,7 +1180,7 @@ mod tests {
             move || current_scan.write().unwrap().take(),
             move |_reason, _auto_rescan| {
                 *emitted_c.lock().unwrap() = true;
-                Err(())  // 模拟 emit 失败
+                Err(()) // 模拟 emit 失败
             },
         );
 
@@ -1078,7 +1199,10 @@ mod tests {
         apply_outcome(&outcome, move |_o| {
             *called_c.lock().unwrap() = true;
         });
-        assert!(*called.lock().unwrap(), "成功路径 source_changed=true 必须触发失效");
+        assert!(
+            *called.lock().unwrap(),
+            "成功路径 source_changed=true 必须触发失效"
+        );
         assert_eq!(outcome.reason, "migrated");
     }
 
@@ -1141,6 +1265,9 @@ mod tests {
         apply_outcome(&outcome, move |_o| {
             *called_c.lock().unwrap() = true;
         });
-        assert!(!*called.lock().unwrap(), "break_link 失败 source_changed=false 不应触发失效");
+        assert!(
+            !*called.lock().unwrap(),
+            "break_link 失败 source_changed=false 不应触发失效"
+        );
     }
 }

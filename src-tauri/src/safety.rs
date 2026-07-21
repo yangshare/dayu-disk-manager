@@ -1,6 +1,6 @@
-use crate::error::AppResult;
 #[cfg(not(windows))]
 use crate::error::AppError;
+use crate::error::AppResult;
 use crate::models::{Config, Migration, MigrationStatus, PrecheckReport, Preset};
 use crate::scanner::matches_preset;
 use std::path::Path;
@@ -172,15 +172,15 @@ pub fn precheck(
     // (a) Restart Manager（对文件路径有效；目录生产返回 None，不影响）
     match probe.locked_processes(src) {
         Ok(Some(procs)) if !procs.is_empty() => {
-            warnings.push(format!("源被进程占用（Restart Manager）：{}", procs.join(", ")));
+            warnings.push(format!(
+                "源被进程占用（Restart Manager）：{}",
+                procs.join(", ")
+            ));
         }
         _ => {}
     }
     // (b) 主检测：预设进程名匹配（针对目录路径真正生效）
-    let preset_match: Option<&Preset> = config
-        .presets
-        .iter()
-        .find(|p| matches_preset(&src_str, p));
+    let preset_match: Option<&Preset> = config.presets.iter().find(|p| matches_preset(&src_str, p));
     if let Some(preset) = preset_match {
         if !preset.match_processes.is_empty() {
             match probe.running_processes() {
@@ -225,9 +225,7 @@ pub fn precheck(
 }
 
 fn norm(p: &str) -> String {
-    p.replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_lowercase()
+    p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
 #[cfg(test)]
@@ -268,11 +266,18 @@ mod tests {
 
     fn migration(source: &str, status: MigrationStatus) -> Migration {
         Migration {
-            id: "u1".into(), schema_version: 1, source: source.into(),
-            target: "D:/Migrated/c/u1/data".into(), old_path: String::new(), preset: None,
-            created_at: "2026-07-18T00:00:00Z".into(), status,
-            source_volume_serial: "C".into(), target_volume_serial: "D".into(),
-            recycle_bin_ref: String::new(), pending_cleanup: None,
+            id: "u1".into(),
+            schema_version: 1,
+            source: source.into(),
+            target: "D:/Migrated/c/u1/data".into(),
+            old_path: String::new(),
+            preset: None,
+            created_at: "2026-07-18T00:00:00Z".into(),
+            status,
+            source_volume_serial: "C".into(),
+            target_volume_serial: "D".into(),
+            recycle_bin_ref: String::new(),
+            pending_cleanup: None,
         }
     }
 
@@ -398,10 +403,11 @@ mod tests {
             1_000_000,
             &probe,
         );
-        assert!(report
-            .warnings
-            .iter()
-            .any(|w| w.contains("wechat")), "warnings: {:?}", report.warnings);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("wechat")),
+            "warnings: {:?}",
+            report.warnings
+        );
     }
 
     /// 增强（第 6 步）：源目录命中预设 + 预设的 match_processes 进程在运行中 → warning。
@@ -409,14 +415,13 @@ mod tests {
     fn warns_when_preset_process_running() {
         // 取 wechat 预设的真实路径模板，构造一个匹配源
         let cfg = default_config();
-        let wechat = cfg
-            .presets
-            .iter()
-            .find(|p| p.id == "wechat")
-            .unwrap();
+        let wechat = cfg.presets.iter().find(|p| p.id == "wechat").unwrap();
         let userprofile = std::env::var("USERPROFILE").unwrap();
         let wechat_path = format!("{userprofile}\\Documents\\WeChat Files");
-        assert!(matches_preset(&wechat_path, wechat), "测试前置：路径应匹配 wechat 预设");
+        assert!(
+            matches_preset(&wechat_path, wechat),
+            "测试前置：路径应匹配 wechat 预设"
+        );
 
         let probe = Mock {
             free: 10_000_000_000,
@@ -429,11 +434,14 @@ mod tests {
         cfg.repository = "D:/Migrated".into();
         let report = precheck(Path::new(&wechat_path), &cfg, &[], 1_000_000, &probe);
         assert!(report.ok, "不应有 blocker: {:?}", report.blockers);
-        assert!(report
-            .warnings
-            .iter()
-            .any(|w| w.contains("微信文件") && w.contains("wechat")),
-            "warnings: {:?}", report.warnings);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("微信文件") && w.contains("wechat")),
+            "warnings: {:?}",
+            report.warnings
+        );
     }
 
     /// 增强（第 6 步）反例：进程未运行 → 不触发占用 warning。
@@ -453,10 +461,7 @@ mod tests {
         let mut cfg = cfg;
         cfg.repository = "D:/Migrated".into();
         let report = precheck(Path::new(&wechat_path), &cfg, &[], 1_000_000, &probe);
-        assert!(report
-            .warnings
-            .iter()
-            .all(|w| !w.contains("微信文件")));
+        assert!(report.warnings.iter().all(|w| !w.contains("微信文件")));
     }
 
     #[test]
@@ -519,9 +524,12 @@ mod tests {
         assert!(!names.is_empty(), "运行中进程列表不应为空");
         // 当前进程（cargo test）至少应出现，或常见系统进程
         assert!(
-            names
-                .iter()
-                .any(|n| n == "explorer" || n == "svchost" || n == "cargo" || n == "conhost" || n == "rustc" || n == "system"),
+            names.iter().any(|n| n == "explorer"
+                || n == "svchost"
+                || n == "cargo"
+                || n == "conhost"
+                || n == "rustc"
+                || n == "system"),
             "未找到常见进程，列表前若干：{:?}",
             names.iter().take(10).collect::<Vec<_>>()
         );

@@ -1,16 +1,3 @@
-export interface ScanItem {
-  path: string
-  displayName: string
-  sizeBytes: number
-  matchedPreset: string | null
-  category: PresetCategory | null
-  autoMigrate: boolean
-  isJunction: boolean
-  inaccessible: boolean
-  scanStatus: ScanItemStatus | null
-  migrationId: string | null
-}
-
 export type ScanItemStatus =
   | 'migrated' | 'migration_pending' | 'link_broken'
   | 'existing_link' | 'contains_migrated' | 'contains_link'

@@ -3,12 +3,8 @@ use crate::models::{
     Preset, PresetCategory, RevealLevel, RootFileSummary, ScanDiagnostics, ScanItemStatus,
     ScanMode, ScanProgressEvent, ScanSource, TreeNode,
 };
-#[cfg(test)]
-use crate::models::ScanItem;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
@@ -16,12 +12,12 @@ use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::junction;
 #[cfg(windows)]
 use crate::mft::{enumerate_mft, MftFileReader};
+use crate::mft::{select_effective_names, FileRef, MftError, MftIndex};
 #[cfg(windows)]
 use crate::win32::{open_volume, read_volume_data, VolumeError};
-use crate::mft::{select_effective_names, FileRef, MftError, MftIndex};
-use crate::junction;
 
 /// 递归计算目录体积（字节）。不跟随 reparse point 的内容。
 pub fn dir_size(path: &Path) -> u64 {
@@ -108,13 +104,19 @@ pub struct RealFsReader;
 impl FsReader for RealFsReader {
     #[allow(clippy::type_complexity)]
     fn read_dir(&self, path: &str) -> Result<Vec<FsEntryResult>, FsEntryError> {
-        let entries = std::fs::read_dir(path).map_err(|e| map_io_error(e.kind(), e.raw_os_error()))?;
+        let entries =
+            std::fs::read_dir(path).map_err(|e| map_io_error(e.kind(), e.raw_os_error()))?;
         let mut result = Vec::new();
         for entry in entries {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    result.push(Err((String::new(), FsEntryError::Io { message: e.to_string() })));
+                    result.push(Err((
+                        String::new(),
+                        FsEntryError::Io {
+                            message: e.to_string(),
+                        },
+                    )));
                     continue;
                 }
             };
@@ -122,10 +124,7 @@ impl FsReader for RealFsReader {
             let meta = match std::fs::symlink_metadata(entry.path()) {
                 Ok(m) => m,
                 Err(e) => {
-                    result.push(Err((
-                        name,
-                        map_io_error(e.kind(), e.raw_os_error()),
-                    )));
+                    result.push(Err((name, map_io_error(e.kind(), e.raw_os_error()))));
                     continue;
                 }
             };
@@ -181,90 +180,17 @@ pub(crate) fn normalize(p: &str) -> String {
     p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
-#[cfg(test)]
-fn is_descendant(path: &str, parent: &str) -> bool {
-    let path = normalize(path);
-    let parent = normalize(parent);
-    path.strip_prefix(&parent)
-        .is_some_and(|rest| rest.starts_with('\\'))
-}
-
 fn represents_migrated_link(status: &MigrationStatus) -> bool {
     !matches!(status, MigrationStatus::TargetPendingDelete)
 }
 
-/// 合并迁移记录，使所有扫描调用方得到一致的状态和迁移资格判断。
-#[cfg(test)]
-pub fn annotate_migrations(
-    items: &mut [ScanItem],
-    migrations: &[Migration],
-    link_valid: &dyn Fn(&Path) -> bool,
-    target_size: &dyn Fn(&Path) -> u64,
-) {
-    let linked_migrations: Vec<&Migration> = migrations
-        .iter()
-        .filter(|migration| represents_migrated_link(&migration.status))
-        .collect();
-    let junction_paths: Vec<String> = items
-        .iter()
-        .filter(|item| item.is_junction)
-        .map(|item| item.path.clone())
-        .collect();
-
-    for item in items {
-        if let Some(migration) = linked_migrations
-            .iter()
-            .find(|migration| normalize(&migration.source) == normalize(&item.path))
-        {
-            item.migration_id = Some(migration.id.clone());
-            let target = Path::new(&migration.target);
-            if target.exists() {
-                item.size_bytes = target_size(target);
-            }
-            item.scan_status = Some(if !link_valid(Path::new(&migration.source)) {
-                ScanItemStatus::LinkBroken
-            } else if migration.status == MigrationStatus::Active {
-                ScanItemStatus::Migrated
-            } else {
-                ScanItemStatus::MigrationPending
-            });
-            continue;
-        }
-
-        if linked_migrations
-            .iter()
-            .any(|migration| is_descendant(&migration.source, &item.path))
-        {
-            item.scan_status = Some(ScanItemStatus::ContainsMigrated);
-        } else if junction_paths
-            .iter()
-            .any(|junction_path| is_descendant(junction_path, &item.path))
-        {
-            item.scan_status = Some(ScanItemStatus::ContainsLink);
-        }
-    }
-}
-
 pub(crate) struct ScanContext {
-    #[cfg(test)]
-    exclude: Vec<String>,
     preset_by_path: HashMap<String, usize>,
     min_bytes: u64,
 }
 
 impl ScanContext {
     pub(crate) fn new(cfg: &Config) -> Self {
-        #[cfg(test)]
-        let exclude: Vec<String> = cfg
-            .scan
-            .exclude_paths
-            .iter()
-            .filter_map(|p| {
-                let normalized = normalize(&expand_env(p));
-                (!normalized.is_empty()).then_some(normalized)
-            })
-            .collect();
-
         // Preset paths are static for the duration of a scan. Expand and normalize
         // them once instead of doing environment lookups for every visited directory.
         let mut preset_by_path = HashMap::new();
@@ -277,16 +203,9 @@ impl ScanContext {
         }
 
         Self {
-            #[cfg(test)]
-            exclude,
             preset_by_path,
             min_bytes: cfg.scan.min_size_mb.saturating_mul(1024 * 1024),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn excluded(&self, normalized_path: &str) -> bool {
-        is_path_excluded(normalized_path, &self.exclude)
     }
 
     pub(crate) fn preset_index(&self, normalized_path: &str) -> Option<usize> {
@@ -311,7 +230,8 @@ fn scan_status_priority(status: &ScanItemStatus) -> u8 {
         ScanItemStatus::LinkBroken => 4,
         ScanItemStatus::MigrationPending => 3,
         ScanItemStatus::Migrated => 2,
-        ScanItemStatus::ExistingLink | ScanItemStatus::ContainsMigrated
+        ScanItemStatus::ExistingLink
+        | ScanItemStatus::ContainsMigrated
         | ScanItemStatus::ContainsLink => 0,
     }
 }
@@ -319,9 +239,7 @@ fn scan_status_priority(status: &ScanItemStatus) -> u8 {
 fn is_exact_migrated_status(status: &ScanItemStatus) -> bool {
     matches!(
         status,
-        ScanItemStatus::Migrated
-            | ScanItemStatus::MigrationPending
-            | ScanItemStatus::LinkBroken
+        ScanItemStatus::Migrated | ScanItemStatus::MigrationPending | ScanItemStatus::LinkBroken
     )
 }
 
@@ -587,232 +505,14 @@ pub fn build_root_summary(graph: &DirectoryGraph, skipped_records: u64) -> RootF
         .map(|node| (node.direct_file_size_bytes, node.direct_file_count))
         .unwrap_or((0, 0));
     let system_metadata_size_bytes = Some(graph.system_metadata_size_bytes);
-    let total_known_size_bytes = direct_file_size_bytes.saturating_add(graph.system_metadata_size_bytes);
+    let total_known_size_bytes =
+        direct_file_size_bytes.saturating_add(graph.system_metadata_size_bytes);
     RootFileSummary {
         direct_file_size_bytes,
         direct_file_count,
         system_metadata_size_bytes,
         total_known_size_bytes,
         incomplete: skipped_records > 0,
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-#[cfg(test)]
-pub struct ScanStats {
-    pub scanned_dirs: u64,
-    pub scanned_files: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
-pub struct ScanCancelled;
-
-#[cfg(test)]
-pub struct ScanOutput {
-    pub items: Vec<ScanItem>,
-    pub stats: ScanStats,
-}
-
-/// Scan several roots with one precomputed matcher. The callback is invoked during
-/// traversal; callers can throttle expensive IPC/event work at the boundary.
-#[cfg(test)]
-pub fn scan_roots_with_control(
-    roots: &[PathBuf],
-    cfg: &Config,
-    cancel: &AtomicBool,
-    on_progress: &mut dyn FnMut(&ScanStats, &Path),
-) -> Result<ScanOutput, ScanCancelled> {
-    let context = ScanContext::new(cfg);
-    let mut output = ScanOutput {
-        items: Vec::new(),
-        stats: ScanStats::default(),
-    };
-    for root in roots {
-        scan_root(root, cfg, &context, cancel, &mut output, on_progress)?;
-    }
-    on_progress(
-        &output.stats,
-        roots.last().map(PathBuf::as_path).unwrap_or(Path::new("")),
-    );
-    Ok(output)
-}
-
-#[cfg(test)]
-fn scan_root(
-    root: &Path,
-    cfg: &Config,
-    context: &ScanContext,
-    cancel: &AtomicBool,
-    output: &mut ScanOutput,
-    on_progress: &mut dyn FnMut(&ScanStats, &Path),
-) -> Result<(), ScanCancelled> {
-    let mut stack = vec![(root.to_path_buf(), None::<PathBuf>, false, None::<usize>)];
-    let mut sizes = HashMap::<PathBuf, u64>::new();
-
-    while let Some((cur, parent, visited, preset_index)) = stack.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(ScanCancelled);
-        }
-
-        if visited {
-            let size = sizes.remove(&cur).unwrap_or(0);
-            push_if_big_or_preset(
-                &mut output.items,
-                &cur,
-                size,
-                preset_index,
-                cfg,
-                context.min_bytes,
-            );
-            if let Some(parent) = parent {
-                let parent_size = sizes.entry(parent).or_default();
-                *parent_size = parent_size.saturating_add(size);
-            }
-            continue;
-        }
-
-        let normalized = normalize(&cur.to_string_lossy());
-        if context.excluded(&normalized) {
-            continue;
-        }
-
-        let meta = match std::fs::symlink_metadata(&cur) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                output.stats.scanned_dirs += 1;
-                output.items.push(inaccessible_item(&cur));
-                on_progress(&output.stats, &cur);
-                continue;
-            }
-        };
-        if metadata_is_reparse_point(&meta) {
-            output.stats.scanned_dirs += 1;
-            output.items.push(junction_item(&cur));
-            on_progress(&output.stats, &cur);
-            continue;
-        }
-
-        let entries = match std::fs::read_dir(&cur) {
-            Ok(entries) => entries,
-            Err(_) => {
-                output.stats.scanned_dirs += 1;
-                output.items.push(inaccessible_item(&cur));
-                on_progress(&output.stats, &cur);
-                continue;
-            }
-        };
-
-        let mut direct_size = 0u64;
-        let mut subdirs = Vec::new();
-        for entry in entries.flatten() {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(ScanCancelled);
-            }
-            let entry_path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-            if file_type.is_dir() || file_type.is_symlink() {
-                subdirs.push(entry_path);
-            } else if let Ok(meta) = entry.metadata() {
-                output.stats.scanned_files += 1;
-                direct_size = direct_size.saturating_add(meta.len());
-                if output.stats.scanned_files.is_multiple_of(256) {
-                    on_progress(&output.stats, &cur);
-                }
-            }
-        }
-
-        output.stats.scanned_dirs += 1;
-        on_progress(&output.stats, &cur);
-        sizes.insert(cur.clone(), direct_size);
-        stack.push((cur.clone(), parent, true, context.preset_index(&normalized)));
-        for subdir in subdirs.into_iter().rev() {
-            stack.push((subdir, Some(cur.clone()), false, None));
-        }
-    }
-    Ok(())
-}
-
-/// 单次后序遍历 root，返回大于阈值或命中预设的项。
-#[cfg(test)]
-pub fn scan(root: &Path, cfg: &Config) -> Vec<ScanItem> {
-    let cancel = AtomicBool::new(false);
-    scan_roots_with_control(&[root.to_path_buf()], cfg, &cancel, &mut |_, _| {})
-        .map(|output| output.items)
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
-fn push_if_big_or_preset(
-    items: &mut Vec<ScanItem>,
-    path: &Path,
-    size: u64,
-    preset_index: Option<usize>,
-    cfg: &Config,
-    min_bytes: u64,
-) {
-    let path_str = path.to_string_lossy();
-    let preset_match = preset_index.and_then(|index| cfg.presets.get(index));
-    let big = size >= min_bytes;
-    if !(big || preset_match.is_some()) {
-        return;
-    }
-    items.push(ScanItem {
-        path: path_str.into(),
-        display_name: preset_match
-            .map(|p| p.name.clone())
-            .or_else(|| path.file_name().map(|n| n.to_string_lossy().into()))
-            .unwrap_or_default(),
-        size_bytes: size,
-        matched_preset: preset_match.map(|p| p.id.clone()),
-        category: preset_match.map(|p| p.category.clone()),
-        auto_migrate: preset_match.map(|p| p.auto_migrate).unwrap_or(false),
-        is_junction: false,
-        inaccessible: false,
-        scan_status: None,
-        migration_id: None,
-    });
-}
-
-#[cfg(test)]
-fn junction_item(path: &Path) -> ScanItem {
-    ScanItem {
-        path: path.to_string_lossy().into(),
-        display_name: path
-            .file_name()
-            .map(|n| n.to_string_lossy().into())
-            .unwrap_or_default(),
-        size_bytes: 0,
-        matched_preset: None,
-        category: None,
-        auto_migrate: false,
-        is_junction: true,
-        inaccessible: false,
-        scan_status: Some(ScanItemStatus::ExistingLink),
-        migration_id: None,
-    }
-}
-
-#[cfg(test)]
-fn inaccessible_item(path: &Path) -> ScanItem {
-    ScanItem {
-        path: path.to_string_lossy().into(),
-        display_name: path
-            .file_name()
-            .map(|n| n.to_string_lossy().into())
-            .unwrap_or_default(),
-        size_bytes: 0,
-        matched_preset: None,
-        category: None,
-        auto_migrate: false,
-        is_junction: false,
-        inaccessible: true,
-        scan_status: None,
-        migration_id: None,
     }
 }
 
@@ -953,7 +653,11 @@ impl DirectoryGraph {
 /// - `root_drive`：根 5 的盘符字母（如 `'C'`）。根路径格式化为 `r"{drive}:\"`。
 ///
 /// 调用方负责传 `&[String]`（T4 不读 `Config`）。
-pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char) -> DirectoryGraph {
+pub fn build_graph(
+    index: &MftIndex,
+    excluded_paths: &[String],
+    root_drive: char,
+) -> DirectoryGraph {
     // 预归一化排除路径（与 ScanContext 同样的处理）。
     let normalized_excluded: Vec<String> = excluded_paths
         .iter()
@@ -1033,8 +737,7 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
                     parent_node.direct_file_size_bytes = parent_node
                         .direct_file_size_bytes
                         .saturating_add(record.logical_size);
-                    parent_node.direct_file_count =
-                        parent_node.direct_file_count.saturating_add(1);
+                    parent_node.direct_file_count = parent_node.direct_file_count.saturating_add(1);
                 }
             } else {
                 // 父不在 nodes：区分"记录不存在"与"sequence 不匹配"。
@@ -1175,10 +878,7 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
                         _ => {} // 白
                     }
                     color.insert(*child_ref, 1);
-                    let parent_path = nodes
-                        .get(&node)
-                        .map(|n| n.path.clone())
-                        .unwrap_or_default();
+                    let parent_path = nodes.get(&node).map(|n| n.path.clone()).unwrap_or_default();
                     let parent_depth = nodes.get(&node).map(|n| n.depth).unwrap_or(0);
                     // 父路径若以 '\\' 结尾（如根 "C:\\"），不要再补分隔符。
                     let mut new_path =
@@ -1243,8 +943,7 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
     }
     // 移除孤儿边：父或子任一为 orphan 时整条边剔除；excluded 节点保留。
     graph.children.retain(|parent, kids| {
-        !unreachable_set.contains(parent)
-            && kids.iter().all(|k| !unreachable_set.contains(k))
+        !unreachable_set.contains(parent) && kids.iter().all(|k| !unreachable_set.contains(k))
     });
     // 剔除后，剩余节点的 direct_dir_count 重算以反映实际可达子目录数。
     for (parent, kids) in &graph.children {
@@ -1370,8 +1069,7 @@ pub fn aggregate_and_exclude(graph: &mut DirectoryGraph, normalized_excluded: &[
             Some(p) => graph.nodes.get(p).map(|n| !n.excluded).unwrap_or(true),
         };
         if is_top {
-            excluded_subtree_size_bytes =
-                excluded_subtree_size_bytes.saturating_add(*size);
+            excluded_subtree_size_bytes = excluded_subtree_size_bytes.saturating_add(*size);
         }
     }
 
@@ -1396,6 +1094,7 @@ pub struct TreeStore {
 
 impl TreeStore {
     /// 从各分片构造 `TreeStore`。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         scan_id: String,
         source: ScanSource,
@@ -1449,7 +1148,11 @@ impl TreeStore {
 
     pub fn children_page(&self, path: &str, offset: u32, limit: u32) -> ChildPage {
         let limit = limit.clamp(1, 500);
-        let all = self.children.get(&normalize(path)).cloned().unwrap_or_default();
+        let all = self
+            .children
+            .get(&normalize(path))
+            .cloned()
+            .unwrap_or_default();
         let total = all.len() as u32;
         if offset >= total {
             return ChildPage {
@@ -1478,10 +1181,17 @@ impl TreeStore {
             .collect()
     }
 
-    pub fn reveal_pages(&self, path: &str, limit: u32) -> Result<Vec<RevealLevel>, crate::error::AppError> {
+    pub fn reveal_pages(
+        &self,
+        path: &str,
+        limit: u32,
+    ) -> Result<Vec<RevealLevel>, crate::error::AppError> {
         let target_norm = normalize(path);
         if !self.nodes.contains_key(&target_norm) {
-            return Err(crate::error::AppError::Store(format!("reveal 目标不存在: {}", path)));
+            return Err(crate::error::AppError::Store(format!(
+                "reveal 目标不存在: {}",
+                path
+            )));
         }
         let limit = limit.clamp(1, 500);
 
@@ -1508,7 +1218,11 @@ impl TreeStore {
         let mut levels: Vec<RevealLevel> = Vec::new();
         for (i, child_norm) in chain.iter().enumerate() {
             // 该层的 parent：第 0 层是根，其余层是 chain[i-1]。
-            let parent_norm = if i == 0 { root_norm.clone() } else { chain[i - 1].clone() };
+            let parent_norm = if i == 0 {
+                root_norm.clone()
+            } else {
+                chain[i - 1].clone()
+            };
             let parent_display = if i == 0 {
                 root_display.clone()
             } else {
@@ -1522,7 +1236,10 @@ impl TreeStore {
             let idx = kids.iter().position(|p| p == child_norm).unwrap_or(0) as u32;
             let page_offset = (idx / limit) * limit;
             let page = self.children_page(&parent_display, page_offset, limit);
-            levels.push(RevealLevel { parent_path: parent_display, page });
+            levels.push(RevealLevel {
+                parent_path: parent_display,
+                page,
+            });
         }
         Ok(levels)
     }
@@ -1577,9 +1294,7 @@ pub fn materialize(
             }
         }
         // size 降序；同 size 用规范化 path 升序。
-        visible_children.sort_by(|a, b| {
-            b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
-        });
+        visible_children.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let child_paths: Vec<String> = visible_children.into_iter().map(|(_, p)| p).collect();
         children.insert(parent_norm.clone(), child_paths);
     }
@@ -1590,7 +1305,10 @@ pub fn materialize(
         if !node.visible {
             continue;
         }
-        let norm_path = ref_to_path.get(fr).cloned().unwrap_or_else(|| normalize(&node.path));
+        let norm_path = ref_to_path
+            .get(fr)
+            .cloned()
+            .unwrap_or_else(|| normalize(&node.path));
         let child_list = children.get(&norm_path).cloned().unwrap_or_default();
         let child_count = child_list.len() as u32;
         let filtered_child_count = graph
@@ -1673,13 +1391,8 @@ pub fn materialize(
             recommended_candidates.push((node.size_bytes, norm_path.clone()));
         }
     }
-    recommended_candidates.sort_by(|a, b| {
-        b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
-    });
-    let recommended: Vec<String> = recommended_candidates
-        .into_iter()
-        .map(|(_, p)| p)
-        .collect();
+    recommended_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let recommended: Vec<String> = recommended_candidates.into_iter().map(|(_, p)| p).collect();
 
     TreeStore::from_parts(
         scan_id,
@@ -1721,8 +1434,8 @@ pub fn concurrency_for(drive_type_fn: &dyn Fn(char) -> DriveKind, root_drive: ch
 
 #[cfg(windows)]
 fn win32_drive_kind(drive: char) -> DriveKind {
-    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
     use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
     // Win32 GetDriveTypeW 返回值（WinBase.h；硬编码避免引入额外 feature）：
     //   0 = DRIVE_UNKNOWN, 1 = DRIVE_NO_ROOT_DIR, 2 = DRIVE_REMOVABLE,
     //   3 = DRIVE_FIXED,   4 = DRIVE_REMOTE,    5 = DRIVE_CDROM,
@@ -2181,8 +1894,22 @@ impl ScanEngine for RealScanEngine {
         on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
     ) -> Result<ScanOutcome, ScanDriveError> {
         match mode {
-            ScanMode::Auto | ScanMode::Mft => self.mft_scan(root_drive, &cfg, &migrations, &excluded_paths, cancel, on_progress),
-            ScanMode::Filesystem => self.fs_scan(root_drive, &cfg, &migrations, &excluded_paths, cancel, on_progress),
+            ScanMode::Auto | ScanMode::Mft => self.mft_scan(
+                root_drive,
+                &cfg,
+                &migrations,
+                &excluded_paths,
+                cancel,
+                on_progress,
+            ),
+            ScanMode::Filesystem => self.fs_scan(
+                root_drive,
+                &cfg,
+                &migrations,
+                &excluded_paths,
+                cancel,
+                on_progress,
+            ),
         }
     }
 }
@@ -2201,7 +1928,8 @@ impl RealScanEngine {
         let vol = open_volume(root_drive).map_err(map_volume_error)?;
         let volume_data = read_volume_data(&vol).map_err(map_volume_error)?;
         let reader = MftFileReader::open(&vol, volume_data).map_err(map_mft_error)?;
-        let record_count = volume_data.mft_valid_data_length / volume_data.bytes_per_file_record_segment as u64;
+        let record_count =
+            volume_data.mft_valid_data_length / volume_data.bytes_per_file_record_segment as u64;
 
         let index = enumerate_mft(
             &reader,
@@ -2275,7 +2003,9 @@ impl RealScanEngine {
         _cancel: Arc<AtomicBool>,
         _on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
     ) -> Result<ScanOutcome, ScanDriveError> {
-        Err(ScanDriveError::FastScanFailure(FastScanFailure::Io { code: None }))
+        Err(ScanDriveError::FastScanFailure(FastScanFailure::Io {
+            code: None,
+        }))
     }
 
     fn fs_scan(
@@ -2363,11 +2093,7 @@ impl RealScanEngine {
         };
 
         let scan_id = generate_scan_id();
-        let store = materialize(&graph,
-            root_summary,
-            ScanSource::Filesystem,
-            scan_id,
-        );
+        let store = materialize(&graph, root_summary, ScanSource::Filesystem, scan_id);
 
         let diagnostics = ScanDiagnostics {
             scanned_records: 0,
@@ -2415,7 +2141,10 @@ fn map_mft_error(e: MftError) -> ScanDriveError {
             ScanDriveError::FastScanFailure(FastScanFailure::UnsupportedFilesystem { actual })
         }
         MftError::UnsupportedNtfsVersion { major, minor } => {
-            ScanDriveError::FastScanFailure(FastScanFailure::UnsupportedNtfsVersion { major, minor })
+            ScanDriveError::FastScanFailure(FastScanFailure::UnsupportedNtfsVersion {
+                major,
+                minor,
+            })
         }
         MftError::InvalidVolumeData => {
             ScanDriveError::FastScanFailure(FastScanFailure::InvalidVolumeData)
@@ -2424,7 +2153,10 @@ fn map_mft_error(e: MftError) -> ScanDriveError {
             ScanDriveError::FastScanFailure(FastScanFailure::RootRecordMissing)
         }
         MftError::ExcessiveRecordErrors { skipped, scanned } => {
-            ScanDriveError::FastScanFailure(FastScanFailure::ExcessiveRecordErrors { skipped, scanned })
+            ScanDriveError::FastScanFailure(FastScanFailure::ExcessiveRecordErrors {
+                skipped,
+                scanned,
+            })
         }
         MftError::BadRecord { .. } => {
             ScanDriveError::FastScanFailure(FastScanFailure::Io { code: None })
@@ -2438,213 +2170,6 @@ fn map_mft_error(e: MftError) -> ScanDriveError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::default_config;
-    use tempfile::TempDir;
-
-    fn scan_item(path: &str, is_junction: bool) -> ScanItem {
-        ScanItem {
-            path: path.into(), display_name: path.into(), size_bytes: 0,
-            matched_preset: None, category: None, auto_migrate: false,
-            is_junction, inaccessible: false,
-            scan_status: is_junction.then_some(ScanItemStatus::ExistingLink),
-            migration_id: None,
-        }
-    }
-
-    fn migration(source: &str, target: &Path, status: MigrationStatus) -> Migration {
-        Migration {
-            id: "migration-1".into(), schema_version: 1, source: source.into(),
-            target: target.to_string_lossy().into(), old_path: String::new(), preset: None,
-            created_at: "2026-07-19T00:00:00Z".into(), status,
-            source_volume_serial: "C".into(), target_volume_serial: "D".into(),
-            recycle_bin_ref: String::new(), pending_cleanup: None,
-        }
-    }
-
-    #[test]
-    fn migration_annotations_mark_exact_link_and_parent() {
-        let root = TempDir::new().unwrap();
-        let target = root.path().join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        let mut items = vec![
-            scan_item("C:\\Users\\x", false),
-            scan_item("C:\\Users\\x\\Cache", true),
-        ];
-        let migrations = vec![migration("c:/users/X/cache/", &target, MigrationStatus::Active)];
-
-        annotate_migrations(&mut items, &migrations, &|_| true, &|_| 4096);
-
-        assert_eq!(items[0].scan_status, Some(ScanItemStatus::ContainsMigrated));
-        assert_eq!(items[1].scan_status, Some(ScanItemStatus::Migrated));
-        assert_eq!(items[1].migration_id.as_deref(), Some("migration-1"));
-        assert_eq!(items[1].size_bytes, 4096);
-    }
-
-    #[test]
-    fn migration_annotations_surface_broken_links() {
-        let root = TempDir::new().unwrap();
-        let target = root.path().join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        let mut items = vec![scan_item("C:\\Users\\x\\Cache", false)];
-        let migrations = vec![migration("C:\\Users\\x\\Cache", &target, MigrationStatus::Active)];
-
-        annotate_migrations(&mut items, &migrations, &|_| false, &|_| 0);
-
-        assert_eq!(items[0].scan_status, Some(ScanItemStatus::LinkBroken));
-        assert_eq!(items[0].migration_id.as_deref(), Some("migration-1"));
-    }
-
-    #[test]
-    fn dir_size_sums_files() {
-        let root = TempDir::new().unwrap();
-        let d = root.path().join("d");
-        std::fs::create_dir_all(d.join("sub")).unwrap();
-        std::fs::write(d.join("a.txt"), vec![0u8; 1000]).unwrap();
-        std::fs::write(d.join("sub/b.txt"), vec![0u8; 500]).unwrap();
-        assert_eq!(dir_size(&d), 1500);
-    }
-
-    #[test]
-    fn dir_size_skips_reparse_point_content() {
-        let root = TempDir::new().unwrap();
-        let d = root.path().join("d");
-        let target = root.path().join("target");
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("big.bin"), vec![0u8; 2000]).unwrap();
-        #[cfg(windows)]
-        junction::create(&d.join("link"), &target).unwrap();
-        // link 是 reparse point，其内部 2000 字节不应计入 d
-        let size = dir_size(&d);
-        assert_eq!(size, 0, "reparse point 内部内容不应计数");
-    }
-
-    #[test]
-    fn expand_env_path_resolves_userprofile() {
-        let expanded = expand_env("%USERPROFILE%/Documents/WeChat Files");
-        assert!(!expanded.contains("%USERPROFILE%"));
-        assert!(expanded.contains("Documents"));
-    }
-
-    #[test]
-    fn match_preset_matches_wechat_path() {
-        let cfg = default_config();
-        let preset = cfg.presets.iter().find(|p| p.id == "wechat").unwrap();
-        let userprofile = std::env::var("USERPROFILE").unwrap();
-        let path = format!("{userprofile}\\Documents\\WeChat Files");
-        assert!(matches_preset(&path, preset));
-    }
-
-    #[test]
-    fn scan_returns_items_above_threshold() {
-        let root = TempDir::new().unwrap();
-        let big = root.path().join("big");
-        std::fs::create_dir_all(&big).unwrap();
-        std::fs::write(big.join("f.bin"), vec![0u8; 600 * 1024]).unwrap(); // 600KB
-        let small = root.path().join("small");
-        std::fs::create_dir_all(&small).unwrap();
-        std::fs::write(small.join("f.txt"), b"x").unwrap();
-        let cfg = default_config();
-        // 测试用 0 阈值便于断言：临时改 min_size_mb
-        let mut cfg = cfg;
-        cfg.scan.min_size_mb = 0;
-        let items = scan(root.path(), &cfg);
-        assert!(items.iter().any(|i| i.path.ends_with("big")));
-    }
-
-    #[test]
-    fn scan_aggregates_nested_sizes() {
-        let root = TempDir::new().unwrap();
-        let parent = root.path().join("parent");
-        let child = parent.join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        std::fs::write(parent.join("a.bin"), vec![0u8; 700]).unwrap();
-        std::fs::write(child.join("b.bin"), vec![0u8; 300]).unwrap();
-        let mut cfg = default_config();
-        cfg.scan.min_size_mb = 0;
-
-        let items = scan(root.path(), &cfg);
-        let parent_item = items
-            .iter()
-            .find(|i| i.path == parent.to_string_lossy())
-            .unwrap();
-        let child_item = items
-            .iter()
-            .find(|i| i.path == child.to_string_lossy())
-            .unwrap();
-
-        assert_eq!(parent_item.size_bytes, 1000);
-        assert_eq!(child_item.size_bytes, 300);
-    }
-
-    #[test]
-    fn scan_exclude_requires_a_path_boundary() {
-        let root = TempDir::new().unwrap();
-        let excluded = root.path().join("cache");
-        let sibling = root.path().join("cache-backup");
-        std::fs::create_dir_all(&excluded).unwrap();
-        std::fs::create_dir_all(&sibling).unwrap();
-        std::fs::write(excluded.join("hidden.bin"), vec![0u8; 10]).unwrap();
-        std::fs::write(sibling.join("visible.bin"), vec![0u8; 20]).unwrap();
-
-        let mut cfg = default_config();
-        cfg.scan.min_size_mb = 0;
-        cfg.scan.exclude_paths = vec![excluded.to_string_lossy().into()];
-        let items = scan(root.path(), &cfg);
-
-        assert!(!items
-            .iter()
-            .any(|item| item.path == excluded.to_string_lossy()));
-        assert!(items
-            .iter()
-            .any(|item| item.path == sibling.to_string_lossy()));
-    }
-
-    #[test]
-    fn controlled_scan_reports_counts() {
-        let root = TempDir::new().unwrap();
-        std::fs::create_dir_all(root.path().join("nested")).unwrap();
-        std::fs::write(root.path().join("a.bin"), vec![0u8; 10]).unwrap();
-        std::fs::write(root.path().join("nested/b.bin"), vec![0u8; 20]).unwrap();
-        let cancel = AtomicBool::new(false);
-        let mut last_stats = ScanStats::default();
-
-        let output = scan_roots_with_control(
-            &[root.path().to_path_buf()],
-            &default_config(),
-            &cancel,
-            &mut |stats, _| last_stats = *stats,
-        )
-        .unwrap();
-
-        assert_eq!(output.stats.scanned_dirs, 2);
-        assert_eq!(output.stats.scanned_files, 2);
-        assert_eq!(last_stats.scanned_dirs, 2);
-        assert_eq!(last_stats.scanned_files, 2);
-    }
-
-    #[test]
-    fn controlled_scan_honors_pre_cancel() {
-        let root = TempDir::new().unwrap();
-        let cancel = AtomicBool::new(true);
-        let result = scan_roots_with_control(
-            &[root.path().to_path_buf()],
-            &default_config(),
-            &cancel,
-            &mut |_, _| {},
-        );
-
-        assert!(matches!(result, Err(ScanCancelled)));
-    }
-
-    #[test]
-    fn inaccessible_dir_marked_not_panic() {
-        let root = TempDir::new().unwrap();
-        // 一个不存在的子目录不应导致 panic
-        let cfg = default_config();
-        let items = scan(root.path(), &cfg);
-        assert!(items.iter().all(|i| !i.inaccessible || i.path.is_empty()));
-    }
 
     // ===== T4：DirectoryGraph 构建测试 =====
     mod graph {
@@ -2773,38 +2298,32 @@ mod tests {
                 fileref(5, 5),
             ] {
                 assert_eq!(
-                    g1.nodes[&key].path,
-                    g2.nodes[&key].path,
+                    g1.nodes[&key].path, g2.nodes[&key].path,
                     "path mismatch for {:?}",
                     key
                 );
                 assert_eq!(
-                    g1.nodes[&key].path,
-                    g3.nodes[&key].path,
+                    g1.nodes[&key].path, g3.nodes[&key].path,
                     "path mismatch for {:?}",
                     key
                 );
                 assert_eq!(
-                    g1.nodes[&key].depth,
-                    g2.nodes[&key].depth,
+                    g1.nodes[&key].depth, g2.nodes[&key].depth,
                     "depth mismatch for {:?}",
                     key
                 );
                 assert_eq!(
-                    g1.nodes[&key].subtree_size_bytes,
-                    g2.nodes[&key].subtree_size_bytes,
+                    g1.nodes[&key].subtree_size_bytes, g2.nodes[&key].subtree_size_bytes,
                     "subtree_size mismatch for {:?}",
                     key
                 );
                 assert_eq!(
-                    g1.nodes[&key].subtree_file_count,
-                    g2.nodes[&key].subtree_file_count,
+                    g1.nodes[&key].subtree_file_count, g2.nodes[&key].subtree_file_count,
                     "subtree_file_count mismatch for {:?}",
                     key
                 );
                 assert_eq!(
-                    g1.nodes[&key].subtree_dir_count,
-                    g2.nodes[&key].subtree_dir_count,
+                    g1.nodes[&key].subtree_dir_count, g2.nodes[&key].subtree_dir_count,
                     "subtree_dir_count mismatch for {:?}",
                     key
                 );
@@ -2823,7 +2342,7 @@ mod tests {
             assert_eq!(g1.nodes[&fileref(30, 1)].subtree_size_bytes, 800);
             assert_eq!(g1.nodes[&fileref(30, 1)].subtree_file_count, 2);
             assert_eq!(g1.nodes[&fileref(30, 1)].subtree_dir_count, 2); // 30+31
-            // dir 20 subtree = 800
+                                                                        // dir 20 subtree = 800
             assert_eq!(g1.nodes[&fileref(20, 1)].subtree_size_bytes, 800);
             // 根 subtree = 100 (root.txt) + 800 (20 subtree)
             assert_eq!(g1.nodes[&fileref(5, 5)].subtree_size_bytes, 900);
@@ -2859,7 +2378,7 @@ mod tests {
             assert!(!g.nodes.contains_key(&fileref(30, 1)));
             assert_eq!(g.diagnostics.unreachable_nodes, 1);
             // dir 20 不应有 30 作为子节点
-            assert!(g.children.get(&fileref(20, 1)).is_none());
+            assert!(!g.children.contains_key(&fileref(20, 1)));
             // dir 20 subtree = 0（无文件、无子目录）
             assert_eq!(g.nodes[&fileref(20, 1)].subtree_size_bytes, 0);
         }
@@ -2934,7 +2453,7 @@ mod tests {
             let g = build_graph(&index, &[], 'C');
 
             // 最深节点可达、有 path、有 depth
-            assert_eq!(g.nodes[&fileref(100 + DEPTH - 1, 1)].reachable_from_root, true);
+            assert!(g.nodes[&fileref(100 + DEPTH - 1, 1)].reachable_from_root);
             assert_eq!(g.nodes[&fileref(100 + DEPTH - 1, 1)].depth, DEPTH as u32);
             assert!(g.nodes[&fileref(100 + DEPTH - 1, 1)]
                 .path
@@ -2951,8 +2470,8 @@ mod tests {
                     id: fileref(20, 1),
                     base_record: None,
                     names: vec![
-                        mk_name(5, 5, "A"),      // 第一个有效名：A 是根的子目录
-                        mk_name(20, 1, "self"),  // 第二个有效名：自引用 = cycle
+                        mk_name(5, 5, "A"),     // 第一个有效名：A 是根的子目录
+                        mk_name(20, 1, "self"), // 第二个有效名：自引用 = cycle
                     ],
                     logical_size: 0,
                     is_dir: true,
@@ -3031,7 +2550,7 @@ mod tests {
             // F1: orphan 已被剔除，诊断保留
             assert!(!g.nodes.contains_key(&fileref(20, 1)));
             assert_eq!(g.diagnostics.unreachable_nodes, 1);
-            assert!(g.children.get(&fileref(5, 5)).is_none());
+            assert!(!g.children.contains_key(&fileref(5, 5)));
         }
 
         // ===== 场景 5：根直接文件与一级目录子树统计分开 =====
@@ -3052,7 +2571,7 @@ mod tests {
             assert_eq!(root.direct_file_size_bytes, 777);
             assert_eq!(root.direct_file_count, 1);
             assert_eq!(root.direct_dir_count, 1); // 仅 Users 一个直接子目录
-            // 根 subtree = 777 + dir 20 subtree (333)
+                                                  // 根 subtree = 777 + dir 20 subtree (333)
             assert_eq!(root.subtree_size_bytes, 777 + 333);
             assert_eq!(root.subtree_file_count, 2);
             assert_eq!(root.subtree_dir_count, 2); // 5 + 20
@@ -3076,10 +2595,7 @@ mod tests {
                 MftRecord {
                     id: fileref(30, 1),
                     base_record: None,
-                    names: vec![
-                        mk_name(20, 1, "shared_in_a"),
-                        mk_name(21, 1, "shared_in_b"),
-                    ],
+                    names: vec![mk_name(20, 1, "shared_in_a"), mk_name(21, 1, "shared_in_b")],
                     logical_size: 0,
                     is_dir: true,
                     in_use: true,
@@ -3092,9 +2608,9 @@ mod tests {
 
             assert_eq!(g.diagnostics.duplicate_dir_entry, 1);
             // dir 30 只挂到第一个 parent（20）
-            assert!(g.children.get(&fileref(20, 1)).is_some());
+            assert!(g.children.contains_key(&fileref(20, 1)));
             assert_eq!(g.children.get(&fileref(20, 1)).unwrap().len(), 1);
-            assert!(g.children.get(&fileref(21, 1)).is_none());
+            assert!(!g.children.contains_key(&fileref(21, 1)));
         }
 
         #[test]
@@ -3233,7 +2749,7 @@ mod tests {
                 mk_dir(30, 1, fileref(20, 1), "alice"), // excluded
                 mk_dir(31, 1, fileref(30, 1), "docs"),  // NOT excluded
                 mk_file(40, 1, fileref(31, 1), "file.txt", 1000),
-                mk_dir(32, 1, fileref(30, 1), "pic"),   // excluded (child of 30)
+                mk_dir(32, 1, fileref(30, 1), "pic"), // excluded (child of 30)
                 mk_file(41, 1, fileref(32, 1), "img.png", 200),
                 mk_file(50, 1, fileref(30, 1), "readme.md", 100), // 30 direct
                 mk_file(60, 1, fileref(20, 1), "shared.bin", 333),
@@ -3351,7 +2867,7 @@ mod tests {
                     id: fileref(22, 1),
                     base_record: None,
                     names: vec![
-                        mk_name(5, 5, "A"),     // first parent: root (valid)
+                        mk_name(5, 5, "A"),      // first parent: root (valid)
                         mk_name(22, 1, "self1"), // first self-ref
                         mk_name(22, 1, "self2"), // second self-ref（应被 F9 去重）
                     ],
@@ -3448,22 +2964,13 @@ mod tests {
 
         #[test]
         fn is_path_excluded_matches_scancontext_semantics() {
-            let exclude = vec![
-                "c:\\users\\alice".to_string(),
-                "c:\\windows".to_string(),
-            ];
+            let exclude = vec!["c:\\users\\alice".to_string(), "c:\\windows".to_string()];
             // 完全相等
             assert!(is_path_excluded("c:\\users\\alice", &exclude));
             // 前缀 + 路径边界
-            assert!(is_path_excluded(
-                "c:\\users\\alice\\docs",
-                &exclude
-            ));
+            assert!(is_path_excluded("c:\\users\\alice\\docs", &exclude));
             // 前缀但不越过路径边界（应不匹配）
-            assert!(!is_path_excluded(
-                "c:\\users\\alice-backup",
-                &exclude
-            ));
+            assert!(!is_path_excluded("c:\\users\\alice-backup", &exclude));
             // 不匹配
             assert!(!is_path_excluded("c:\\program files", &exclude));
         }
@@ -3476,7 +2983,10 @@ mod tests {
         use std::collections::HashMap;
 
         pub(super) fn fileref(record_no: u64, sequence: u16) -> FileRef {
-            FileRef { record_no, sequence }
+            FileRef {
+                record_no,
+                sequence,
+            }
         }
 
         pub(super) fn node(
@@ -3598,7 +3108,12 @@ mod tests {
                 5,
             );
             let cfg = config(1, vec![preset(path)]);
-            let migrations = vec![migration("m1", path, target.path(), MigrationStatus::Active)];
+            let migrations = vec![migration(
+                "m1",
+                path,
+                target.path(),
+                MigrationStatus::Active,
+            )];
             annotate_graph_with_callbacks(
                 &mut graph,
                 &cfg,
@@ -3686,7 +3201,12 @@ mod tests {
                 Some(ScanItemStatus::MigrationPending)
             );
 
-            let active = vec![migration("active", path, target.path(), MigrationStatus::Active)];
+            let active = vec![migration(
+                "active",
+                path,
+                target.path(),
+                MigrationStatus::Active,
+            )];
             let mut graph_active = make_graph(
                 vec![
                     node(5, "C:\\", 0, 0, None, false),
@@ -3821,10 +3341,7 @@ mod tests {
                 &[(5, 20), (20, 30), (5, 40), (5, 50), (5, 60)],
                 5,
             );
-            graph.nodes
-                .get_mut(&fileref(50, 1))
-                .unwrap()
-                .access_state = AccessState::Inaccessible;
+            graph.nodes.get_mut(&fileref(50, 1)).unwrap().access_state = AccessState::Inaccessible;
             let mut preset = preset("C:\\preset");
             preset.id = "preset".into();
             annotate_graph_with_callbacks(
@@ -3913,7 +3430,10 @@ mod tests {
         use std::collections::HashMap;
 
         fn fr(no: u64) -> FileRef {
-            FileRef { record_no: no, sequence: 1 }
+            FileRef {
+                record_no: no,
+                sequence: 1,
+            }
         }
 
         /// 构造一个 visible 目录节点（其余字段取默认/零值）。
@@ -3980,7 +3500,10 @@ mod tests {
             let g = graph(vec![vnode(10, r"C:\A", 1, 100), b], &[(5, 10), (5, 11)]);
             let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
             assert!(store.node(r"C:\A").is_some());
-            assert!(store.node(r"C:\B").is_none(), "不可见节点不应进入 TreeStore");
+            assert!(
+                store.node(r"C:\B").is_none(),
+                "不可见节点不应进入 TreeStore"
+            );
             let roots: Vec<String> = store.roots().into_iter().map(|n| n.path).collect();
             assert_eq!(roots, vec![r"C:\A".to_string()]);
         }
@@ -4015,7 +3538,10 @@ mod tests {
             let mut a3 = vnode(33, r"C:\A\A3", 2, 50);
             a3.visible = false;
             a3.excluded = true; // excluded：不计入 filtered
-            let g = graph(vec![a, a1, a2, a3], &[(5, 30), (30, 31), (30, 32), (30, 33)]);
+            let g = graph(
+                vec![a, a1, a2, a3],
+                &[(5, 30), (30, 31), (30, 32), (30, 33)],
+            );
             let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
             let node_a = store.node(r"C:\A").unwrap();
             assert_eq!(node_a.child_count, 1, "只有 A1 可见");
@@ -4057,7 +3583,11 @@ mod tests {
             let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
             let roots: Vec<String> = store.roots().into_iter().map(|n| n.path).collect();
             assert_eq!(roots, vec![r"C:\A".to_string()]);
-            assert_eq!(store.filtered_root_count(), 1, "只有 B 是非排除不可见的一级子");
+            assert_eq!(
+                store.filtered_root_count(),
+                1,
+                "只有 B 是非排除不可见的一级子"
+            );
         }
 
         #[test]
@@ -4110,7 +3640,11 @@ mod tests {
             assert_eq!(levels[1].parent_path, r"C:\A");
             assert!(levels[1].page.items.iter().any(|n| n.path == r"C:\A\B"));
             assert_eq!(levels[2].parent_path, r"C:\A\B");
-            assert!(levels[2].page.items.iter().any(|n| n.path == r"C:\A\B\Target"));
+            assert!(levels[2]
+                .page
+                .items
+                .iter()
+                .any(|n| n.path == r"C:\A\B\Target"));
         }
 
         #[test]
@@ -4267,7 +3801,10 @@ mod tests {
                 normalize("C:\\Users\\alice\\docs"),
                 vec![entry("c.txt", false, 300)],
             );
-            dirs.insert(normalize("C:\\Users\\bob"), vec![entry("d.txt", false, 400)]);
+            dirs.insert(
+                normalize("C:\\Users\\bob"),
+                vec![entry("d.txt", false, 400)],
+            );
             dirs.insert(normalize("C:\\ProgramData"), vec![]);
             dirs
         }
@@ -4331,7 +3868,11 @@ mod tests {
                 .find(|(_, n)| normalize(&n.path) == users_norm)
                 .map(|(r, _)| *r)
                 .unwrap();
-            assert!(graph.children.get(&graph.root).unwrap().contains(&users_ref));
+            assert!(graph
+                .children
+                .get(&graph.root)
+                .unwrap()
+                .contains(&users_ref));
         }
 
         #[test]
@@ -4426,14 +3967,12 @@ mod tests {
         #[test]
         fn entry_error_not_silently_accessible() {
             let mut dirs = tree();
-            dirs.get_mut(&normalize("C:\\"))
-                .unwrap()
-                .push(err_entry(
-                    "badfile.dll",
-                    FsEntryError::Io {
-                        message: "crc error".into(),
-                    },
-                ));
+            dirs.get_mut(&normalize("C:\\")).unwrap().push(err_entry(
+                "badfile.dll",
+                FsEntryError::Io {
+                    message: "crc error".into(),
+                },
+            ));
             let (graph, _, _) = run_coordinator(dirs, &[], 2);
             // 该 entry 未产生节点，也不应把任何现有节点误标 Accessible。
             let root = graph.nodes.get(&graph.root).unwrap();
@@ -4445,24 +3984,15 @@ mod tests {
             let cancel = Arc::new(AtomicBool::new(false));
             let cancel_setter = cancel.clone();
             // 每个 read_dir 强制 10ms 延迟，确保 5ms 后设置 cancel 时扫描仍在进行。
-            let reader: Arc<dyn FsReader> = Arc::new(MockFsReader::with_delay(
-                tree(),
-                Duration::from_millis(10),
-            ));
+            let reader: Arc<dyn FsReader> =
+                Arc::new(MockFsReader::with_delay(tree(), Duration::from_millis(10)));
 
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(5));
                 cancel_setter.store(true, Ordering::Relaxed);
             });
 
-            let result = coordinator_run(
-                reader,
-                'C',
-                &[],
-                2,
-                cancel,
-                Arc::new(|_| {}),
-            );
+            let result = coordinator_run(reader, 'C', &[], 2, cancel, Arc::new(|_| {}));
             assert!(matches!(result, Err(ScanDriveError::Cancelled)));
         }
 
@@ -4520,17 +4050,17 @@ mod tests {
             let mut dirs = HashMap::new();
             dirs.insert(
                 normalize("C:\\"),
-                vec![
-                    entry("root.txt", false, 100),
-                    entry("Users", true, 0),
-                ],
+                vec![entry("root.txt", false, 100), entry("Users", true, 0)],
             );
             dirs.insert(normalize("C:\\Users"), vec![entry("alice", true, 0)]);
             dirs.insert(
                 normalize("C:\\Users\\alice"),
                 vec![entry("docs", true, 0), entry("a.txt", false, 500)],
             );
-            dirs.insert(normalize("C:\\Users\\alice\\docs"), vec![entry("b.txt", false, 300)]);
+            dirs.insert(
+                normalize("C:\\Users\\alice\\docs"),
+                vec![entry("b.txt", false, 300)],
+            );
 
             let (graph, _, _) = run_coordinator(dirs, &[], 2);
             let root = graph.nodes.get(&graph.root).unwrap();

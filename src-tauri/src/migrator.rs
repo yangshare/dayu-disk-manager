@@ -2,7 +2,9 @@ use crate::error::{AppError, AppResult};
 use crate::file_ops::{CopyPhase, CopyProgress, FileOps};
 use crate::history::History;
 use crate::journal::Journal;
-use crate::models::{HistoryEntry, Migration, MigrationStatus, OperationOutcome, ProgressEvent, TransferProgress};
+use crate::models::{
+    HistoryEntry, Migration, MigrationStatus, OperationOutcome, ProgressEvent, TransferProgress,
+};
 use crate::store::Store;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -21,8 +23,18 @@ pub mod stage {
 
 /// 构造失败返回：携带 (AppError, OperationOutcome)，OperationOutcome 反映
 /// 当前 source_changed 状态，使调用方能精确决定是否失效扫描树。
-fn fail(op: AppError, source_changed: bool, reason: impl Into<String>) -> (AppError, OperationOutcome) {
-    (op, OperationOutcome { source_changed, reason: reason.into() })
+fn fail(
+    op: AppError,
+    source_changed: bool,
+    reason: impl Into<String>,
+) -> (AppError, OperationOutcome) {
+    (
+        op,
+        OperationOutcome {
+            source_changed,
+            reason: reason.into(),
+        },
+    )
 }
 
 /// 把 AppResult 包装为带 source_changed 的 Result，避免每个 `?` 手动匹配。
@@ -51,7 +63,9 @@ fn transfer_event(
         CopyPhase::Preparing => range.0,
         CopyPhase::Copying => {
             let span = range.1.saturating_sub(range.0) as u16;
-            range.0.saturating_add(((progress.percent() as u16 * span) / 100) as u8)
+            range
+                .0
+                .saturating_add(((progress.percent() as u16 * span) / 100) as u8)
         }
     };
     let mut event = ProgressEvent::new(task_id, stage, percent, message);
@@ -59,12 +73,15 @@ fn transfer_event(
         phase: match progress.phase {
             CopyPhase::Preparing => "preparing",
             CopyPhase::Copying => "copying",
-        }.into(),
+        }
+        .into(),
         completed_bytes: progress.completed_bytes,
         total_bytes: progress.total_bytes,
         completed_files: progress.completed_files,
         total_files: progress.total_files,
-        current_path: progress.current_path.as_ref()
+        current_path: progress
+            .current_path
+            .as_ref()
             .map(|path| path.to_string_lossy().replace('/', "\\")),
     });
     event
@@ -74,9 +91,9 @@ pub struct MigratePlan {
     pub task_id: String,
     pub migration_id: String,
     pub src: PathBuf,
-    pub target: PathBuf,       // 最终 data 路径
-    pub tmp: PathBuf,          // data.tmp
-    pub old_path: PathBuf,     // src.dayu-old-{taskId}
+    pub target: PathBuf,   // 最终 data 路径
+    pub tmp: PathBuf,      // data.tmp
+    pub old_path: PathBuf, // src.dayu-old-{taskId}
     pub preset_id: Option<String>,
     pub source_volume_serial: String,
     pub target_volume_serial: String,
@@ -109,32 +126,42 @@ pub fn migrate(
         ));
     }
 
-    journal.begin(
-        &plan.task_id, &plan.migration_id, "migrate",
-        &plan.src.to_string_lossy(),
-        &plan.target.to_string_lossy(),
-        &plan.tmp.to_string_lossy(),
-        &plan.old_path.to_string_lossy(),
-    ).map_err(|e| fail(e, source_changed, "migrate_rolled_back"))?;
+    journal
+        .begin(
+            &plan.task_id,
+            &plan.migration_id,
+            "migrate",
+            &plan.src.to_string_lossy(),
+            &plan.target.to_string_lossy(),
+            &plan.tmp.to_string_lossy(),
+            &plan.old_path.to_string_lossy(),
+        )
+        .map_err(|e| fail(e, source_changed, "migrate_rolled_back"))?;
 
     // 阶段 a：复制
     emit(stage::COPYING, 0, "准备复制到临时目录");
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = ops.remove_tree(&plan.tmp);
         let _ = journal.cancel(&plan.task_id);
-        return Err(fail(AppError::Cancelled, source_changed, "migrate_canceled"));
+        return Err(fail(
+            AppError::Cancelled,
+            source_changed,
+            "migrate_canceled",
+        ));
     }
     if let Err(e) = ops.copy_tree(
         &plan.src,
         &plan.tmp,
-        &|progress| on_progress(transfer_event(
-            &plan.task_id,
-            stage::COPYING,
-            (0, 60),
-            progress,
-            "正在统计待复制内容",
-            "正在复制到迁移仓库",
-        )),
+        &|progress| {
+            on_progress(transfer_event(
+                &plan.task_id,
+                stage::COPYING,
+                (0, 60),
+                progress,
+                "正在统计待复制内容",
+                "正在复制到迁移仓库",
+            ))
+        },
         &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
     ) {
         let _ = ops.remove_tree(&plan.tmp);
@@ -148,13 +175,25 @@ pub fn migrate(
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = ops.remove_tree(&plan.tmp);
         let _ = journal.cancel(&plan.task_id);
-        return Err(fail(AppError::Cancelled, source_changed, "migrate_canceled"));
+        return Err(fail(
+            AppError::Cancelled,
+            source_changed,
+            "migrate_canceled",
+        ));
     }
 
     // 阶段 b：首次校验
     emit(stage::VERIFYING, 60, "校验 manifest");
-    let m1 = bail(ops.manifest(&plan.src), source_changed, "migrate_rolled_back")?;
-    let m2 = bail(ops.manifest(&plan.tmp), source_changed, "migrate_rolled_back")?;
+    let m1 = bail(
+        ops.manifest(&plan.src),
+        source_changed,
+        "migrate_rolled_back",
+    )?;
+    let m2 = bail(
+        ops.manifest(&plan.tmp),
+        source_changed,
+        "migrate_rolled_back",
+    )?;
     if !ops.diff_manifests(&m1, &m2).is_empty() {
         // 保留 tmp 供排查
         let _ = journal.fail(&plan.task_id, "manifest 不一致");
@@ -174,21 +213,23 @@ pub fn migrate(
         return Err(fail(e, source_changed, "migrate_rolled_back"));
     }
     let _ = journal.mark_stage(&plan.task_id, "source_renamed");
-    source_changed = true;  // 改名后源路径形态已变
+    source_changed = true; // 改名后源路径形态已变
 
     // 增量同步：old_path -> tmp（捕捉复制期间变化）
     emit(stage::SYNCING, 80, "准备同步复制期间的变化");
     if let Err(e) = ops.copy_tree(
         &plan.old_path,
         &plan.tmp,
-        &|progress| on_progress(transfer_event(
-            &plan.task_id,
-            stage::SYNCING,
-            (80, 90),
-            progress,
-            "正在检查复制期间的变化",
-            "正在同步复制期间的变化",
-        )),
+        &|progress| {
+            on_progress(transfer_event(
+                &plan.task_id,
+                stage::SYNCING,
+                (80, 90),
+                progress,
+                "正在检查复制期间的变化",
+                "正在同步复制期间的变化",
+            ))
+        },
         &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
     ) {
         // 回滚：改回原名
@@ -201,7 +242,11 @@ pub fn migrate(
         }
         return Err(fail(e, source_changed, "migrate_partial"));
     }
-    let m3 = bail(ops.manifest(&plan.old_path), source_changed, "migrate_partial")?;
+    let m3 = bail(
+        ops.manifest(&plan.old_path),
+        source_changed,
+        "migrate_partial",
+    )?;
     let m4 = bail(ops.manifest(&plan.tmp), source_changed, "migrate_partial")?;
     if !ops.diff_manifests(&m3, &m4).is_empty() {
         let _ = ops.rename(&plan.old_path, &plan.src);
@@ -286,10 +331,13 @@ pub fn migrate(
 
     // 历史与终态
     if let Err(e) = history.append(&HistoryEntry {
-        op: "migrate".into(), id: plan.migration_id.clone(),
+        op: "migrate".into(),
+        id: plan.migration_id.clone(),
         src: plan.src.to_string_lossy().into(),
         dst: plan.target.to_string_lossy().into(),
-        result: "ok".into(), time: now(), duration_sec: 0,
+        result: "ok".into(),
+        time: now(),
+        duration_sec: 0,
     }) {
         return Err(fail(e, true, "migrate_partial"));
     }
@@ -323,8 +371,16 @@ pub fn restore(
     // 删 junction 后改名失败时重建 junction：仍然报告 true（删-重建过程 src 曾不是 junction）。
     let mut source_changed = false;
 
-    journal.begin(&format!("restore-{}", mig.id), &mig.id, "restore",
-        &mig.source, &mig.target, &restore_tmp.to_string_lossy(), &mig.old_path)
+    journal
+        .begin(
+            &format!("restore-{}", mig.id),
+            &mig.id,
+            "restore",
+            &mig.source,
+            &mig.target,
+            &restore_tmp.to_string_lossy(),
+            &mig.old_path,
+        )
         .map_err(|e| fail(e, source_changed, "restore_rolled_back"))?;
 
     // 校验 junction 仍指向有效 target
@@ -340,19 +396,25 @@ pub fn restore(
     emit(stage::COPYING, 0, "复制回源盘临时目录");
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = journal.cancel(&format!("restore-{}", mig.id));
-        return Err(fail(AppError::Cancelled, source_changed, "restore_canceled"));
+        return Err(fail(
+            AppError::Cancelled,
+            source_changed,
+            "restore_canceled",
+        ));
     }
     if let Err(e) = ops.copy_tree(
         &target,
         &restore_tmp,
-        &|progress| on_progress(transfer_event(
-            &task_id,
-            stage::COPYING,
-            (0, 50),
-            progress,
-            "正在统计待还原内容",
-            "正在复制回原磁盘",
-        )),
+        &|progress| {
+            on_progress(transfer_event(
+                &task_id,
+                stage::COPYING,
+                (0, 50),
+                progress,
+                "正在统计待还原内容",
+                "正在复制回原磁盘",
+            ))
+        },
         &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
     ) {
         let _ = ops.remove_tree(&restore_tmp);
@@ -366,7 +428,11 @@ pub fn restore(
 
     emit(stage::VERIFYING, 50, "校验 manifest");
     let m1 = bail(ops.manifest(&target), source_changed, "restore_rolled_back")?;
-    let m2 = bail(ops.manifest(&restore_tmp), source_changed, "restore_rolled_back")?;
+    let m2 = bail(
+        ops.manifest(&restore_tmp),
+        source_changed,
+        "restore_rolled_back",
+    )?;
     if !ops.diff_manifests(&m1, &m2).is_empty() {
         let _ = ops.remove_tree(&restore_tmp);
         let _ = journal.fail(&format!("restore-{}", mig.id), "manifest 不一致");
@@ -387,7 +453,7 @@ pub fn restore(
         return Err(fail(e, source_changed, "restore_rolled_back"));
     }
     let _ = journal.mark_stage(&format!("restore-{}", mig.id), "junction_removed");
-    source_changed = true;  // junction 已删，src 不再是 junction
+    source_changed = true; // junction 已删，src 不再是 junction
 
     emit(stage::SWITCHING, 85, "切换为普通目录");
     if let Err(e) = ops.rename(&restore_tmp, &src) {
@@ -417,9 +483,13 @@ pub fn restore(
         return Err(fail(e, true, "restore_partial"));
     }
     if let Err(e) = history.append(&HistoryEntry {
-        op: "restore".into(), id: mig.id.clone(),
-        src: mig.source.clone(), dst: mig.target.clone(),
-        result: "ok".into(), time: now(), duration_sec: 0,
+        op: "restore".into(),
+        id: mig.id.clone(),
+        src: mig.source.clone(),
+        dst: mig.target.clone(),
+        result: "ok".into(),
+        time: now(),
+        duration_sec: 0,
     }) {
         return Err(fail(e, true, "restore_partial"));
     }
@@ -448,9 +518,13 @@ pub fn break_link(
         return Err(fail(e, true, "break_link_partial"));
     }
     if let Err(e) = history.append(&HistoryEntry {
-        op: "break_link".into(), id: mig.id.clone(),
-        src: mig.source.clone(), dst: mig.target.clone(),
-        result: "ok".into(), time: chrono::Utc::now().to_rfc3339(), duration_sec: 0,
+        op: "break_link".into(),
+        id: mig.id.clone(),
+        src: mig.source.clone(),
+        dst: mig.target.clone(),
+        result: "ok".into(),
+        time: chrono::Utc::now().to_rfc3339(),
+        duration_sec: 0,
     }) {
         return Err(fail(e, true, "break_link_partial"));
     }
@@ -500,23 +574,45 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let events = RefCell::new(Vec::new());
         let (m, outcome) = migrate(
-            &RealFileOps, &store, &journal, &history, &plan,
-            &|e| events.borrow_mut().push(e), &cancel,
-        ).unwrap();
+            &RealFileOps,
+            &store,
+            &journal,
+            &history,
+            &plan,
+            &|e| events.borrow_mut().push(e),
+            &cancel,
+        )
+        .unwrap();
         assert_eq!(m.status, MigrationStatus::Active);
-        assert!(outcome.source_changed, "成功路径 source_changed 必须为 true");
+        assert!(
+            outcome.source_changed,
+            "成功路径 source_changed 必须为 true"
+        );
         assert_eq!(outcome.reason, "migrated");
         assert!(crate::junction::exists(&src), "源路径应已变为 junction");
         assert!(plan.target.join("a.txt").exists(), "数据应落到 target");
-        assert!(store.load_migrations().unwrap().iter().any(|x| x.id == "m-1"));
+        assert!(store
+            .load_migrations()
+            .unwrap()
+            .iter()
+            .any(|x| x.id == "m-1"));
         let migrated = history.list(Some("migrate"), None).unwrap();
         assert!(migrated.iter().any(|h| h.id == "m-1" && h.result == "ok"));
-        assert!(journal.recover_pending().unwrap().is_empty(), "任务应已完成");
+        assert!(
+            journal.recover_pending().unwrap().is_empty(),
+            "任务应已完成"
+        );
         let events = events.into_inner();
-        let copied = events.iter().find(|event| {
-            event.stage == stage::COPYING
-                && event.transfer.as_ref().is_some_and(|progress| progress.phase == "copying")
-        }).expect("复制阶段应包含结构化传输进度");
+        let copied = events
+            .iter()
+            .find(|event| {
+                event.stage == stage::COPYING
+                    && event
+                        .transfer
+                        .as_ref()
+                        .is_some_and(|progress| progress.phase == "copying")
+            })
+            .expect("复制阶段应包含结构化传输进度");
         let transfer = copied.transfer.as_ref().unwrap();
         assert_eq!(transfer.total_bytes, Some(5));
         assert_eq!(transfer.total_files, Some(1));
@@ -564,60 +660,117 @@ mod tests {
             _cancel: &dyn Fn() -> bool,
         ) -> AppResult<()> {
             // 区分阶段：复制阶段 src 是 plan.src，增量阶段 src 是 plan.old_path（含 dayu-old-）
-            let is_incremental_stage = s.file_name()
+            let is_incremental_stage = s
+                .file_name()
                 .and_then(|n| n.to_str())
                 .map(|n| n.contains("dayu-old-"))
                 .unwrap_or(false);
             if is_incremental_stage {
-                if self.incremental_copy_ok { Ok(()) } else { Err(crate::error::AppError::Migrate("incremental copy fail".into())) }
+                if self.incremental_copy_ok {
+                    Ok(())
+                } else {
+                    Err(crate::error::AppError::Migrate(
+                        "incremental copy fail".into(),
+                    ))
+                }
             } else {
-                if self.copy_ok { Ok(()) } else { Err(crate::error::AppError::Migrate("copy fail".into())) }
+                if self.copy_ok {
+                    Ok(())
+                } else {
+                    Err(crate::error::AppError::Migrate("copy fail".into()))
+                }
             }
         }
         fn manifest(&self, _s: &Path) -> AppResult<Manifest> {
-            Ok(Manifest { root: String::new(), entries: vec![] })
+            Ok(Manifest {
+                root: String::new(),
+                entries: vec![],
+            })
         }
         fn diff_manifests(&self, _a: &Manifest, _b: &Manifest) -> Vec<String> {
-            if self.manifest_ok { vec![] } else { vec!["f.txt".into()] }
+            if self.manifest_ok {
+                vec![]
+            } else {
+                vec!["f.txt".into()]
+            }
         }
         fn rename(&self, f: &Path, _t: &Path) -> AppResult<()> {
             // 区分阶段：旧名（old_path / restore_tmp）改名与源改名
             let fname = f.file_name().and_then(|s| s.to_str()).unwrap_or("");
             let is_old_path_stage = fname.contains("dayu-old-") || fname.contains("dayu-restore-");
             if is_old_path_stage {
-                if self.rename_ok { Ok(()) } else { Err(crate::error::AppError::Migrate("rename fail".into())) }
+                if self.rename_ok {
+                    Ok(())
+                } else {
+                    Err(crate::error::AppError::Migrate("rename fail".into()))
+                }
             } else {
-                if self.rename_source_ok { Ok(()) } else { Err(crate::error::AppError::Migrate("rename source fail".into())) }
+                if self.rename_source_ok {
+                    Ok(())
+                } else {
+                    Err(crate::error::AppError::Migrate("rename source fail".into()))
+                }
             }
         }
         fn to_recycle_bin(&self, _p: &Path) -> AppResult<()> {
-            if self.recycle_ok { Ok(()) } else { Err(crate::error::AppError::Win32("recycle fail".into())) }
+            if self.recycle_ok {
+                Ok(())
+            } else {
+                Err(crate::error::AppError::Win32("recycle fail".into()))
+            }
         }
-        fn remove_tree(&self, _p: &Path) -> AppResult<()> { Ok(()) }
-        fn is_reparse_point(&self, _p: &Path) -> bool { false }
-        fn dir_exists(&self, _p: &Path) -> bool { true }
+        fn remove_tree(&self, _p: &Path) -> AppResult<()> {
+            Ok(())
+        }
+        fn is_reparse_point(&self, _p: &Path) -> bool {
+            false
+        }
+        fn dir_exists(&self, _p: &Path) -> bool {
+            true
+        }
         fn create_junction(&self, l: &Path, t: &Path) -> AppResult<()> {
-            self.create_junction_calls.borrow_mut().push((l.to_path_buf(), t.to_path_buf()));
-            if self.junction_fails { Err(crate::error::AppError::Junction("mock junction fail".into())) }
-            else { Ok(()) }
+            self.create_junction_calls
+                .borrow_mut()
+                .push((l.to_path_buf(), t.to_path_buf()));
+            if self.junction_fails {
+                Err(crate::error::AppError::Junction(
+                    "mock junction fail".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
-        fn remove_junction(&self, _l: &Path) -> AppResult<()> { Ok(()) }
-        fn junction_resolves(&self, _l: &Path) -> bool { !self.junction_fails }
+        fn remove_junction(&self, _l: &Path) -> AppResult<()> {
+            Ok(())
+        }
+        fn junction_resolves(&self, _l: &Path) -> bool {
+            !self.junction_fails
+        }
     }
 
     #[test]
     fn migrate_rolls_back_when_copy_fails_keeps_source() {
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "c");
-        let ops = { let mut o = MockOps::success_path(); o.copy_ok = false; o };
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.copy_ok = false;
+            o
+        };
         let cancel = AtomicBool::new(false);
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         assert!(res.is_err());
         // 源目录未被改名（仍存在原文件）
         assert!(plan.src.join("a.txt").exists());
-        assert!(store.load_migrations().unwrap().is_empty(), "不应落盘迁移记录");
+        assert!(
+            store.load_migrations().unwrap().is_empty(),
+            "不应落盘迁移记录"
+        );
         let (_e, outcome) = res.err().unwrap();
-        assert!(!outcome.source_changed, "复制失败回滚应保持 source_changed=false");
+        assert!(
+            !outcome.source_changed,
+            "复制失败回滚应保持 source_changed=false"
+        );
         assert_eq!(outcome.reason, "migrate_rolled_back");
     }
 
@@ -625,14 +778,21 @@ mod tests {
     fn migrate_aborts_when_manifest_mismatch_keeps_tmp() {
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "m");
-        let ops = { let mut o = MockOps::success_path(); o.manifest_ok = false; o };
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.manifest_ok = false;
+            o
+        };
         let cancel = AtomicBool::new(false);
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         assert!(res.is_err());
         // 源未改名
         assert!(plan.src.join("a.txt").exists());
         let (_e, outcome) = res.err().unwrap();
-        assert!(!outcome.source_changed, "首次校验失败回滚应 source_changed=false");
+        assert!(
+            !outcome.source_changed,
+            "首次校验失败回滚应 source_changed=false"
+        );
     }
 
     #[test]
@@ -659,14 +819,18 @@ mod tests {
         let src = dir.path().join("src");
         crate::junction::create(&src, &target).unwrap();
         let mig = Migration {
-            id: format!("m-{id}"), schema_version: 1,
+            id: format!("m-{id}"),
+            schema_version: 1,
             source: src.to_string_lossy().into(),
             target: target.to_string_lossy().into(),
-            old_path: String::new(), preset: None,
+            old_path: String::new(),
+            preset: None,
             created_at: "2026-07-18T00:00:00Z".into(),
             status: MigrationStatus::Active,
-            source_volume_serial: "C".into(), target_volume_serial: "D".into(),
-            recycle_bin_ref: String::new(), pending_cleanup: None,
+            source_volume_serial: "C".into(),
+            target_volume_serial: "D".into(),
+            recycle_bin_ref: String::new(),
+            pending_cleanup: None,
         };
         store.upsert_migration(mig.clone()).unwrap();
         (dir, store, journal, history, mig)
@@ -677,12 +841,28 @@ mod tests {
         let (_dir, store, journal, history, mig) = restore_fixture("1");
         let src: std::path::PathBuf = mig.source.clone().into();
         let cancel = AtomicBool::new(false);
-        let outcome = restore(&RealFileOps, &store, &journal, &history, &mig, &|_| {}, &cancel).unwrap();
+        let outcome = restore(
+            &RealFileOps,
+            &store,
+            &journal,
+            &history,
+            &mig,
+            &|_| {},
+            &cancel,
+        )
+        .unwrap();
         assert!(outcome.source_changed, "还原成功应 source_changed=true");
         assert_eq!(outcome.reason, "restored");
         assert!(!crate::junction::exists(&src), "junction 应已删除");
         assert!(src.join("a.txt").exists(), "源应恢复为普通目录");
-        assert!(store.load_migrations().unwrap().iter().all(|x| x.id != "m-1"), "记录应移除");
+        assert!(
+            store
+                .load_migrations()
+                .unwrap()
+                .iter()
+                .all(|x| x.id != "m-1"),
+            "记录应移除"
+        );
         let r = history.list(Some("restore"), None).unwrap();
         assert!(r.iter().any(|h| h.id == "m-1" && h.result == "ok"));
     }
@@ -694,10 +874,21 @@ mod tests {
         let target: std::path::PathBuf = mig.target.clone().into();
         std::fs::remove_dir_all(&target).unwrap();
         let cancel = AtomicBool::new(false);
-        let res = restore(&RealFileOps, &store, &journal, &history, &mig, &|_| {}, &cancel);
+        let res = restore(
+            &RealFileOps,
+            &store,
+            &journal,
+            &history,
+            &mig,
+            &|_| {},
+            &cancel,
+        );
         assert!(res.is_err(), "junction 失效时应中止");
         let (_e, outcome) = res.err().unwrap();
-        assert!(!outcome.source_changed, "junction 失效回滚应 source_changed=false");
+        assert!(
+            !outcome.source_changed,
+            "junction 失效回滚应 source_changed=false"
+        );
         assert_eq!(outcome.reason, "restore_rolled_back");
     }
 
@@ -707,19 +898,33 @@ mod tests {
         let src: std::path::PathBuf = mig.source.clone().into();
         let target: std::path::PathBuf = mig.target.clone().into();
         // mock：切换阶段（remove_junction 之后 rename）失败，期望重建 junction
-        let ops = { let mut o = MockOps::success_path(); o.rename_ok = false; o };
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.rename_ok = false;
+            o
+        };
         let cancel = AtomicBool::new(false);
         let res = restore(&ops, &store, &journal, &history, &mig, &|_| {}, &cancel);
         assert!(res.is_err());
         // 真实验证：create_junction 被调用一次（重建 junction 保入口）
         let calls = ops.create_junction_calls.borrow();
-        assert_eq!(calls.len(), 1, "切换失败时应调用 create_junction 重建 junction");
+        assert_eq!(
+            calls.len(),
+            1,
+            "切换失败时应调用 create_junction 重建 junction"
+        );
         assert_eq!(calls[0].0, src, "重建 junction 的 link 应为 src");
-        assert_eq!(calls[0].1, target, "重建 junction 的 target 应为 mig.target");
+        assert_eq!(
+            calls[0].1, target,
+            "重建 junction 的 target 应为 mig.target"
+        );
         // 重建 junction 失败路径：删 junction 已发生，src 不再是 junction，
         // 即使重建了也报告 source_changed=true（中间过程 src 不是 junction）。
         let (_e, outcome) = res.err().unwrap();
-        assert!(outcome.source_changed, "删 junction 后改名失败应 source_changed=true");
+        assert!(
+            outcome.source_changed,
+            "删 junction 后改名失败应 source_changed=true"
+        );
         assert_eq!(outcome.reason, "restore_partial");
     }
 
@@ -740,7 +945,11 @@ mod tests {
         // 复制失败：source_changed=false
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "cpf");
-        let ops = { let mut o = MockOps::success_path(); o.copy_ok = false; o };
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.copy_ok = false;
+            o
+        };
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         let (_e, outcome) = res.expect_err("复制失败应返 Err");
         assert!(!outcome.source_changed, "复制失败 source_changed=false");
@@ -749,7 +958,11 @@ mod tests {
         // 改名源失败：source_changed=false（未改名）
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "rsf");
-        let ops = { let mut o = MockOps::success_path(); o.rename_source_ok = false; o };
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.rename_source_ok = false;
+            o
+        };
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         let (_e, outcome) = res.expect_err("改名源失败应返 Err");
         assert!(!outcome.source_changed, "改名源失败 source_changed=false");
@@ -758,16 +971,27 @@ mod tests {
         // 增量同步失败：source_changed=true（已改名）
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "isf");
-        let ops = { let mut o = MockOps::success_path(); o.incremental_copy_ok = false; o };
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.incremental_copy_ok = false;
+            o
+        };
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         let (_e, outcome) = res.expect_err("增量同步失败应返 Err");
-        assert!(outcome.source_changed, "增量同步失败 source_changed=true（已改名）");
+        assert!(
+            outcome.source_changed,
+            "增量同步失败 source_changed=true（已改名）"
+        );
         assert_eq!(outcome.reason, "migrate_partial");
 
         // 建 junction 失败：source_changed=true
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "cjf");
-        let ops = { let mut o = MockOps::success_path(); o.junction_fails = true; o };
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.junction_fails = true;
+            o
+        };
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         let (_e, outcome) = res.expect_err("建链失败应返 Err");
         assert!(outcome.source_changed, "建链失败 source_changed=true");
@@ -776,7 +1000,11 @@ mod tests {
         // 回收站失败降级：成功路径 source_changed=true
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "recfail");
-        let ops = { let mut o = MockOps::success_path(); o.recycle_ok = false; o };
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.recycle_ok = false;
+            o
+        };
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         let (_mig, outcome) = res.expect("回收站失败降级仍应成功");
         assert!(outcome.source_changed, "回收站失败降级 source_changed=true");
@@ -788,7 +1016,11 @@ mod tests {
     fn migrate_rolled_back_failure_no_junction_left() {
         let (dir, store, journal, history) = fixtures();
         let plan = plan_for(dir.path(), "clean");
-        let ops = { let mut o = MockOps::success_path(); o.copy_ok = false; o };
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.copy_ok = false;
+            o
+        };
         let cancel = AtomicBool::new(false);
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         assert!(res.is_err());
@@ -843,7 +1075,10 @@ mod tests {
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
         assert!(res.is_err(), "history.append 失败应传播 Err");
         let (_e, outcome) = res.err().unwrap();
-        assert!(outcome.source_changed, "history.append 失败时 source_changed=true（已建链）");
+        assert!(
+            outcome.source_changed,
+            "history.append 失败时 source_changed=true（已建链）"
+        );
         assert_eq!(outcome.reason, "migrate_partial");
     }
 
@@ -861,10 +1096,21 @@ mod tests {
                 remove_file(&journal.path);
             }
         };
-        let res = migrate(&ops, &store, &journal, &history, &plan, &on_progress, &cancel);
+        let res = migrate(
+            &ops,
+            &store,
+            &journal,
+            &history,
+            &plan,
+            &on_progress,
+            &cancel,
+        );
         assert!(res.is_err(), "journal.complete 失败应传播 Err");
         let (_e, outcome) = res.err().unwrap();
-        assert!(outcome.source_changed, "journal.complete 失败时 source_changed=true");
+        assert!(
+            outcome.source_changed,
+            "journal.complete 失败时 source_changed=true"
+        );
         assert_eq!(outcome.reason, "migrate_partial");
     }
 
@@ -881,10 +1127,21 @@ mod tests {
                 replace_file_with_dir(&store.mig_path());
             }
         };
-        let res = restore(&RealFileOps, &store, &journal, &history, &mig, &on_progress, &cancel);
+        let res = restore(
+            &RealFileOps,
+            &store,
+            &journal,
+            &history,
+            &mig,
+            &on_progress,
+            &cancel,
+        );
         assert!(res.is_err(), "store.remove_migration 失败应传播 Err");
         let (_e, outcome) = res.err().unwrap();
-        assert!(outcome.source_changed, "store.remove_migration 失败时 source_changed=true");
+        assert!(
+            outcome.source_changed,
+            "store.remove_migration 失败时 source_changed=true"
+        );
         assert_eq!(outcome.reason, "restore_partial");
     }
 
@@ -899,10 +1156,21 @@ mod tests {
                 replace_file_with_dir(&history.path);
             }
         };
-        let res = restore(&RealFileOps, &store, &journal, &history, &mig, &on_progress, &cancel);
+        let res = restore(
+            &RealFileOps,
+            &store,
+            &journal,
+            &history,
+            &mig,
+            &on_progress,
+            &cancel,
+        );
         assert!(res.is_err(), "history.append 失败应传播 Err");
         let (_e, outcome) = res.err().unwrap();
-        assert!(outcome.source_changed, "history.append 失败时 source_changed=true");
+        assert!(
+            outcome.source_changed,
+            "history.append 失败时 source_changed=true"
+        );
         assert_eq!(outcome.reason, "restore_partial");
     }
 }

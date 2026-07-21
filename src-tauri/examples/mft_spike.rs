@@ -8,9 +8,7 @@
 //!
 //! 此 example 仅在 windows 平台可执行——非 windows 平台 main 直接报错退出。
 
-use dayu_disk_manager_lib::win32::{
-    open_volume, read_mft_record, read_volume_data, VolumeError,
-};
+use dayu_disk_manager_lib::win32::{open_volume, read_mft_record, read_volume_data, VolumeError};
 use std::collections::HashSet;
 use std::env;
 use std::process::ExitCode;
@@ -144,9 +142,8 @@ fn run_spike(drive: char) -> Result<SpikeSummary, VolumeError> {
                 // 简报 0.3：普通 I/O/句柄错误立即 no-go，不掩盖全局错误。
                 // 仅记录级别的瞬时变化可继续——但单次 IOCTL 失败无法区分"记录变化"
                 // 与"全局错误"，保守起见一律 no-go。
-                summary.no_go_reason = Some(format!(
-                    "IO 错误（code={code} op={operation}）——保守 no-go"
-                ));
+                summary.no_go_reason =
+                    Some(format!("IO 错误（code={code} op={operation}）——保守 no-go"));
                 return Ok(summary);
             }
             Err(other) => return Err(other),
@@ -173,8 +170,7 @@ fn run_spike(drive: char) -> Result<SpikeSummary, VolumeError> {
         if returned == 5 {
             summary.root_5_seen = true;
             // FILE 记录头：偏移 0 处的 "FILE" 签名（4 字节 ASCII）
-            summary.root_5_has_file_signature = raw.bytes.len() >= 4
-                && &raw.bytes[0..4] == b"FILE";
+            summary.root_5_has_file_signature = raw.bytes.len() >= 4 && &raw.bytes[0..4] == b"FILE";
             // flags 字段位于偏移 0x16（22），bit 0 = FILE_RECORD_SEGMENT_IN_USE
             if raw.bytes.len() >= 23 {
                 summary.root_5_in_use = (raw.bytes[22] & 0x01) != 0;

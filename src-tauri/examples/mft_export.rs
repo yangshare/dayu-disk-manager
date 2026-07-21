@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[cfg(not(windows))]
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
 }
 
 #[cfg(windows)]
-fn run(drive: char, out_dir: &PathBuf) -> Result<usize, Box<dyn std::error::Error>> {
+fn run(drive: char, out_dir: &Path) -> Result<usize, Box<dyn std::error::Error>> {
     let vol = open_volume(drive)?;
     let vdata = read_volume_data(&vol)?;
     let record_size = vdata.bytes_per_file_record_segment;
@@ -74,7 +74,11 @@ fn run(drive: char, out_dir: &PathBuf) -> Result<usize, Box<dyn std::error::Erro
         writeln!(meta, "bytes_per_sector={}", vdata.bytes_per_sector)?;
         writeln!(meta, "bytes_per_cluster={}", vdata.bytes_per_cluster)?;
         writeln!(meta, "bytes_per_file_record_segment={record_size}")?;
-        writeln!(meta, "mft_valid_data_length={}", vdata.mft_valid_data_length)?;
+        writeln!(
+            meta,
+            "mft_valid_data_length={}",
+            vdata.mft_valid_data_length
+        )?;
         writeln!(
             meta,
             "ntfs_version={}.{}",

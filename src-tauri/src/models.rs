@@ -201,21 +201,6 @@ pub struct RevealLevel {
     pub page: ChildPage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScanItem {
-    pub path: String,
-    pub display_name: String,
-    pub size_bytes: u64,
-    pub matched_preset: Option<String>,
-    pub category: Option<PresetCategory>,
-    pub auto_migrate: bool,
-    pub is_junction: bool,
-    pub inaccessible: bool,
-    pub scan_status: Option<ScanItemStatus>,
-    pub migration_id: Option<String>,
-}
-
 // ===== Journal =====
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -328,11 +313,17 @@ pub struct OperationOutcome {
 
 impl OperationOutcome {
     pub fn changed(reason: impl Into<String>) -> Self {
-        Self { source_changed: true, reason: reason.into() }
+        Self {
+            source_changed: true,
+            reason: reason.into(),
+        }
     }
 
     pub fn unchanged(reason: impl Into<String>) -> Self {
-        Self { source_changed: false, reason: reason.into() }
+        Self {
+            source_changed: false,
+            reason: reason.into(),
+        }
     }
 }
 
@@ -396,7 +387,9 @@ mod tests {
     #[test]
     fn scan_drive_result_json_fast_scan_unavailable() {
         let v = serde_json::to_value(ScanDriveResult::FastScanUnavailable {
-            reason: FastScanFailure::UnsupportedFilesystem { actual: "fat32".into() },
+            reason: FastScanFailure::UnsupportedFilesystem {
+                actual: "fat32".into(),
+            },
         })
         .unwrap();
         assert_eq!(
@@ -447,7 +440,9 @@ mod tests {
     fn fast_scan_failure_each_variant() {
         let cases = vec![
             (
-                FastScanFailure::UnsupportedFilesystem { actual: "exfat".into() },
+                FastScanFailure::UnsupportedFilesystem {
+                    actual: "exfat".into(),
+                },
                 serde_json::json!({ "kind": "unsupported_filesystem", "actual": "exfat" }),
             ),
             (
@@ -463,7 +458,10 @@ mod tests {
                 serde_json::json!({ "kind": "root_record_missing" }),
             ),
             (
-                FastScanFailure::ExcessiveRecordErrors { skipped: 1, scanned: 2 },
+                FastScanFailure::ExcessiveRecordErrors {
+                    skipped: 1,
+                    scanned: 2,
+                },
                 serde_json::json!({ "kind": "excessive_record_errors", "skipped": 1, "scanned": 2 }),
             ),
             (
