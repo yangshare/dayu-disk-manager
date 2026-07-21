@@ -375,16 +375,33 @@ mod tests {
             snapshot: minimal_snapshot(),
         })
         .unwrap();
-        let obj = v.as_object().unwrap();
-        assert_eq!(obj.get("kind"), Some(&serde_json::json!("complete")));
-        assert!(obj.contains_key("snapshot"));
-        let snap = obj.get("snapshot").unwrap();
-        assert!(snap.get("scanId").is_some());
-        assert!(snap.get("source").is_some());
-        assert!(snap.get("roots").is_some());
-        assert!(snap.get("filteredRootCount").is_some());
-        assert!(snap.get("rootFileSummary").is_some());
-        assert!(snap.get("diagnostics").is_some());
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "kind": "complete",
+                "snapshot": {
+                    "scanId": "123",
+                    "source": "mft",
+                    "roots": [],
+                    "filteredRootCount": 0,
+                    "rootFileSummary": {
+                        "directFileSizeBytes": 0,
+                        "directFileCount": 0,
+                        "systemMetadataSizeBytes": null,
+                        "totalKnownSizeBytes": 0,
+                        "incomplete": false
+                    },
+                    "diagnostics": {
+                        "scannedRecords": 0,
+                        "scannedDirs": 0,
+                        "scannedFiles": 0,
+                        "skippedRecords": 0,
+                        "orphanEntries": 0,
+                        "hardLinkEntries": 0
+                    }
+                }
+            })
+        );
     }
 
     #[test]
@@ -392,29 +409,36 @@ mod tests {
         let cases = vec![
             (
                 FastScanFailure::UnsupportedFilesystem { actual: "exfat".into() },
-                "unsupported_filesystem",
+                serde_json::json!({ "kind": "unsupported_filesystem", "actual": "exfat" }),
             ),
             (
                 FastScanFailure::UnsupportedNtfsVersion { major: 1, minor: 2 },
-                "unsupported_ntfs_version",
+                serde_json::json!({ "kind": "unsupported_ntfs_version", "major": 1, "minor": 2 }),
             ),
-            (FastScanFailure::InvalidVolumeData, "invalid_volume_data"),
-            (FastScanFailure::RootRecordMissing, "root_record_missing"),
+            (
+                FastScanFailure::InvalidVolumeData,
+                serde_json::json!({ "kind": "invalid_volume_data" }),
+            ),
+            (
+                FastScanFailure::RootRecordMissing,
+                serde_json::json!({ "kind": "root_record_missing" }),
+            ),
             (
                 FastScanFailure::ExcessiveRecordErrors { skipped: 1, scanned: 2 },
-                "excessive_record_errors",
+                serde_json::json!({ "kind": "excessive_record_errors", "skipped": 1, "scanned": 2 }),
             ),
-            (FastScanFailure::Io { code: Some(5) }, "io"),
-            (FastScanFailure::Io { code: None }, "io"),
+            (
+                FastScanFailure::Io { code: Some(5) },
+                serde_json::json!({ "kind": "io", "code": 5 }),
+            ),
+            (
+                FastScanFailure::Io { code: None },
+                serde_json::json!({ "kind": "io", "code": null }),
+            ),
         ];
-        for (failure, expected_kind) in cases {
+        for (failure, expected) in cases {
             let v = serde_json::to_value(&failure).unwrap();
-            assert_eq!(
-                v.get("kind").unwrap().as_str().unwrap(),
-                expected_kind,
-                "{:?}",
-                failure
-            );
+            assert_eq!(v, expected, "{:?}", failure);
         }
     }
 }

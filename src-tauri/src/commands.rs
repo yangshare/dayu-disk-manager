@@ -65,6 +65,11 @@ async fn scan_drive_impl(
 
     match task_result {
         Ok(Ok(outcome)) => {
+            // 先发布 store，再从同一 store 构造 snapshot。
+            {
+                let mut current = state.current_scan.write().unwrap();
+                *current = Some(outcome.store.clone());
+            }
             let snapshot = ScanSnapshot {
                 scan_id: outcome.store.scan_id().to_string(),
                 source: outcome.store.source(),
@@ -73,8 +78,6 @@ async fn scan_drive_impl(
                 root_file_summary: outcome.store.root_file_summary().clone(),
                 diagnostics: outcome.diagnostics,
             };
-            let mut current = state.current_scan.write().unwrap();
-            *current = Some(outcome.store);
             Ok(ScanDriveResult::Complete { snapshot })
         }
         Ok(Err(ScanDriveError::NeedsElevation)) => Ok(ScanDriveResult::NeedsElevation),
