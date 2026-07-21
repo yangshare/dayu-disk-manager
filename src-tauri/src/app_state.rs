@@ -1,6 +1,6 @@
 use crate::journal::Journal;
 use crate::models::JournalEntry;
-use crate::scanner::TreeStore;
+use crate::scanner::{ScanEngine, TreeStore};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::AtomicBool;
@@ -29,6 +29,8 @@ pub struct AppState {
     pub scan_cancel_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     /// 当前扫描快照（None = 无活跃扫描结果）
     pub current_scan: Arc<RwLock<Option<Arc<TreeStore>>>>,
+    /// 扫描引擎（生产 RealScanEngine，测试可注入 MockScanEngine）
+    pub scan_engine: Arc<dyn ScanEngine>,
 }
 
 /// 启动时根据 journal 恢复决策。

@@ -29,6 +29,9 @@ pub enum AppError {
 
     #[error("Win32 错误: {0}")]
     Win32(String),
+
+    #[error("stale_scan")]
+    StaleScan,
 }
 
 // Tauri 命令返回的 Result<T, AppError> 必须可序列化给前端

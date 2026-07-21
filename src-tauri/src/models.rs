@@ -85,6 +85,55 @@ pub enum ScanSource {
     Filesystem,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanMode {
+    Auto,
+    Mft,
+    Filesystem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScanDriveResult {
+    NeedsElevation,
+    FastScanUnavailable { reason: FastScanFailure },
+    Complete { snapshot: ScanSnapshot },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FastScanFailure {
+    UnsupportedFilesystem { actual: String },
+    UnsupportedNtfsVersion { major: u16, minor: u16 },
+    InvalidVolumeData,
+    RootRecordMissing,
+    ExcessiveRecordErrors { skipped: u64, scanned: u64 },
+    Io { code: Option<i32> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanSnapshot {
+    pub scan_id: String,
+    pub source: ScanSource,
+    pub roots: Vec<TreeNode>,
+    pub filtered_root_count: u32,
+    pub root_file_summary: RootFileSummary,
+    pub diagnostics: ScanDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanDiagnostics {
+    pub scanned_records: u64,
+    pub scanned_dirs: u64,
+    pub scanned_files: u64,
+    pub skipped_records: u64,
+    pub orphan_entries: u64,
+    pub hard_link_entries: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanItemStatus {
@@ -241,12 +290,23 @@ impl ProgressEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentPhase {
+    ReadingMft,
+    Aggregating,
+    Annotating,
+    WalkingFs,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanProgressEvent {
+    pub scanned_records: u64,
     pub scanned_dirs: u64,
     pub scanned_files: u64,
-    pub current_path: String,
+    pub estimated_record_slots: u64,
+    pub current_phase: CurrentPhase,
 }
 
 // ===== Precheck =====
@@ -258,4 +318,103 @@ pub struct PrecheckReport {
     pub blockers: Vec<String>,
     pub source_size_bytes: u64,
     pub target_free_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_snapshot() -> ScanSnapshot {
+        ScanSnapshot {
+            scan_id: "123".into(),
+            source: ScanSource::Mft,
+            roots: Vec::new(),
+            filtered_root_count: 0,
+            root_file_summary: RootFileSummary {
+                direct_file_size_bytes: 0,
+                direct_file_count: 0,
+                system_metadata_size_bytes: None,
+                total_known_size_bytes: 0,
+                incomplete: false,
+            },
+            diagnostics: ScanDiagnostics {
+                scanned_records: 0,
+                scanned_dirs: 0,
+                scanned_files: 0,
+                skipped_records: 0,
+                orphan_entries: 0,
+                hard_link_entries: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn scan_drive_result_json_needs_elevation() {
+        let v = serde_json::to_value(ScanDriveResult::NeedsElevation).unwrap();
+        assert_eq!(v, serde_json::json!({"kind": "needs_elevation"}));
+    }
+
+    #[test]
+    fn scan_drive_result_json_fast_scan_unavailable() {
+        let v = serde_json::to_value(ScanDriveResult::FastScanUnavailable {
+            reason: FastScanFailure::UnsupportedFilesystem { actual: "fat32".into() },
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "kind": "fast_scan_unavailable",
+                "reason": { "kind": "unsupported_filesystem", "actual": "fat32" }
+            })
+        );
+    }
+
+    #[test]
+    fn scan_drive_result_json_complete() {
+        let v = serde_json::to_value(ScanDriveResult::Complete {
+            snapshot: minimal_snapshot(),
+        })
+        .unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.get("kind"), Some(&serde_json::json!("complete")));
+        assert!(obj.contains_key("snapshot"));
+        let snap = obj.get("snapshot").unwrap();
+        assert!(snap.get("scanId").is_some());
+        assert!(snap.get("source").is_some());
+        assert!(snap.get("roots").is_some());
+        assert!(snap.get("filteredRootCount").is_some());
+        assert!(snap.get("rootFileSummary").is_some());
+        assert!(snap.get("diagnostics").is_some());
+    }
+
+    #[test]
+    fn fast_scan_failure_each_variant() {
+        let cases = vec![
+            (
+                FastScanFailure::UnsupportedFilesystem { actual: "exfat".into() },
+                "unsupported_filesystem",
+            ),
+            (
+                FastScanFailure::UnsupportedNtfsVersion { major: 1, minor: 2 },
+                "unsupported_ntfs_version",
+            ),
+            (FastScanFailure::InvalidVolumeData, "invalid_volume_data"),
+            (FastScanFailure::RootRecordMissing, "root_record_missing"),
+            (
+                FastScanFailure::ExcessiveRecordErrors { skipped: 1, scanned: 2 },
+                "excessive_record_errors",
+            ),
+            (FastScanFailure::Io { code: Some(5) }, "io"),
+            (FastScanFailure::Io { code: None }, "io"),
+        ];
+        for (failure, expected_kind) in cases {
+            let v = serde_json::to_value(&failure).unwrap();
+            assert_eq!(
+                v.get("kind").unwrap().as_str().unwrap(),
+                expected_kind,
+                "{:?}",
+                failure
+            );
+        }
+    }
 }

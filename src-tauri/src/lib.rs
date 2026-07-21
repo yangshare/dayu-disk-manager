@@ -19,6 +19,8 @@ pub mod win32;
 use app_state::AppState;
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::scanner::RealScanEngine;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = win32::local_appdata_dayu_dir().expect("无法解析 %LOCALAPPDATA%");
@@ -40,12 +42,16 @@ pub fn run() {
         cancel_token: Arc::new(Mutex::new(None)),
         scan_cancel_token: Arc::new(Mutex::new(None)),
         current_scan: Arc::new(RwLock::new(None)),
+        scan_engine: Arc::new(RealScanEngine),
     };
 
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
-            commands::scan_drives,
+            commands::scan_drive,
+            commands::expand_node,
+            commands::reveal_node,
+            commands::list_recommended,
             commands::cancel_scan,
             commands::precheck_migrate,
             commands::start_migrate,

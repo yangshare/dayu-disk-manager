@@ -1,12 +1,19 @@
 use crate::models::{
-    AccessState, ChildPage, Config, Migration, MigrationStatus, Preset, PresetCategory,
-    RevealLevel, RootFileSummary, ScanItem, ScanItemStatus, ScanSource, TreeNode,
+    AccessState, ChildPage, Config, CurrentPhase, FastScanFailure, Migration, MigrationStatus,
+    Preset, PresetCategory, RevealLevel, RootFileSummary, ScanDiagnostics, ScanItem,
+    ScanItemStatus, ScanMode, ScanProgressEvent, ScanSource, TreeNode,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::mft::{select_effective_names, FileRef, MftIndex};
+#[cfg(windows)]
+use crate::mft::{enumerate_mft, MftFileReader};
+#[cfg(windows)]
+use crate::win32::{open_volume, read_volume_data, VolumeError};
+use crate::mft::{select_effective_names, FileRef, MftError, MftIndex};
 use crate::junction;
 
 /// 递归计算目录体积（字节）。不跟随 reparse point 的内容。
@@ -821,6 +828,13 @@ pub struct DirectoryGraph {
     pub excluded_subtree_size_bytes: u64,
 }
 
+impl DirectoryGraph {
+    /// 不可达目录节点计数（orphan / cycle / 缺父），作为 ScanDiagnostics.orphan_entries 的代理。
+    pub fn orphan_count(&self) -> u64 {
+        self.diagnostics.unreachable_nodes
+    }
+}
+
 /// 从 `MftIndex` 线性构建 `DirectoryGraph`。
 ///
 /// - `excluded_paths`：归一化前的原始排除路径列表（与 `Config.scan.exclude_paths`
@@ -1557,6 +1571,333 @@ pub fn materialize(
         filtered_root_count,
         recommended,
     )
+}
+
+// ===== T7：结构化扫描引擎 =====
+
+/// 扫描任务内部错误，commands 层映射为 `ScanDriveResult`。
+#[derive(Debug)]
+pub enum ScanDriveError {
+    NeedsElevation,
+    FastScanFailure(FastScanFailure),
+    Cancelled,
+}
+
+/// 扫描成功产物：不可变树快照 + 诊断计数。
+pub struct ScanOutcome {
+    pub store: Arc<TreeStore>,
+    pub diagnostics: ScanDiagnostics,
+}
+
+/// 可注入扫描引擎边界。生产用 `RealScanEngine`，测试用 `MockScanEngine`。
+pub trait ScanEngine: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        mode: ScanMode,
+        root_drive: char,
+        cfg: Config,
+        migrations: Vec<Migration>,
+        excluded_paths: Vec<String>,
+        cancel: Arc<AtomicBool>,
+        on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
+    ) -> Result<ScanOutcome, ScanDriveError>;
+}
+
+/// 生产扫描引擎：编排 MFT / filesystem 两条路线。
+pub struct RealScanEngine;
+
+impl ScanEngine for RealScanEngine {
+    fn run(
+        &self,
+        mode: ScanMode,
+        root_drive: char,
+        cfg: Config,
+        migrations: Vec<Migration>,
+        excluded_paths: Vec<String>,
+        cancel: Arc<AtomicBool>,
+        on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
+    ) -> Result<ScanOutcome, ScanDriveError> {
+        match mode {
+            ScanMode::Auto | ScanMode::Mft => self.mft_scan(root_drive, &cfg, &migrations, &excluded_paths, cancel, on_progress),
+            ScanMode::Filesystem => self.fs_scan(&cfg, &migrations, cancel, on_progress),
+        }
+    }
+}
+
+impl RealScanEngine {
+    #[cfg(windows)]
+    fn mft_scan(
+        &self,
+        root_drive: char,
+        cfg: &Config,
+        migrations: &[Migration],
+        excluded_paths: &[String],
+        cancel: Arc<AtomicBool>,
+        on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
+    ) -> Result<ScanOutcome, ScanDriveError> {
+        let vol = open_volume(root_drive).map_err(map_volume_error)?;
+        let volume_data = read_volume_data(&vol).map_err(map_volume_error)?;
+        let reader = MftFileReader::open(&vol, volume_data).map_err(map_mft_error)?;
+        let record_count = volume_data.mft_valid_data_length / volume_data.bytes_per_file_record_segment as u64;
+
+        let index = enumerate_mft(
+            &reader,
+            volume_data,
+            &mut || cancel.load(Ordering::Relaxed),
+            &mut |scanned| {
+                on_progress(ScanProgressEvent {
+                    scanned_records: scanned,
+                    scanned_dirs: 0,
+                    scanned_files: 0,
+                    estimated_record_slots: record_count,
+                    current_phase: CurrentPhase::ReadingMft,
+                });
+            },
+        )
+        .map_err(map_mft_error)?;
+
+        on_progress(ScanProgressEvent {
+            scanned_records: index.scanned_records,
+            scanned_dirs: 0,
+            scanned_files: index.scanned_files,
+            estimated_record_slots: record_count,
+            current_phase: CurrentPhase::Aggregating,
+        });
+
+        let mut graph = build_graph(&index, excluded_paths, root_drive);
+
+        on_progress(ScanProgressEvent {
+            scanned_records: index.scanned_records,
+            scanned_dirs: graph.nodes.len() as u64,
+            scanned_files: index.scanned_files,
+            estimated_record_slots: record_count,
+            current_phase: CurrentPhase::Annotating,
+        });
+
+        let root_summary = annotate_graph_with_callbacks(
+            &mut graph,
+            cfg,
+            migrations,
+            &junction::exists,
+            &|source| junction::verify(source),
+            &dir_size,
+            index.skipped_records,
+        );
+
+        let scan_id = generate_scan_id();
+        let store = materialize(&graph, root_summary, ScanSource::Mft, scan_id);
+
+        let diagnostics = ScanDiagnostics {
+            scanned_records: index.scanned_records,
+            scanned_dirs: graph.nodes.len() as u64,
+            scanned_files: index.scanned_files,
+            skipped_records: index.skipped_records,
+            orphan_entries: graph.orphan_count(),
+            hard_link_entries: index.hard_link_entries,
+        };
+
+        Ok(ScanOutcome {
+            store: Arc::new(store),
+            diagnostics,
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn mft_scan(
+        &self,
+        _root_drive: char,
+        _cfg: &Config,
+        _migrations: &[Migration],
+        _excluded_paths: &[String],
+        _cancel: Arc<AtomicBool>,
+        _on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
+    ) -> Result<ScanOutcome, ScanDriveError> {
+        Err(ScanDriveError::FastScanFailure(FastScanFailure::Io { code: None }))
+    }
+
+    fn fs_scan(
+        &self,
+        cfg: &Config,
+        migrations: &[Migration],
+        cancel: Arc<AtomicBool>,
+        on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
+    ) -> Result<ScanOutcome, ScanDriveError> {
+        let mut roots = vec![];
+        if let Some(home) = dirs::home_dir() {
+            roots.push(home);
+        }
+        roots.push(PathBuf::from("C:/Program Files"));
+
+        let on_progress = on_progress.clone();
+        let mut last_stats = ScanStats::default();
+        let mut output = scan_roots_with_control(&roots, cfg, cancel.as_ref(), &mut |stats, _path| {
+            last_stats = *stats;
+            on_progress(ScanProgressEvent {
+                scanned_records: 0,
+                scanned_dirs: stats.scanned_dirs,
+                scanned_files: stats.scanned_files,
+                estimated_record_slots: 0,
+                current_phase: CurrentPhase::WalkingFs,
+            });
+        })
+        .map_err(|_| ScanDriveError::Cancelled)?;
+
+        annotate_migrations(
+            &mut output.items,
+            migrations,
+            &|source| junction::verify(source),
+            &dir_size,
+        );
+
+        output.items.sort_unstable_by_key(|item| {
+            let managed_priority = u8::from(item.migration_id.is_some());
+            (std::cmp::Reverse(managed_priority), std::cmp::Reverse(item.size_bytes))
+        });
+
+        let scan_id = generate_scan_id();
+        let (store, diagnostics) = tree_store_from_scan_items(output.items, output.stats, scan_id);
+
+        Ok(ScanOutcome {
+            store: Arc::new(store),
+            diagnostics,
+        })
+    }
+}
+
+fn generate_scan_id() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn tree_store_from_scan_items(
+    items: Vec<ScanItem>,
+    stats: ScanStats,
+    scan_id: String,
+) -> (TreeStore, ScanDiagnostics) {
+    let root_summary = RootFileSummary {
+        direct_file_size_bytes: 0,
+        direct_file_count: 0,
+        system_metadata_size_bytes: None,
+        total_known_size_bytes: 0,
+        incomplete: true,
+    };
+
+    let mut nodes = HashMap::new();
+    let mut roots = Vec::new();
+    let mut recommended = Vec::new();
+
+    for item in &items {
+        let norm_path = normalize(&item.path);
+        let is_reparse = item.is_junction;
+        let tree_node = TreeNode {
+            path: item.path.clone(),
+            display_name: item.display_name.clone(),
+            size_bytes: item.size_bytes,
+            linked_target_size_bytes: None,
+            file_count: 0,
+            dir_count: 0,
+            depth: 0,
+            is_reparse,
+            reparse_tag: None,
+            is_junction: item.is_junction,
+            access_state: if item.inaccessible {
+                AccessState::Inaccessible
+            } else {
+                AccessState::Accessible
+            },
+            matched_preset: item.matched_preset.clone(),
+            category: item.category.clone(),
+            auto_migrate: item.auto_migrate,
+            scan_status: item.scan_status.clone(),
+            migration_id: item.migration_id.clone(),
+            child_count: 0,
+            filtered_child_count: 0,
+        };
+        nodes.insert(norm_path.clone(), tree_node);
+        roots.push(norm_path.clone());
+
+        if item.matched_preset.is_some()
+            && item.scan_status.is_none()
+            && !is_reparse
+            && !item.inaccessible
+        {
+            recommended.push(norm_path.clone());
+        }
+    }
+
+    let children: HashMap<String, Vec<String>> = HashMap::new();
+    let parent: HashMap<String, String> = HashMap::new();
+    let filtered_root_count = 0;
+
+    let store = TreeStore::from_parts(
+        scan_id,
+        ScanSource::Filesystem,
+        root_summary,
+        nodes,
+        children,
+        parent,
+        roots,
+        filtered_root_count,
+        recommended,
+    );
+
+    let diagnostics = ScanDiagnostics {
+        scanned_records: 0,
+        scanned_dirs: stats.scanned_dirs,
+        scanned_files: stats.scanned_files,
+        skipped_records: 0,
+        orphan_entries: 0,
+        hard_link_entries: 0,
+    };
+
+    (store, diagnostics)
+}
+
+#[cfg(windows)]
+fn map_volume_error(e: VolumeError) -> ScanDriveError {
+    match e {
+        VolumeError::AccessDenied => ScanDriveError::NeedsElevation,
+        VolumeError::UnsupportedFilesystem { actual } => {
+            ScanDriveError::FastScanFailure(FastScanFailure::UnsupportedFilesystem { actual })
+        }
+        VolumeError::InvalidVolumeData => {
+            ScanDriveError::FastScanFailure(FastScanFailure::InvalidVolumeData)
+        }
+        VolumeError::Io { code, .. } => ScanDriveError::FastScanFailure(FastScanFailure::Io {
+            code: Some(code as i32),
+        }),
+    }
+}
+
+fn map_mft_error(e: MftError) -> ScanDriveError {
+    match e {
+        MftError::NeedElevation => ScanDriveError::NeedsElevation,
+        MftError::UnsupportedFilesystem { actual } => {
+            ScanDriveError::FastScanFailure(FastScanFailure::UnsupportedFilesystem { actual })
+        }
+        MftError::UnsupportedNtfsVersion { major, minor } => {
+            ScanDriveError::FastScanFailure(FastScanFailure::UnsupportedNtfsVersion { major, minor })
+        }
+        MftError::InvalidVolumeData => {
+            ScanDriveError::FastScanFailure(FastScanFailure::InvalidVolumeData)
+        }
+        MftError::RootRecordMissing => {
+            ScanDriveError::FastScanFailure(FastScanFailure::RootRecordMissing)
+        }
+        MftError::ExcessiveRecordErrors { skipped, scanned } => {
+            ScanDriveError::FastScanFailure(FastScanFailure::ExcessiveRecordErrors { skipped, scanned })
+        }
+        MftError::BadRecord { .. } => {
+            ScanDriveError::FastScanFailure(FastScanFailure::Io { code: None })
+        }
+        MftError::Io(e) => ScanDriveError::FastScanFailure(FastScanFailure::Io {
+            code: e.raw_os_error(),
+        }),
+        MftError::Cancelled => ScanDriveError::Cancelled,
+    }
 }
 #[cfg(test)]
 mod tests {

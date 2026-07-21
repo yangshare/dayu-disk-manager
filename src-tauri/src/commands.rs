@@ -1,82 +1,60 @@
 use crate::app_state::{recover_pending_decisions, AppState};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::file_ops::RealFileOps;
 use crate::migrator::{self, MigratePlan};
 use crate::models::*;
-use crate::scanner;
+use crate::scanner::{self, ScanDriveError, TreeStore};
 use crate::safety::{migration_conflict, precheck, Win32Probe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command]
-pub async fn scan_drives(
+pub async fn scan_drive(
+    mode: ScanMode,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> AppResult<Vec<ScanItem>> {
+) -> AppResult<ScanDriveResult> {
+    let emitter = Arc::new(move |evt: ScanProgressEvent| {
+        let _ = app.emit("dayu://scan-progress", evt);
+    });
+    scan_drive_impl(mode, &state, emitter).await
+}
+
+async fn scan_drive_impl(
+    mode: ScanMode,
+    state: &AppState,
+    emit_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
+) -> AppResult<ScanDriveResult> {
     let cfg = state.store.load_config()?;
     let migrations = state.store.load_migrations()?;
+    let excluded_paths = cfg.scan.exclude_paths.clone();
     let cancel = Arc::new(AtomicBool::new(false));
     let scan_slot = state.scan_cancel_token.clone();
     {
         let mut active = scan_slot.lock().unwrap();
         if active.is_some() {
-            return Err(crate::error::AppError::Conflict("扫描任务已在运行".into()));
+            return Err(AppError::Conflict("扫描任务已在运行".into()));
         }
         *active = Some(cancel.clone());
     }
 
-    // Directory walking and size calculation can take a long time on a real disk.
-    // Keep it off the Tauri/UI thread so the window remains responsive while a scan runs.
+    let engine = state.scan_engine.clone();
     let task_cancel = cancel.clone();
     let task_result = tauri::async_runtime::spawn_blocking(move || {
-        // 首版扫描根：当前用户目录 + Program Files（受 excludePaths 过滤）
-        let mut roots = vec![];
-        if let Some(home) = dirs::home_dir() { roots.push(home); }
-        roots.push(PathBuf::from("C:/Program Files"));
-        let mut last_emit = None::<Instant>;
-        let mut on_progress = |stats: &scanner::ScanStats, path: &std::path::Path| {
-            let now = Instant::now();
-            if last_emit
-                .map(|last| now.duration_since(last) >= Duration::from_millis(200))
-                .unwrap_or(true)
-            {
-                let _ = app.emit("dayu://scan-progress", ScanProgressEvent {
-                    scanned_dirs: stats.scanned_dirs,
-                    scanned_files: stats.scanned_files,
-                    current_path: path.to_string_lossy().into(),
-                });
-                last_emit = Some(now);
-            }
-        };
-        let mut output = scanner::scan_roots_with_control(
-            &roots,
-            &cfg,
-            &task_cancel,
-            &mut on_progress,
+        engine.run(
+            mode,
+            'C',
+            cfg,
+            migrations,
+            excluded_paths,
+            task_cancel,
+            emit_progress,
         )
-        .map_err(|_| crate::error::AppError::Cancelled)?;
-        scanner::annotate_migrations(
-            &mut output.items,
-            &migrations,
-            &|source| crate::junction::verify(source),
-            &scanner::dir_size,
-        );
-        let _ = app.emit("dayu://scan-progress", ScanProgressEvent {
-            scanned_dirs: output.stats.scanned_dirs,
-            scanned_files: output.stats.scanned_files,
-            current_path: String::new(),
-        });
-        output.items.sort_unstable_by_key(|item| {
-            let managed_priority = u8::from(item.migration_id.is_some());
-            (std::cmp::Reverse(managed_priority), std::cmp::Reverse(item.size_bytes))
-        });
-        Ok(output.items)
     })
     .await
-    .map_err(|e| crate::error::AppError::Store(format!("扫描任务失败: {e}")));
+    .map_err(|e| AppError::Store(format!("扫描任务失败: {e}")));
 
     {
         let mut active = scan_slot.lock().unwrap();
@@ -84,7 +62,28 @@ pub async fn scan_drives(
             *active = None;
         }
     }
-    task_result?
+
+    match task_result {
+        Ok(Ok(outcome)) => {
+            let snapshot = ScanSnapshot {
+                scan_id: outcome.store.scan_id().to_string(),
+                source: outcome.store.source(),
+                roots: outcome.store.roots(),
+                filtered_root_count: outcome.store.filtered_root_count(),
+                root_file_summary: outcome.store.root_file_summary().clone(),
+                diagnostics: outcome.diagnostics,
+            };
+            let mut current = state.current_scan.write().unwrap();
+            *current = Some(outcome.store);
+            Ok(ScanDriveResult::Complete { snapshot })
+        }
+        Ok(Err(ScanDriveError::NeedsElevation)) => Ok(ScanDriveResult::NeedsElevation),
+        Ok(Err(ScanDriveError::FastScanFailure(f))) => {
+            Ok(ScanDriveResult::FastScanUnavailable { reason: f })
+        }
+        Ok(Err(ScanDriveError::Cancelled)) => Err(AppError::Cancelled),
+        Err(e) => Err(e),
+    }
 }
 
 #[tauri::command]
@@ -97,6 +96,69 @@ pub fn cancel_scan(state: State<AppState>) -> bool {
 }
 
 #[tauri::command]
+pub async fn expand_node(
+    scan_id: String,
+    path: String,
+    offset: u32,
+    limit: u32,
+    state: State<'_, AppState>,
+) -> AppResult<ChildPage> {
+    expand_node_impl(&state, &scan_id, &path, offset, limit)
+}
+
+fn expand_node_impl(
+    state: &AppState,
+    scan_id: &str,
+    path: &str,
+    offset: u32,
+    limit: u32,
+) -> AppResult<ChildPage> {
+    let store = acquire_store(state, scan_id)?;
+    Ok(store.children_page(path, offset, limit))
+}
+
+#[tauri::command]
+pub async fn reveal_node(
+    scan_id: String,
+    path: String,
+    limit: u32,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<RevealLevel>> {
+    reveal_node_impl(&state, &scan_id, &path, limit)
+}
+
+fn reveal_node_impl(
+    state: &AppState,
+    scan_id: &str,
+    path: &str,
+    limit: u32,
+) -> AppResult<Vec<RevealLevel>> {
+    let store = acquire_store(state, scan_id)?;
+    store.reveal_pages(path, limit)
+}
+
+#[tauri::command]
+pub async fn list_recommended(
+    scan_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<TreeNode>> {
+    list_recommended_impl(&state, &scan_id)
+}
+
+fn list_recommended_impl(state: &AppState, scan_id: &str) -> AppResult<Vec<TreeNode>> {
+    let store = acquire_store(state, scan_id)?;
+    Ok(store.recommended())
+}
+
+fn acquire_store(state: &AppState, scan_id: &str) -> AppResult<Arc<TreeStore>> {
+    let guard = state.current_scan.read().unwrap();
+    match guard.as_ref() {
+        Some(store) if store.scan_id() == scan_id => Ok(store.clone()),
+        _ => Err(AppError::StaleScan),
+    }
+}
+
+#[tauri::command]
 pub async fn precheck_migrate(src: String, state: State<'_, AppState>) -> AppResult<PrecheckReport> {
     let cfg = state.store.load_config()?;
     let existing = state.store.load_migrations()?;
@@ -105,7 +167,7 @@ pub async fn precheck_migrate(src: String, state: State<'_, AppState>) -> AppRes
         Ok(precheck(std::path::Path::new(&src), &cfg, &existing, src_size, &Win32Probe))
     })
     .await
-    .map_err(|e| crate::error::AppError::Store(format!("预检任务失败: {e}")))?
+    .map_err(|e| AppError::Store(format!("预检任务失败: {e}")))?
 }
 
 #[tauri::command]
@@ -117,7 +179,7 @@ pub async fn start_migrate(
     let src_path = PathBuf::from(&src);
     let existing = state.store.load_migrations()?;
     if let Some(conflict) = migration_conflict(&src_path, &existing) {
-        return Err(crate::error::AppError::Conflict(conflict));
+        return Err(AppError::Conflict(conflict));
     }
     let preset = preset_id.as_ref().and_then(|id| cfg.presets.iter().find(|p| &p.id == id));
     let subdir = preset.map(|p| p.target_subdir.clone()).unwrap_or_else(|| "custom".into());
@@ -139,7 +201,7 @@ pub async fn start_migrate(
     {
         let mut active = cancel_slot.lock().unwrap();
         if active.is_some() {
-            return Err(crate::error::AppError::Conflict("已有迁移或还原任务正在运行".into()));
+            return Err(AppError::Conflict("已有迁移或还原任务正在运行".into()));
         }
         *active = Some(cancel.clone());
     }
@@ -156,7 +218,7 @@ pub async fn start_migrate(
         )
     })
     .await
-    .map_err(|e| crate::error::AppError::Store(format!("迁移任务失败: {e}")));
+    .map_err(|e| AppError::Store(format!("迁移任务失败: {e}")));
 
     {
         let mut active = cancel_slot.lock().unwrap();
@@ -182,14 +244,14 @@ pub async fn start_restore(
 ) -> AppResult<bool> {
     let migs = state.store.load_migrations()?;
     let mig = migs.into_iter().find(|m| m.id == migration_id)
-        .ok_or_else(|| crate::error::AppError::Store("迁移记录不存在".into()))?;
+        .ok_or_else(|| AppError::Store("迁移记录不存在".into()))?;
     let app2 = app.clone();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_slot = state.cancel_token.clone();
     {
         let mut active = cancel_slot.lock().unwrap();
         if active.is_some() {
-            return Err(crate::error::AppError::Conflict("已有迁移或还原任务正在运行".into()));
+            return Err(AppError::Conflict("已有迁移或还原任务正在运行".into()));
         }
         *active = Some(cancel.clone());
     }
@@ -205,7 +267,7 @@ pub async fn start_restore(
         )
     })
     .await
-    .map_err(|e| crate::error::AppError::Store(format!("还原任务失败: {e}")));
+    .map_err(|e| AppError::Store(format!("还原任务失败: {e}")));
 
     {
         let mut active = cancel_slot.lock().unwrap();
@@ -237,7 +299,7 @@ pub fn list_links(state: State<AppState>) -> AppResult<Vec<crate::app_state::Lin
 pub fn break_link_cmd(migration_id: String, state: State<AppState>) -> AppResult<bool> {
     let migs = state.store.load_migrations()?;
     let mig = migs.into_iter().find(|m| m.id == migration_id)
-        .ok_or_else(|| crate::error::AppError::Store("迁移记录不存在".into()))?;
+        .ok_or_else(|| AppError::Store("迁移记录不存在".into()))?;
     migrator::break_link(&RealFileOps, &state.store, &state.history, &mig)?;
     Ok(true)
 }
@@ -270,4 +332,379 @@ pub fn export_history(state: State<AppState>) -> AppResult<String> {
 pub fn get_recovery_advice(state: State<AppState>) -> AppResult<Vec<(String, String, String)>> {
     let pending = state.journal.recover_pending()?;
     Ok(recover_pending_decisions(&pending))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scanner::{ScanEngine, ScanOutcome};
+    use crate::models::{RootFileSummary, ScanSource, ScanDiagnostics};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, RwLock};
+
+    struct MockScanEngine {
+        result: Mutex<Option<Result<ScanOutcome, ScanDriveError>>>,
+    }
+
+    impl MockScanEngine {
+        fn success(store: Arc<TreeStore>, diagnostics: ScanDiagnostics) -> Self {
+            Self {
+                result: Mutex::new(Some(Ok(ScanOutcome { store, diagnostics }))),
+            }
+        }
+
+        fn needs_elevation() -> Self {
+            Self {
+                result: Mutex::new(Some(Err(ScanDriveError::NeedsElevation))),
+            }
+        }
+
+        fn fast_scan_failure(f: FastScanFailure) -> Self {
+            Self {
+                result: Mutex::new(Some(Err(ScanDriveError::FastScanFailure(f)))),
+            }
+        }
+
+        fn cancelled() -> Self {
+            Self {
+                result: Mutex::new(Some(Err(ScanDriveError::Cancelled))),
+            }
+        }
+    }
+
+    impl ScanEngine for MockScanEngine {
+        fn run(
+            &self,
+            _mode: ScanMode,
+            _root_drive: char,
+            _cfg: Config,
+            _migrations: Vec<Migration>,
+            _excluded_paths: Vec<String>,
+            _cancel: Arc<AtomicBool>,
+            _on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
+        ) -> Result<ScanOutcome, ScanDriveError> {
+            self.result.lock().unwrap().take().expect("MockScanEngine 只能使用一次")
+        }
+    }
+
+    fn empty_store(scan_id: &str) -> Arc<TreeStore> {
+        let summary = RootFileSummary {
+            direct_file_size_bytes: 0,
+            direct_file_count: 0,
+            system_metadata_size_bytes: None,
+            total_known_size_bytes: 0,
+            incomplete: false,
+        };
+        Arc::new(TreeStore::from_parts(
+            scan_id.into(),
+            ScanSource::Mft,
+            summary,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+            0,
+            Vec::new(),
+        ))
+    }
+
+    fn temp_app_state(engine: Arc<dyn ScanEngine>) -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::new(dir.path()).unwrap();
+        let journal = crate::journal::Journal::new(dir.path().join("journal.jsonl")).unwrap();
+        let history = crate::history::History::new(dir.path().join("history.jsonl")).unwrap();
+        AppState {
+            store,
+            journal,
+            history,
+            cancel_token: Arc::new(Mutex::new(None)),
+            scan_cancel_token: Arc::new(Mutex::new(None)),
+            current_scan: Arc::new(RwLock::new(None)),
+            scan_engine: engine,
+        }
+    }
+
+    fn no_op_progress() -> Arc<dyn Fn(ScanProgressEvent) + Send + Sync> {
+        Arc::new(|_| {})
+    }
+
+    #[test]
+    fn needs_elevation_returns_before_lock_released() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        let result = tauri::async_runtime::block_on(scan_drive_impl(
+            ScanMode::Auto,
+            &state,
+            no_op_progress(),
+        ))
+        .unwrap();
+        assert!(matches!(result, ScanDriveResult::NeedsElevation));
+        assert!(state.scan_cancel_token.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn fast_scan_failure_preserves_old_snapshot() {
+        let old_store = empty_store("old");
+        let state = temp_app_state(Arc::new(MockScanEngine::fast_scan_failure(
+            FastScanFailure::UnsupportedFilesystem { actual: "fat32".into() },
+        )));
+        *state.current_scan.write().unwrap() = Some(old_store.clone());
+
+        let result = tauri::async_runtime::block_on(scan_drive_impl(
+            ScanMode::Auto,
+            &state,
+            no_op_progress(),
+        ))
+        .unwrap();
+
+        assert!(
+            matches!(result, ScanDriveResult::FastScanUnavailable { reason: FastScanFailure::UnsupportedFilesystem { .. } })
+        );
+        assert_eq!(
+            state.current_scan.read().unwrap().as_ref().map(|s| s.scan_id().to_string()),
+            Some("old".to_string())
+        );
+        assert!(state.scan_cancel_token.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn cancelled_preserves_old_snapshot() {
+        let old_store = empty_store("old");
+        let state = temp_app_state(Arc::new(MockScanEngine::cancelled()));
+        *state.current_scan.write().unwrap() = Some(old_store.clone());
+
+        let result = tauri::async_runtime::block_on(scan_drive_impl(
+            ScanMode::Auto,
+            &state,
+            no_op_progress(),
+        ));
+
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert_eq!(
+            state.current_scan.read().unwrap().as_ref().map(|s| s.scan_id().to_string()),
+            Some("old".to_string())
+        );
+    }
+
+    #[test]
+    fn success_atomically_replaces_snapshot() {
+        let old_store = empty_store("old");
+        let new_store = empty_store("new");
+        let diagnostics = ScanDiagnostics {
+            scanned_records: 1,
+            scanned_dirs: 2,
+            scanned_files: 3,
+            skipped_records: 0,
+            orphan_entries: 0,
+            hard_link_entries: 0,
+        };
+        let state = temp_app_state(Arc::new(MockScanEngine::success(
+            new_store.clone(),
+            diagnostics.clone(),
+        )));
+        *state.current_scan.write().unwrap() = Some(old_store);
+
+        let result = tauri::async_runtime::block_on(scan_drive_impl(
+            ScanMode::Auto,
+            &state,
+            no_op_progress(),
+        ))
+        .unwrap();
+
+        match result {
+            ScanDriveResult::Complete { snapshot } => {
+                assert_eq!(snapshot.scan_id, "new");
+                assert_eq!(snapshot.diagnostics.scanned_records, 1);
+            }
+            _ => panic!("期望 Complete"),
+        }
+        assert_eq!(
+            state.current_scan.read().unwrap().as_ref().map(|s| s.scan_id().to_string()),
+            Some("new".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_scan_on_id_mismatch() {
+        let store = empty_store("a");
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        *state.current_scan.write().unwrap() = Some(store);
+
+        let result = expand_node_impl(&state, "b", "C:\\", 0, 10);
+        assert!(matches!(result, Err(AppError::StaleScan)));
+    }
+
+    #[test]
+    fn stale_scan_on_empty() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        let result = expand_node_impl(&state, "x", "C:\\", 0, 10);
+        assert!(matches!(result, Err(AppError::StaleScan)));
+    }
+
+    fn sample_store() -> Arc<TreeStore> {
+        let summary = RootFileSummary {
+            direct_file_size_bytes: 0,
+            direct_file_count: 0,
+            system_metadata_size_bytes: None,
+            total_known_size_bytes: 0,
+            incomplete: false,
+        };
+        let mut nodes = HashMap::new();
+        let a = TreeNode {
+            path: r"C:\A".into(),
+            display_name: "A".into(),
+            size_bytes: 100,
+            linked_target_size_bytes: None,
+            file_count: 0,
+            dir_count: 1,
+            depth: 1,
+            is_reparse: false,
+            reparse_tag: None,
+            is_junction: false,
+            access_state: AccessState::Unknown,
+            matched_preset: None,
+            category: None,
+            auto_migrate: false,
+            scan_status: None,
+            migration_id: None,
+            child_count: 1,
+            filtered_child_count: 0,
+        };
+        let b = TreeNode {
+            path: r"C:\A\B".into(),
+            display_name: "B".into(),
+            size_bytes: 50,
+            linked_target_size_bytes: None,
+            file_count: 0,
+            dir_count: 1,
+            depth: 2,
+            is_reparse: false,
+            reparse_tag: None,
+            is_junction: false,
+            access_state: AccessState::Unknown,
+            matched_preset: None,
+            category: None,
+            auto_migrate: false,
+            scan_status: None,
+            migration_id: None,
+            child_count: 0,
+            filtered_child_count: 0,
+        };
+        nodes.insert(r"c:\a".into(), a);
+        nodes.insert(r"c:\a\b".into(), b);
+        let mut children = HashMap::new();
+        children.insert(r"c:\".into(), vec![r"c:\a".into()]);
+        children.insert(r"c:\a".into(), vec![r"c:\a\b".into()]);
+        let mut parent = HashMap::new();
+        parent.insert(r"c:\a".into(), r"c:\".into());
+        parent.insert(r"c:\a\b".into(), r"c:\a".into());
+        Arc::new(TreeStore::from_parts(
+            "sample".into(),
+            ScanSource::Mft,
+            summary,
+            nodes,
+            children,
+            parent,
+            vec![r"c:\a".into()],
+            0,
+            Vec::new(),
+        ))
+    }
+
+    #[test]
+    fn expand_node_returns_child_page() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        *state.current_scan.write().unwrap() = Some(sample_store());
+
+        let page = expand_node_impl(&state, "sample", r"C:\A", 0, 10).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].path, r"C:\A\B");
+    }
+
+    #[test]
+    fn reveal_node_returns_chain() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        *state.current_scan.write().unwrap() = Some(sample_store());
+
+        let levels = reveal_node_impl(&state, "sample", r"C:\A\B", 10).unwrap();
+        assert_eq!(levels.len(), 2);
+        assert!(levels.iter().any(|l| l.parent_path == r"c:\"));
+        assert!(levels.iter().any(|l| l.parent_path == r"C:\A"));
+    }
+
+    #[test]
+    fn list_recommended_returns_nodes() {
+        let summary = RootFileSummary {
+            direct_file_size_bytes: 0,
+            direct_file_count: 0,
+            system_metadata_size_bytes: None,
+            total_known_size_bytes: 0,
+            incomplete: false,
+        };
+        let mut nodes = HashMap::new();
+        let a = TreeNode {
+            path: r"C:\A".into(),
+            display_name: "A".into(),
+            size_bytes: 100,
+            linked_target_size_bytes: None,
+            file_count: 0,
+            dir_count: 1,
+            depth: 1,
+            is_reparse: false,
+            reparse_tag: None,
+            is_junction: false,
+            access_state: AccessState::Unknown,
+            matched_preset: Some("p1".into()),
+            category: None,
+            auto_migrate: false,
+            scan_status: None,
+            migration_id: None,
+            child_count: 0,
+            filtered_child_count: 0,
+        };
+        nodes.insert(r"c:\a".into(), a);
+        let store_with_rec = Arc::new(TreeStore::from_parts(
+            "rec".into(),
+            ScanSource::Mft,
+            summary,
+            nodes,
+            HashMap::new(),
+            HashMap::new(),
+            vec![r"c:\a".into()],
+            0,
+            vec![r"c:\a".into()],
+        ));
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        *state.current_scan.write().unwrap() = Some(store_with_rec);
+
+        let nodes = list_recommended_impl(&state, "rec").unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].path, r"C:\A");
+    }
+
+    #[test]
+    fn cancel_scan_returns_false_when_idle() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        assert!(!cancel_scan_impl(&state));
+    }
+
+    fn cancel_scan_impl(state: &AppState) -> bool {
+        if let Some(token) = state.scan_cancel_token.lock().unwrap().as_ref() {
+            token.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    fn read_commands_dont_hold_scan_lock() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        *state.current_scan.write().unwrap() = Some(sample_store());
+
+        // 读树命令使用短读锁，scan_slot（scan_cancel_token）应保持空闲
+        let _ = expand_node_impl(&state, "sample", r"C:\A", 0, 10).unwrap();
+        let _ = reveal_node_impl(&state, "sample", r"C:\A\B", 10).unwrap();
+        let _ = list_recommended_impl(&state, "sample").unwrap();
+
+        assert!(state.scan_cancel_token.try_lock().is_ok());
+    }
 }
