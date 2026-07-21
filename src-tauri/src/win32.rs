@@ -896,7 +896,7 @@ pub fn classify_shell_result(hinst: isize) -> ElevationOutcome {
 /// - 使用 `ShellExecuteW` + `runas` verb；不主动退出旧实例。
 /// - 返回 `ElevationOutcome` 三分支：成功启动 / 用户取消 / 启动失败。
 #[cfg(windows)]
-pub fn request_elevation() -> Result<ElevationOutcome, VolumeError> {
+pub fn request_elevation(params: &str) -> Result<ElevationOutcome, VolumeError> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -908,13 +908,14 @@ pub fn request_elevation() -> Result<ElevationOutcome, VolumeError> {
     })?;
     let exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let verb = to_wide("runas");
+    let params_wide: Vec<u16> = to_wide(params).into_iter().chain(std::iter::once(0)).collect();
 
     let hinst = unsafe {
         ShellExecuteW(
             None,
             PCWSTR(verb.as_ptr()),
             PCWSTR(exe_wide.as_ptr()),
-            None,
+            PCWSTR(params_wide.as_ptr()),
             None,
             SW_SHOWNORMAL,
         )
@@ -957,7 +958,7 @@ pub fn read_mft_record(
 }
 
 #[cfg(not(windows))]
-pub fn request_elevation() -> Result<ElevationOutcome, VolumeError> {
+pub fn request_elevation(_params: &str) -> Result<ElevationOutcome, VolumeError> {
     Err(VolumeError::Io {
         code: u32::MAX,
         operation: "request_elevation/not_windows",
@@ -1658,7 +1659,7 @@ mod tests {
             eprintln!("跳过 request_elevation 手动测试；设置 DAYU_MANUAL_ELEVATION_TEST=1 以启用");
             return;
         }
-        let outcome = request_elevation().expect("request_elevation 在 current_exe 失败时不应 panic");
+        let outcome = request_elevation("--elevated-scan").expect("request_elevation 在 current_exe 失败时不应 panic");
         println!("request_elevation outcome: {}", outcome);
     }
 }

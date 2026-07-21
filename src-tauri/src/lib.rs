@@ -21,6 +21,11 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::scanner::RealScanEngine;
 
+/// 纯函数：判断启动参数是否包含 --elevated-scan 意图。
+pub fn is_elevated_scan_start(args: &[impl AsRef<str>]) -> bool {
+    args.iter().any(|a| a.as_ref() == "--elevated-scan")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = win32::local_appdata_dayu_dir().expect("无法解析 %LOCALAPPDATA%");
@@ -35,6 +40,9 @@ pub fn run() {
         }
     }
 
+    let is_elevated_scan = is_elevated_scan_start(&std::env::args().collect::<Vec<_>>());
+    let startup_scan_intent = Arc::new(Mutex::new(Some(is_elevated_scan)));
+
     let state = AppState {
         store,
         journal,
@@ -43,6 +51,7 @@ pub fn run() {
         scan_cancel_token: Arc::new(Mutex::new(None)),
         current_scan: Arc::new(RwLock::new(None)),
         scan_engine: Arc::new(RealScanEngine),
+        startup_scan_intent,
     };
 
     tauri::Builder::default()
@@ -64,7 +73,33 @@ pub fn run() {
             commands::save_config,
             commands::export_history,
             commands::get_recovery_advice,
+            commands::restart_elevated,
+            commands::take_startup_scan_intent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_elevated_scan_flag_present() {
+        assert!(is_elevated_scan_start(&["dayu".to_string(), "--elevated-scan".to_string()]
+        ));
+    }
+
+    #[test]
+    fn parse_elevated_scan_flag_absent() {
+        assert!(!is_elevated_scan_start(&["dayu".to_string()]
+        ));
+    }
+
+    #[test]
+    fn parse_elevated_scan_flag_mixed() {
+        assert!(is_elevated_scan_start(
+            &["dayu".to_string(), "--other".to_string(), "--elevated-scan".to_string()]
+        ));
+    }
 }

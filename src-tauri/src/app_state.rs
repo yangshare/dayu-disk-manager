@@ -31,6 +31,8 @@ pub struct AppState {
     pub current_scan: Arc<RwLock<Option<Arc<TreeStore>>>>,
     /// 扫描引擎（生产 RealScanEngine，测试可注入 MockScanEngine）
     pub scan_engine: Arc<dyn ScanEngine>,
+    /// 启动时的一次性提权扫描意图：None=未取过、Some(true)=提权启动应自动扫描、Some(false)=非提权或已取过
+    pub startup_scan_intent: Arc<Mutex<Option<bool>>>,
 }
 
 /// 启动时根据 journal 恢复决策。

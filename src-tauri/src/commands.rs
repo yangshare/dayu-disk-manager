@@ -5,6 +5,7 @@ use crate::migrator::{self, MigratePlan};
 use crate::models::*;
 use crate::scanner::{self, ScanDriveError, TreeStore};
 use crate::safety::{migration_conflict, precheck, Win32Probe};
+use crate::win32::{ElevationOutcome, VolumeError};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -337,6 +338,39 @@ pub fn get_recovery_advice(state: State<AppState>) -> AppResult<Vec<(String, Str
     Ok(recover_pending_decisions(&pending))
 }
 
+#[tauri::command]
+pub async fn restart_elevated(_state: State<'_, AppState>) -> AppResult<bool> {
+    restart_elevated_impl(crate::win32::request_elevation).await
+}
+
+async fn restart_elevated_impl(
+    elevation_fn: impl Fn(&str) -> Result<ElevationOutcome, VolumeError> + Send + 'static,
+) -> AppResult<bool> {
+    let outcome = tauri::async_runtime::spawn_blocking(move || elevation_fn("--elevated-scan"))
+        .await
+        .map_err(|e| AppError::Store(format!("提权任务失败: {e}")))?
+        .map_err(|e| AppError::Win32(e.to_string()))?;
+
+    match outcome {
+        ElevationOutcome::Launched => Ok(true),
+        ElevationOutcome::Cancelled => Err(AppError::Win32("用户取消 UAC 提权".into())),
+        ElevationOutcome::Failed { code } => Err(AppError::Win32(format!("UAC 提权启动失败，code={code}"))),
+    }
+    // 关键：后端任何分支都不退出当前进程。"成功后关闭旧窗口"由前端 T11 处理。
+}
+
+#[tauri::command]
+pub async fn take_startup_scan_intent(state: State<'_, AppState>) -> AppResult<bool> {
+    take_startup_scan_intent_impl(&state)
+}
+
+fn take_startup_scan_intent_impl(state: &AppState) -> AppResult<bool> {
+    let mut guard = state.startup_scan_intent.lock().unwrap();
+    let intent = guard.unwrap_or(false);
+    *guard = Some(false);
+    Ok(intent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +458,7 @@ mod tests {
             scan_cancel_token: Arc::new(Mutex::new(None)),
             current_scan: Arc::new(RwLock::new(None)),
             scan_engine: engine,
+            startup_scan_intent: Arc::new(Mutex::new(Some(false))),
         }
     }
 
@@ -709,5 +744,94 @@ mod tests {
         let _ = list_recommended_impl(&state, "sample").unwrap();
 
         assert!(state.scan_cancel_token.try_lock().is_ok());
+    }
+
+    fn temp_app_state_with_intent(intent: Option<bool>) -> AppState {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        *state.startup_scan_intent.lock().unwrap() = intent;
+        state
+    }
+
+    #[test]
+    fn take_startup_scan_intent_one_shot_true() {
+        let state = temp_app_state_with_intent(Some(true));
+        assert!(take_startup_scan_intent_impl(&state).unwrap());
+        assert!(!take_startup_scan_intent_impl(&state).unwrap());
+        assert!(!take_startup_scan_intent_impl(&state).unwrap());
+    }
+
+    #[test]
+    fn take_startup_scan_intent_false_on_normal_start() {
+        let state = temp_app_state_with_intent(Some(false));
+        assert!(!take_startup_scan_intent_impl(&state).unwrap());
+    }
+
+    #[test]
+    fn take_startup_scan_intent_false_when_none() {
+        let state = temp_app_state_with_intent(None);
+        assert!(!take_startup_scan_intent_impl(&state).unwrap());
+    }
+
+    #[test]
+    fn restart_elevated_returns_true_on_launched() {
+        let result = tauri::async_runtime::block_on(restart_elevated_impl(|_| {
+            Ok(ElevationOutcome::Launched)
+        }));
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn restart_elevated_returns_err_on_cancelled() {
+        let result = tauri::async_runtime::block_on(restart_elevated_impl(|_| {
+            Ok(ElevationOutcome::Cancelled)
+        }));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("取消"), "错误信息应提示取消: {}", err);
+    }
+
+    #[test]
+    fn restart_elevated_returns_err_on_failed() {
+        let result = tauri::async_runtime::block_on(restart_elevated_impl(|_| {
+            Ok(ElevationOutcome::Failed { code: 5 })
+        }));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("code=5"), "错误信息应包含 code: {}", err);
+    }
+
+    #[test]
+    fn restart_elevated_never_exits_process() {
+        let called = Arc::new(AtomicBool::new(false));
+        let c = called.clone();
+        let result = tauri::async_runtime::block_on(restart_elevated_impl(move |_| {
+            c.store(true, Ordering::SeqCst);
+            Ok(ElevationOutcome::Launched)
+        }));
+        assert!(called.load(Ordering::SeqCst), "mock 应被调用");
+        assert!(result.unwrap(), "函数应正常返回而非退出进程");
+    }
+
+    #[test]
+    fn csp_is_non_null_and_local_only() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("读取 tauri.conf.json 失败");
+        let conf: serde_json::Value = serde_json::from_str(&raw).expect("tauri.conf.json 解析失败");
+        let csp = conf["app"]["security"]["csp"].as_str().expect("CSP 必须是非空字符串");
+        assert!(csp.contains("default-src 'self'"), "CSP 必须限制 default-src 为 'self': {csp}");
+        assert!(!csp.contains("http://"), "CSP 不得包含 http:// 远程源: {csp}");
+        assert!(!csp.contains("https://"), "CSP 不得包含 https:// 远程源: {csp}");
+    }
+
+    #[test]
+    fn no_shell_execute_permission() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/capabilities/default.json"))
+            .expect("读取 capabilities/default.json 失败");
+        let cap: serde_json::Value = serde_json::from_str(&raw).expect("capabilities/default.json 解析失败");
+        let perms = cap["permissions"].as_array().expect("capabilities 必须有 permissions 数组");
+        for p in perms {
+            let s = p.as_str().unwrap_or("");
+            assert!(!s.contains("shell:allow-execute"), "禁止 shell:allow-execute: {s}");
+            assert!(!s.contains("shell:default"), "禁止 shell:default: {s}");
+            assert!(!s.contains("process:"), "禁止 process 类 permission: {s}");
+        }
     }
 }
