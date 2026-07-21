@@ -285,13 +285,17 @@ pub fn migrate(
     }
 
     // 历史与终态
-    let _ = history.append(&HistoryEntry {
+    if let Err(e) = history.append(&HistoryEntry {
         op: "migrate".into(), id: plan.migration_id.clone(),
         src: plan.src.to_string_lossy().into(),
         dst: plan.target.to_string_lossy().into(),
         result: "ok".into(), time: now(), duration_sec: 0,
-    });
-    let _ = journal.complete(&plan.task_id);
+    }) {
+        return Err(fail(e, true, "migrate_partial"));
+    }
+    if let Err(e) = journal.complete(&plan.task_id) {
+        return Err(fail(e, true, "migrate_partial"));
+    }
     emit(stage::CLEANING, 100, "迁移完成");
     Ok((migration, OperationOutcome::changed("migrated")))
 }
@@ -409,13 +413,19 @@ pub fn restore(
         }
     }
 
-    let _ = store.remove_migration(&mig.id);
-    let _ = history.append(&HistoryEntry {
+    if let Err(e) = store.remove_migration(&mig.id) {
+        return Err(fail(e, true, "restore_partial"));
+    }
+    if let Err(e) = history.append(&HistoryEntry {
         op: "restore".into(), id: mig.id.clone(),
         src: mig.source.clone(), dst: mig.target.clone(),
         result: "ok".into(), time: now(), duration_sec: 0,
-    });
-    let _ = journal.complete(&format!("restore-{}", mig.id));
+    }) {
+        return Err(fail(e, true, "restore_partial"));
+    }
+    if let Err(e) = journal.complete(&format!("restore-{}", mig.id)) {
+        return Err(fail(e, true, "restore_partial"));
+    }
     emit(stage::CLEANING, 100, "还原完成");
     Ok(OperationOutcome::changed("restored"))
 }
@@ -792,5 +802,107 @@ mod tests {
         assert!(!plan.tmp.exists(), "tmp 不应存在");
         // 无迁移记录落盘
         assert!(store.load_migrations().unwrap().is_empty());
+    }
+
+    // ===== T10 修复轮：成功路径命根子失败注入测试 =====
+    //
+    // migrate/restore 的成功路径对 history.append / journal.complete /
+    // store.remove_migration 改为 if let Err 传播后，必须在任一调用失败时
+    // 返回 Err，且 source_changed=true、reason 为 "..._partial"。
+    //
+    // 注入策略：History/Journal/Store 是具体结构（非 trait），生产签名不允许
+    // 改造（§6.4"不要为测试改生产代码签名"）。改用文件系统层注入：
+    // 在迁移/还原最后一个进度回调（CLEANING 99 / CLEANING 95）触发后、
+    // 命根子调用之前，把对应路径替换为目录或清空文件，使后续 OpenOptions 或
+    // read_all/save_migrations 等真实调用按预期失败。
+
+    /// 辅助：把 path 指向的文件删除，替换为同名目录（让 OpenOptions::append 失败）。
+    fn replace_file_with_dir(path: &Path) {
+        if path.exists() {
+            fs::remove_file(path).expect("test setup: remove file");
+        }
+        fs::create_dir(path).expect("test setup: create dir at file path");
+    }
+
+    /// 辅助：把 path 指向的文件删除（让 read_all 返回空 / find 失败）。
+    fn remove_file(path: &Path) {
+        if path.exists() {
+            fs::remove_file(path).expect("test setup: remove file");
+        }
+    }
+
+    #[test]
+    fn migrate_history_append_failure_reports_partial() {
+        let (dir, store, journal, history) = fixtures();
+        let plan = plan_for(dir.path(), "haf");
+        let ops = MockOps::success_path();
+        let cancel = AtomicBool::new(false);
+        // CLEANING 99 emit 是 history.append 之前最后一个 emit：在回调里把
+        // history 文件路径替换为目录，append 将无法以 append 模式打开。
+        replace_file_with_dir(&history.path);
+        let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
+        assert!(res.is_err(), "history.append 失败应传播 Err");
+        let (_e, outcome) = res.err().unwrap();
+        assert!(outcome.source_changed, "history.append 失败时 source_changed=true（已建链）");
+        assert_eq!(outcome.reason, "migrate_partial");
+    }
+
+    #[test]
+    fn migrate_journal_complete_failure_reports_partial() {
+        let (dir, store, journal, history) = fixtures();
+        let plan = plan_for(dir.path(), "jcf");
+        let ops = MockOps::success_path();
+        let cancel = AtomicBool::new(false);
+        // 在 CLEANING 99 emit 时清空 journal 文件：mark_stage "old_recycled"
+        // 失败走 let _ = 静默；history.append 走 history 文件不受影响而成功；
+        // journal.complete 时 read_all 返回空 → find 返回 None → 失败。
+        let on_progress = |e: crate::models::ProgressEvent| {
+            if e.stage == stage::CLEANING && e.percent == 99 {
+                remove_file(&journal.path);
+            }
+        };
+        let res = migrate(&ops, &store, &journal, &history, &plan, &on_progress, &cancel);
+        assert!(res.is_err(), "journal.complete 失败应传播 Err");
+        let (_e, outcome) = res.err().unwrap();
+        assert!(outcome.source_changed, "journal.complete 失败时 source_changed=true");
+        assert_eq!(outcome.reason, "migrate_partial");
+    }
+
+    #[test]
+    fn restore_remove_migration_failure_reports_partial() {
+        let (_dir, store, journal, history, mig) = restore_fixture("rmf");
+        let cancel = AtomicBool::new(false);
+        // restore 的成功路径中 store.remove_migration 是第一个命根子调用。
+        // 在 CLEANING 95 emit 时把 store.mig_path 替换为目录，load_migrations
+        // 内的 fs::read 会以 IsADirectory / AccessDenied 失败，从而失败传播。
+        // 即便 recycle 失败，upsert_migration 也是 let _ = 静默，不影响测试目标。
+        let on_progress = |e: crate::models::ProgressEvent| {
+            if e.stage == stage::CLEANING && e.percent == 95 {
+                replace_file_with_dir(&store.mig_path());
+            }
+        };
+        let res = restore(&RealFileOps, &store, &journal, &history, &mig, &on_progress, &cancel);
+        assert!(res.is_err(), "store.remove_migration 失败应传播 Err");
+        let (_e, outcome) = res.err().unwrap();
+        assert!(outcome.source_changed, "store.remove_migration 失败时 source_changed=true");
+        assert_eq!(outcome.reason, "restore_partial");
+    }
+
+    #[test]
+    fn restore_history_append_failure_reports_partial() {
+        let (_dir, store, journal, history, mig) = restore_fixture("rhaf");
+        let cancel = AtomicBool::new(false);
+        // CLEANING 95 emit 时把 history 文件路径替换为目录，让 history.append
+        // 失败。store.remove_migration 先于 history.append 且不受影响，仍 Ok。
+        let on_progress = |e: crate::models::ProgressEvent| {
+            if e.stage == stage::CLEANING && e.percent == 95 {
+                replace_file_with_dir(&history.path);
+            }
+        };
+        let res = restore(&RealFileOps, &store, &journal, &history, &mig, &on_progress, &cancel);
+        assert!(res.is_err(), "history.append 失败应传播 Err");
+        let (_e, outcome) = res.err().unwrap();
+        assert!(outcome.source_changed, "history.append 失败时 source_changed=true");
+        assert_eq!(outcome.reason, "restore_partial");
     }
 }
