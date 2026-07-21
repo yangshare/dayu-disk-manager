@@ -1,13 +1,20 @@
 use crate::models::{
     AccessState, ChildPage, Config, CurrentPhase, FastScanFailure, Migration, MigrationStatus,
-    Preset, PresetCategory, RevealLevel, RootFileSummary, ScanDiagnostics, ScanItem,
-    ScanItemStatus, ScanMode, ScanProgressEvent, ScanSource, TreeNode,
+    Preset, PresetCategory, RevealLevel, RootFileSummary, ScanDiagnostics, ScanItemStatus,
+    ScanMode, ScanProgressEvent, ScanSource, TreeNode,
 };
+#[cfg(test)]
+use crate::models::ScanItem;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use crate::mft::{enumerate_mft, MftFileReader};
@@ -61,6 +68,95 @@ fn metadata_is_reparse_point(meta: &std::fs::Metadata) -> bool {
     }
 }
 
+// ===== T9: 可注入 filesystem 读取器 =====
+
+/// 单条目录/文件条目。
+#[derive(Debug, Clone)]
+pub struct FsEntry {
+    pub name: String,
+    pub is_dir: bool,
+    /// 文件才有效，目录为 0。
+    pub file_size: u64,
+    /// reparse point 的 tag；非 reparse 为 None。
+    pub reparse_tag: Option<u32>,
+}
+
+/// 读目录时遇到的错误。
+#[derive(Debug, Clone)]
+pub enum FsEntryError {
+    AccessDenied,
+    Io { message: String },
+}
+
+/// `read_dir` 的返回项：成功条目或单条 entry 错误。
+pub type FsEntryResult = Result<FsEntry, (String, FsEntryError)>;
+
+/// 可注入的文件系统读取器，便于测试 AccessDenied/reparse/IO 错误。
+pub trait FsReader: Send + Sync {
+    /// 读目录条目。
+    ///
+    /// 外层 `Err` 表示整目录失败（AccessDenied 或其他 IO）；
+    /// 内层 `Result` 表示单个条目的成功/失败，用于把普通 entry 错误
+    /// 计入诊断而不是静默标 Accessible。
+    #[allow(clippy::type_complexity)]
+    fn read_dir(&self, path: &str) -> Result<Vec<FsEntryResult>, FsEntryError>;
+}
+
+/// 生产实现：使用 `std::fs::read_dir` + `symlink_metadata`，不跟随 reparse target。
+pub struct RealFsReader;
+
+impl FsReader for RealFsReader {
+    #[allow(clippy::type_complexity)]
+    fn read_dir(&self, path: &str) -> Result<Vec<FsEntryResult>, FsEntryError> {
+        let entries = std::fs::read_dir(path).map_err(|e| map_io_error(e.kind(), e.raw_os_error()))?;
+        let mut result = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    result.push(Err((String::new(), FsEntryError::Io { message: e.to_string() })));
+                    continue;
+                }
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let meta = match std::fs::symlink_metadata(entry.path()) {
+                Ok(m) => m,
+                Err(e) => {
+                    result.push(Err((
+                        name,
+                        map_io_error(e.kind(), e.raw_os_error()),
+                    )));
+                    continue;
+                }
+            };
+            let is_dir = meta.is_dir();
+            let file_size = if is_dir { 0 } else { meta.len() };
+            let reparse_tag = if metadata_is_reparse_point(&meta) {
+                Some(u32::MAX)
+            } else {
+                None
+            };
+            result.push(Ok(FsEntry {
+                name,
+                is_dir,
+                file_size,
+                reparse_tag,
+            }));
+        }
+        Ok(result)
+    }
+}
+
+fn map_io_error(kind: std::io::ErrorKind, raw: Option<i32>) -> FsEntryError {
+    if kind == std::io::ErrorKind::PermissionDenied || raw == Some(5) {
+        FsEntryError::AccessDenied
+    } else {
+        FsEntryError::Io {
+            message: std::io::Error::from(kind).to_string(),
+        }
+    }
+}
+
 /// 展开 %USERPROFILE%/%LOCALAPPDATA%/%APPDATA% 占位。
 pub fn expand_env(p: &str) -> String {
     let mut out = p.to_string();
@@ -85,6 +181,7 @@ pub(crate) fn normalize(p: &str) -> String {
     p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
+#[cfg(test)]
 fn is_descendant(path: &str, parent: &str) -> bool {
     let path = normalize(path);
     let parent = normalize(parent);
@@ -97,6 +194,7 @@ fn represents_migrated_link(status: &MigrationStatus) -> bool {
 }
 
 /// 合并迁移记录，使所有扫描调用方得到一致的状态和迁移资格判断。
+#[cfg(test)]
 pub fn annotate_migrations(
     items: &mut [ScanItem],
     migrations: &[Migration],
@@ -148,6 +246,7 @@ pub fn annotate_migrations(
 }
 
 pub(crate) struct ScanContext {
+    #[cfg(test)]
     exclude: Vec<String>,
     preset_by_path: HashMap<String, usize>,
     min_bytes: u64,
@@ -155,7 +254,8 @@ pub(crate) struct ScanContext {
 
 impl ScanContext {
     pub(crate) fn new(cfg: &Config) -> Self {
-        let exclude = cfg
+        #[cfg(test)]
+        let exclude: Vec<String> = cfg
             .scan
             .exclude_paths
             .iter()
@@ -177,12 +277,14 @@ impl ScanContext {
         }
 
         Self {
+            #[cfg(test)]
             exclude,
             preset_by_path,
             min_bytes: cfg.scan.min_size_mb.saturating_mul(1024 * 1024),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn excluded(&self, normalized_path: &str) -> bool {
         is_path_excluded(normalized_path, &self.exclude)
     }
@@ -496,14 +598,17 @@ pub fn build_root_summary(graph: &DirectoryGraph, skipped_records: u64) -> RootF
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg(test)]
 pub struct ScanStats {
     pub scanned_dirs: u64,
     pub scanned_files: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ScanCancelled;
 
+#[cfg(test)]
 pub struct ScanOutput {
     pub items: Vec<ScanItem>,
     pub stats: ScanStats,
@@ -511,6 +616,7 @@ pub struct ScanOutput {
 
 /// Scan several roots with one precomputed matcher. The callback is invoked during
 /// traversal; callers can throttle expensive IPC/event work at the boundary.
+#[cfg(test)]
 pub fn scan_roots_with_control(
     roots: &[PathBuf],
     cfg: &Config,
@@ -532,6 +638,7 @@ pub fn scan_roots_with_control(
     Ok(output)
 }
 
+#[cfg(test)]
 fn scan_root(
     root: &Path,
     cfg: &Config,
@@ -631,6 +738,7 @@ fn scan_root(
 }
 
 /// 单次后序遍历 root，返回大于阈值或命中预设的项。
+#[cfg(test)]
 pub fn scan(root: &Path, cfg: &Config) -> Vec<ScanItem> {
     let cancel = AtomicBool::new(false);
     scan_roots_with_control(&[root.to_path_buf()], cfg, &cancel, &mut |_, _| {})
@@ -638,6 +746,7 @@ pub fn scan(root: &Path, cfg: &Config) -> Vec<ScanItem> {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn push_if_big_or_preset(
     items: &mut Vec<ScanItem>,
     path: &Path,
@@ -669,6 +778,7 @@ fn push_if_big_or_preset(
     });
 }
 
+#[cfg(test)]
 fn junction_item(path: &Path) -> ScanItem {
     ScanItem {
         path: path.to_string_lossy().into(),
@@ -687,6 +797,7 @@ fn junction_item(path: &Path) -> ScanItem {
     }
 }
 
+#[cfg(test)]
 fn inaccessible_item(path: &Path) -> ScanItem {
     ScanItem {
         path: path.to_string_lossy().into(),
@@ -1106,31 +1217,82 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
     let reachable_count = nodes.values().filter(|n| n.reachable_from_root).count() as u64;
     diagnostics.unreachable_nodes = (nodes.len() as u64).saturating_sub(reachable_count);
 
-    // ===== Phase 4：排除子树标记（在路径构建之后、后序聚合之前） =====
-    for node in nodes.values_mut() {
+    let mut graph = DirectoryGraph {
+        nodes,
+        root: root_file_ref,
+        children: children_index,
+        system_metadata_size_bytes,
+        diagnostics,
+        excluded_subtree_size_bytes: 0,
+    };
+
+    // Phase 4/5：排除标记 + 后序聚合（抽出为独立函数供 filesystem 路径复用）。
+    aggregate_and_exclude(&mut graph, &normalized_excluded);
+
+    // F1: 从 nodes 中物理剔除 reachable_from_root == false 的节点（orphan /
+    // cycle / 缺父）；excluded 节点因其 reachable_from_root 为 true 保留在 nodes 中。
+    // F4: root_missing 时由于没有可达锚点，全部节点都是 unreachable，清空 nodes。
+    let unreachable_set: HashSet<FileRef> = graph
+        .nodes
+        .iter()
+        .filter(|(_, n)| !n.reachable_from_root)
+        .map(|(k, _)| *k)
+        .collect();
+    for r in &unreachable_set {
+        graph.nodes.remove(r);
+    }
+    // 移除孤儿边：父或子任一为 orphan 时整条边剔除；excluded 节点保留。
+    graph.children.retain(|parent, kids| {
+        !unreachable_set.contains(parent)
+            && kids.iter().all(|k| !unreachable_set.contains(k))
+    });
+    // 剔除后，剩余节点的 direct_dir_count 重算以反映实际可达子目录数。
+    for (parent, kids) in &graph.children {
+        if let Some(parent_node) = graph.nodes.get_mut(parent) {
+            parent_node.direct_dir_count = kids.len() as u32;
+        }
+    }
+
+    graph
+}
+
+/// 对 `DirectoryGraph` 执行排除标记 + 后序聚合（从 `build_graph` 抽出的 Phase 4/5）。
+///
+/// filesystem 路径在 coordinator 构好 nodes/children/root 后调用本函数，即可得到与
+/// MFT 路径一致的 `subtree_*`、`excluded`、`excluded_subtree_size_bytes` 语义。
+pub fn aggregate_and_exclude(graph: &mut DirectoryGraph, normalized_excluded: &[String]) {
+    // Phase 4：排除子树标记。
+    for node in graph.nodes.values_mut() {
         if node.path.is_empty() {
             continue;
         }
         let normalized = normalize(&node.path);
-        if is_path_excluded(&normalized, &normalized_excluded) {
+        if is_path_excluded(&normalized, normalized_excluded) {
             node.excluded = true;
         }
     }
 
-    // ===== Phase 5：后序 O(V+E) 聚合 =====
-    // 用两阶段显式栈做后序：先压 (n, false)，访问时改压 (n, true)；弹 true 时为后序。
+    // 由 children 建反向父索引，用于计算顶层 excluded 子树。
+    let mut parent_of: HashMap<FileRef, FileRef> = HashMap::new();
+    for (parent, kids) in &graph.children {
+        for kid in kids {
+            parent_of.insert(*kid, *parent);
+        }
+    }
+
+    // Phase 5：后序 O(V+E) 聚合。
     let mut post_order: Vec<FileRef> = Vec::new();
-    if !diagnostics.root_missing && nodes.contains_key(&root_file_ref) {
-        let mut stack: Vec<(FileRef, bool)> = vec![(root_file_ref, false)];
+    if graph.nodes.contains_key(&graph.root) {
+        let mut stack: Vec<(FileRef, bool)> = vec![(graph.root, false)];
         let mut visited: HashSet<FileRef> = HashSet::new();
-        visited.insert(root_file_ref);
+        visited.insert(graph.root);
         while let Some((node, processing)) = stack.pop() {
             if processing {
                 post_order.push(node);
                 continue;
             }
             stack.push((node, true));
-            if let Some(kids) = children_index.get(&node) {
+            if let Some(kids) = graph.children.get(&node) {
                 for kid in kids.iter().rev() {
                     if visited.insert(*kid) {
                         stack.push((*kid, false));
@@ -1140,19 +1302,12 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
         }
     }
 
-    // post_order：叶子在前，根在最后。
-    // 聚合规则：
-    //   - 非 excluded 节点 = 自身 direct + Σ 非 excluded 子节点.subtree
-    //     （F2: aggregate 不含的 cycle/orphan 子节点必须跳过，否则会反向污染可达父节点）
-    //   - excluded 节点 = 自身 direct + Σ 所有子节点（含 excluded 子）
-    //     （简报第 9 条：excluded 节点不下传到祖先，但 excluded 节点自身的
-    //      subtree 仍正常聚合自身 + 全部后代，用于 excluded_subtree_size_bytes）
-    // subtree_dir_count 含自身（=1+Σ）。
     let mut aggregate: HashMap<FileRef, (u64, u64, u64)> = HashMap::new();
     let mut excluded_subtree_size_bytes: u64 = 0;
 
     for node_ref in &post_order {
-        let node = nodes
+        let node = graph
+            .nodes
             .get(node_ref)
             .expect("post_order 仅含已入 nodes 的节点");
         let mut size = node.direct_file_size_bytes;
@@ -1161,14 +1316,12 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
 
         if !node.excluded {
             // 非 excluded 节点：聚合非 excluded 子的 subtree。
-            if let Some(kids) = children_index.get(node_ref) {
+            if let Some(kids) = graph.children.get(node_ref) {
                 for kid in kids {
-                    if let Some(kid_node) = nodes.get(kid) {
-                        // 排除子不下传。
+                    if let Some(kid_node) = graph.nodes.get(kid) {
                         if kid_node.excluded {
                             continue;
                         }
-                        // F2: kid 不在 aggregate（cycle/orphan/缺父）→ 跳过。
                         if let Some(&(ks, kfc, kdc)) = aggregate.get(kid) {
                             size = size.saturating_add(ks);
                             file_count = file_count.saturating_add(kfc);
@@ -1178,9 +1331,8 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
                 }
             }
         } else {
-            // F3: excluded 节点聚合全部子节点（含 excluded 子），
-            // 用于正确的 excluded_subtree_size_bytes 计数。
-            if let Some(kids) = children_index.get(node_ref) {
+            // excluded 节点聚合全部子节点（含 excluded 子），用于 excluded_subtree_size_bytes。
+            if let Some(kids) = graph.children.get(node_ref) {
                 for kid in kids {
                     if let Some(&(ks, kfc, kdc)) = aggregate.get(kid) {
                         size = size.saturating_add(ks);
@@ -1194,29 +1346,28 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
         aggregate.insert(*node_ref, (size, file_count, dir_count));
     }
 
-    // F3: 写回 subtree_* 字段。
+    // 写回 subtree_* 字段。
     for (node_ref, (size, file_count, dir_count)) in &aggregate {
-        if let Some(node) = nodes.get_mut(node_ref) {
+        if let Some(node) = graph.nodes.get_mut(node_ref) {
             node.subtree_size_bytes = *size;
             node.subtree_file_count = *file_count;
             node.subtree_dir_count = *dir_count;
         }
     }
 
-    // F3: excluded_subtree_size_bytes 只累加"顶层" excluded 节点（parent 未 excluded
-    // 或该节点为根的直接 excluded 子）的 subtree_size_bytes；下层 excluded 节点的
-    // 字节已被其祖先 excluded 节点覆盖，避免重复计数。
+    // excluded_subtree_size_bytes 只累加顶层 excluded 节点。
     for (node_ref, (size, _, _)) in &aggregate {
-        let node_is_excluded = nodes
+        let node_is_excluded = graph
+            .nodes
             .get(node_ref)
             .map(|n| n.excluded)
             .unwrap_or(false);
         if !node_is_excluded {
             continue;
         }
-        let is_top = match assigned_parent.get(node_ref) {
+        let is_top = match parent_of.get(node_ref) {
             None => true,
-            Some(p) => nodes.get(p).map(|n| !n.excluded).unwrap_or(true),
+            Some(p) => graph.nodes.get(p).map(|n| !n.excluded).unwrap_or(true),
         };
         if is_top {
             excluded_subtree_size_bytes =
@@ -1224,37 +1375,7 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
         }
     }
 
-    // F1: 从 nodes 中物理剔除 reachable_from_root == false 的节点（orphan /
-    // cycle / 缺父）；excluded 节点因其 reachable_from_root 为 true 保留在 nodes 中。
-    // F4: root_missing 时由于没有可达锚点，全部节点都是 unreachable，清空 nodes。
-    let unreachable_set: HashSet<FileRef> = nodes
-        .iter()
-        .filter(|(_, n)| !n.reachable_from_root)
-        .map(|(k, _)| *k)
-        .collect();
-    for r in &unreachable_set {
-        nodes.remove(r);
-    }
-    // 移除孤儿边：父或子任一为 orphan 时整条边剔除；excluded 节点保留。
-    children_index.retain(|parent, kids| {
-        !unreachable_set.contains(parent)
-            && kids.iter().all(|k| !unreachable_set.contains(k))
-    });
-    // 剔除后，剩余节点的 direct_dir_count 重算以反映实际可达子目录数。
-    for (parent, kids) in &children_index {
-        if let Some(parent_node) = nodes.get_mut(parent) {
-            parent_node.direct_dir_count = kids.len() as u32;
-        }
-    }
-
-    DirectoryGraph {
-        nodes,
-        root: root_file_ref,
-        children: children_index,
-        system_metadata_size_bytes,
-        diagnostics,
-        excluded_subtree_size_bytes,
-    }
+    graph.excluded_subtree_size_bytes = excluded_subtree_size_bytes;
 }
 
 // ===== TreeStore =====
@@ -1573,6 +1694,447 @@ pub fn materialize(
     )
 }
 
+// ===== T9: 有界并发 filesystem 扫描 worker / coordinator =====
+
+/// 磁盘类型，用于并发策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveKind {
+    Fixed,
+    Removable,
+    Network,
+    Other,
+}
+
+/// 根据盘符类型决定 worker 数：固定磁盘 `min(available_parallelism, 4)` 并 clamp 到 1..=8；
+/// 可移动/网络介质降到 1。
+pub fn concurrency_for(drive_type_fn: &dyn Fn(char) -> DriveKind, root_drive: char) -> usize {
+    match drive_type_fn(root_drive) {
+        DriveKind::Removable | DriveKind::Network => 1,
+        _ => {
+            let avail = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            avail.min(4).clamp(1, 8)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn win32_drive_kind(drive: char) -> DriveKind {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::core::PCWSTR;
+    // Win32 GetDriveTypeW 返回值（WinBase.h；硬编码避免引入额外 feature）：
+    //   0 = DRIVE_UNKNOWN, 1 = DRIVE_NO_ROOT_DIR, 2 = DRIVE_REMOVABLE,
+    //   3 = DRIVE_FIXED,   4 = DRIVE_REMOTE,    5 = DRIVE_CDROM,
+    //   6 = DRIVE_RAMDISK.
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    const DRIVE_REMOTE: u32 = 4;
+    let path = format!("{}:\\", drive);
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let kind = unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) };
+    match kind {
+        x if x == DRIVE_REMOVABLE => DriveKind::Removable,
+        x if x == DRIVE_REMOTE => DriveKind::Network,
+        x if x == DRIVE_FIXED => DriveKind::Fixed,
+        _ => DriveKind::Other,
+    }
+}
+
+#[cfg(not(windows))]
+fn win32_drive_kind(_drive: char) -> DriveKind {
+    DriveKind::Fixed
+}
+
+/// 为 filesystem 路径生成稳定 FileRef：同路径跨进程/跨运行一致。
+fn stable_hash_path(path: &str) -> u64 {
+    // FNV-1a：简单、稳定、无 std hash 版本依赖。
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in path.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// worker 产出的单目录观察。
+struct DirectoryObservation {
+    pub norm_path: String,
+    pub display_path: String,
+    pub parent_norm_path: Option<String>,
+    pub display_name: String,
+    pub depth: u32,
+    pub direct_files: Vec<(String, u64)>,
+    /// (子目录名, 若该 entry 本身是 reparse point 则为 Some(tag)，否则 None)
+    pub direct_dirs: Vec<(String, Option<u32>)>,
+    pub reparse_tag: Option<u32>,
+    pub access_denied: bool,
+    pub entry_errors: Vec<(String, String)>,
+}
+
+/// 等待 worker 读取的目录任务单元。
+#[derive(Clone)]
+struct DirWorkItem {
+    pub norm_path: String,
+    pub display_path: String,
+    pub parent_norm_path: Option<String>,
+    pub display_name: String,
+    pub depth: u32,
+    pub reparse_tag: Option<u32>,
+}
+
+fn process_fs_item(
+    reader: &dyn FsReader,
+    item: DirWorkItem,
+    cancel: &AtomicBool,
+) -> DirectoryObservation {
+    let item_norm_path = item.norm_path;
+    if cancel.load(Ordering::Relaxed) {
+        return DirectoryObservation {
+            norm_path: item_norm_path,
+            display_path: item.display_path,
+            parent_norm_path: item.parent_norm_path,
+            display_name: item.display_name,
+            depth: item.depth,
+            direct_files: Vec::new(),
+            direct_dirs: Vec::new(),
+            reparse_tag: item.reparse_tag,
+            access_denied: false,
+            entry_errors: Vec::new(),
+        };
+    }
+
+    // Reparse point：记录 tag 后停止下钻，不读其 target 内容。
+    if item.reparse_tag.is_some() {
+        return DirectoryObservation {
+            norm_path: item_norm_path,
+            display_path: item.display_path,
+            parent_norm_path: item.parent_norm_path,
+            display_name: item.display_name,
+            depth: item.depth,
+            direct_files: Vec::new(),
+            direct_dirs: Vec::new(),
+            reparse_tag: item.reparse_tag,
+            access_denied: false,
+            entry_errors: Vec::new(),
+        };
+    }
+
+    match reader.read_dir(&item_norm_path) {
+        Err(FsEntryError::AccessDenied) => DirectoryObservation {
+            norm_path: item_norm_path,
+            display_path: item.display_path,
+            parent_norm_path: item.parent_norm_path,
+            display_name: item.display_name,
+            depth: item.depth,
+            direct_files: Vec::new(),
+            direct_dirs: Vec::new(),
+            reparse_tag: None,
+            access_denied: true,
+            entry_errors: Vec::new(),
+        },
+        Err(FsEntryError::Io { message }) => DirectoryObservation {
+            norm_path: item_norm_path,
+            display_path: item.display_path,
+            parent_norm_path: item.parent_norm_path,
+            display_name: item.display_name,
+            depth: item.depth,
+            direct_files: Vec::new(),
+            direct_dirs: Vec::new(),
+            reparse_tag: None,
+            access_denied: false,
+            entry_errors: vec![(String::new(), message)],
+        },
+        Ok(entries) => {
+            let mut direct_files = Vec::new();
+            let mut direct_dirs = Vec::new();
+            let mut entry_errors = Vec::new();
+            for entry_result in entries {
+                match entry_result {
+                    Ok(entry) => {
+                        if entry.is_dir {
+                            direct_dirs.push((entry.name, entry.reparse_tag));
+                        } else {
+                            direct_files.push((entry.name, entry.file_size));
+                        }
+                    }
+                    Err((name, err)) => {
+                        let msg = match err {
+                            FsEntryError::AccessDenied => "AccessDenied".to_string(),
+                            FsEntryError::Io { message } => message,
+                        };
+                        entry_errors.push((name, msg));
+                    }
+                }
+            }
+            DirectoryObservation {
+                norm_path: item_norm_path,
+                display_path: item.display_path,
+                parent_norm_path: item.parent_norm_path,
+                display_name: item.display_name,
+                depth: item.depth,
+                direct_files,
+                direct_dirs,
+                reparse_tag: None,
+                access_denied: false,
+                entry_errors,
+            }
+        }
+    }
+}
+
+fn fs_worker(
+    reader: Arc<dyn FsReader>,
+    queue: Arc<WorkQueue>,
+    obs_tx: mpsc::Sender<DirectoryObservation>,
+    cancel: Arc<AtomicBool>,
+) {
+    loop {
+        let item = {
+            let mut q = queue.queue.lock().unwrap();
+            loop {
+                if cancel.load(Ordering::Relaxed) || queue.closed.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(item) = q.pop_front() {
+                    break item;
+                }
+                let result = queue
+                    .cvar
+                    .wait_timeout(q, Duration::from_millis(100))
+                    .unwrap();
+                q = result.0;
+            }
+        };
+        let obs = process_fs_item(reader.as_ref(), item, &cancel);
+        if obs_tx.send(obs).is_err() {
+            return;
+        }
+    }
+}
+
+struct WorkQueue {
+    queue: Mutex<VecDeque<DirWorkItem>>,
+    cvar: Condvar,
+    closed: AtomicBool,
+}
+
+/// 有界并发 coordinator：worker 只产观察，单线程构图 + 聚合。
+fn coordinator_run(
+    reader: Arc<dyn FsReader>,
+    root_drive: char,
+    excluded_paths: &[String],
+    worker_count: usize,
+    cancel: Arc<AtomicBool>,
+    on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
+) -> Result<(DirectoryGraph, u64, u64), ScanDriveError> {
+    let normalized_excluded: Vec<String> = excluded_paths
+        .iter()
+        .filter_map(|p| {
+            let normalized = normalize(&expand_env(p));
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect();
+
+    let worker_count = worker_count.clamp(1, 8);
+    let queue_capacity = worker_count.saturating_mul(4).max(1);
+    let queue = Arc::new(WorkQueue {
+        queue: Mutex::new(VecDeque::new()),
+        cvar: Condvar::new(),
+        closed: AtomicBool::new(false),
+    });
+    let (obs_tx, obs_rx) = mpsc::channel::<DirectoryObservation>();
+
+    let root_norm = normalize(&format!("{}:\\", root_drive));
+    let root_display = format!("{}:\\", root_drive);
+    {
+        let mut q = queue.queue.lock().unwrap();
+        q.push_back(DirWorkItem {
+            norm_path: root_norm.clone(),
+            display_path: root_display.clone(),
+            parent_norm_path: None,
+            display_name: root_drive.to_string(),
+            depth: 0,
+            reparse_tag: None,
+        });
+    }
+    queue.cvar.notify_all();
+
+    for _ in 0..worker_count {
+        let reader = reader.clone();
+        let queue = queue.clone();
+        let obs_tx = obs_tx.clone();
+        let cancel = cancel.clone();
+        thread::spawn(move || fs_worker(reader, queue, obs_tx, cancel));
+    }
+    drop(obs_tx);
+
+    let mut graph = DirectoryGraph {
+        nodes: HashMap::new(),
+        root: FileRef {
+            record_no: stable_hash_path(&root_norm),
+            sequence: 1,
+        },
+        children: HashMap::new(),
+        system_metadata_size_bytes: 0,
+        diagnostics: GraphDiagnostics::default(),
+        excluded_subtree_size_bytes: 0,
+    };
+    let mut path_to_ref: HashMap<String, FileRef> = HashMap::new();
+    let mut pending_dirs: VecDeque<DirWorkItem> = VecDeque::new();
+    let mut outstanding: usize = 1; // 根已入队
+    let mut scanned_files: u64 = 0;
+    let mut entry_errors: u64 = 0;
+    let mut completed: u64 = 0;
+    let progress_interval: u64 = 4096;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            pending_dirs.clear();
+            queue.closed.store(true, Ordering::Relaxed);
+            queue.cvar.notify_all();
+            while obs_rx.recv_timeout(Duration::from_millis(100)).is_ok() {}
+            return Err(ScanDriveError::Cancelled);
+        }
+
+        // 尽量把 pending 目录推进有界队列。
+        while let Some(item) = pending_dirs.front() {
+            let item = item.clone();
+            let mut q = queue.queue.lock().unwrap();
+            if q.len() >= queue_capacity {
+                break;
+            }
+            q.push_back(item);
+            pending_dirs.pop_front();
+            queue.cvar.notify_one();
+        }
+
+        match obs_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(obs) => {
+                outstanding = outstanding.saturating_sub(1);
+
+                let file_ref = FileRef {
+                    record_no: stable_hash_path(&obs.norm_path),
+                    sequence: 1,
+                };
+                path_to_ref.insert(obs.norm_path.clone(), file_ref);
+
+                let direct_file_size_bytes = obs
+                    .direct_files
+                    .iter()
+                    .map(|(_, size)| *size)
+                    .fold(0u64, u64::saturating_add);
+                let direct_file_count = obs.direct_files.len() as u64;
+                scanned_files = scanned_files.saturating_add(direct_file_count);
+
+                let node = DirectoryNode {
+                    file_ref,
+                    path: obs.display_path.clone(),
+                    display_name: obs.display_name,
+                    depth: obs.depth,
+                    reparse_tag: obs.reparse_tag,
+                    is_junction: false,
+                    matched_preset: None,
+                    category: None,
+                    auto_migrate: false,
+                    access_state: if obs.access_denied {
+                        AccessState::Inaccessible
+                    } else {
+                        AccessState::Unknown
+                    },
+                    scan_status: None,
+                    migration_id: None,
+                    linked_target_size_bytes: None,
+                    visible: false,
+                    direct_file_size_bytes,
+                    direct_file_count,
+                    direct_dir_count: obs.direct_dirs.len() as u32,
+                    subtree_size_bytes: 0,
+                    subtree_file_count: 0,
+                    subtree_dir_count: 0,
+                    excluded: false,
+                    reachable_from_root: true,
+                };
+                graph.nodes.insert(file_ref, node);
+
+                // entry_errors 计数（非 AccessDenied，AccessDenied 已转 access_state）。
+                entry_errors = entry_errors.saturating_add(obs.entry_errors.len() as u64);
+
+                if let Some(parent_norm) = obs.parent_norm_path {
+                    if let Some(parent_ref) = path_to_ref.get(&parent_norm) {
+                        graph
+                            .children
+                            .entry(*parent_ref)
+                            .or_default()
+                            .push(file_ref);
+                    }
+                } else {
+                    graph.root = file_ref;
+                }
+
+                // 非 reparse / 非 AccessDenied 才继续下钻子目录。
+                if obs.reparse_tag.is_none() && !obs.access_denied {
+                    for (dir_name, child_reparse) in &obs.direct_dirs {
+                        let child_display = if obs.display_path.ends_with('\\') {
+                            format!("{}{}", obs.display_path, dir_name)
+                        } else {
+                            format!("{}\\{}", obs.display_path, dir_name)
+                        };
+                        let child_norm = normalize(&child_display);
+                        pending_dirs.push_back(DirWorkItem {
+                            norm_path: child_norm,
+                            display_path: child_display,
+                            parent_norm_path: Some(obs.norm_path.clone()),
+                            display_name: dir_name.clone(),
+                            depth: obs.depth + 1,
+                            reparse_tag: *child_reparse,
+                        });
+                        outstanding = outstanding.saturating_add(1);
+                    }
+                }
+
+                completed = completed.saturating_add(1);
+                if completed.is_multiple_of(progress_interval) {
+                    on_progress(ScanProgressEvent {
+                        scanned_records: 0,
+                        scanned_dirs: completed,
+                        scanned_files,
+                        estimated_record_slots: 0,
+                        current_phase: CurrentPhase::WalkingFs,
+                    });
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let q = queue.queue.lock().unwrap();
+                if outstanding == 0 && pending_dirs.is_empty() && q.is_empty() {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    queue.closed.store(true, Ordering::Relaxed);
+    queue.cvar.notify_all();
+    while obs_rx.recv_timeout(Duration::from_millis(100)).is_ok() {}
+
+    // 稳定 sibling 顺序：按 display_name 排序，保证测试可重复。
+    let graph_ref = &mut graph;
+    for kids in graph_ref.children.values_mut() {
+        kids.sort_by_key(|fr| {
+            graph_ref
+                .nodes
+                .get(fr)
+                .map(|n| n.display_name.clone())
+                .unwrap_or_default()
+        });
+    }
+
+    aggregate_and_exclude(graph_ref, &normalized_excluded);
+
+    Ok((graph, scanned_files, entry_errors))
+}
+
 // ===== T7：结构化扫描引擎 =====
 
 /// 扫描任务内部错误，commands 层映射为 `ScanDriveResult`。
@@ -1620,7 +2182,7 @@ impl ScanEngine for RealScanEngine {
     ) -> Result<ScanOutcome, ScanDriveError> {
         match mode {
             ScanMode::Auto | ScanMode::Mft => self.mft_scan(root_drive, &cfg, &migrations, &excluded_paths, cancel, on_progress),
-            ScanMode::Filesystem => self.fs_scan(&cfg, &migrations, cancel, on_progress),
+            ScanMode::Filesystem => self.fs_scan(root_drive, &cfg, &migrations, &excluded_paths, cancel, on_progress),
         }
     }
 }
@@ -1718,45 +2280,103 @@ impl RealScanEngine {
 
     fn fs_scan(
         &self,
+        root_drive: char,
         cfg: &Config,
         migrations: &[Migration],
+        excluded_paths: &[String],
         cancel: Arc<AtomicBool>,
         on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
     ) -> Result<ScanOutcome, ScanDriveError> {
-        let mut roots = vec![];
-        if let Some(home) = dirs::home_dir() {
-            roots.push(home);
-        }
-        roots.push(PathBuf::from("C:/Program Files"));
-
-        let on_progress = on_progress.clone();
-        let mut last_stats = ScanStats::default();
-        let mut output = scan_roots_with_control(&roots, cfg, cancel.as_ref(), &mut |stats, _path| {
-            last_stats = *stats;
-            on_progress(ScanProgressEvent {
-                scanned_records: 0,
-                scanned_dirs: stats.scanned_dirs,
-                scanned_files: stats.scanned_files,
-                estimated_record_slots: 0,
-                current_phase: CurrentPhase::WalkingFs,
-            });
-        })
-        .map_err(|_| ScanDriveError::Cancelled)?;
-
-        annotate_migrations(
-            &mut output.items,
+        self.fs_scan_with_reader(
+            root_drive,
+            cfg,
             migrations,
-            &|source| junction::verify(source),
-            &dir_size,
-        );
+            excluded_paths,
+            cancel,
+            on_progress,
+            Arc::new(RealFsReader),
+            &win32_drive_kind,
+        )
+    }
 
-        output.items.sort_unstable_by_key(|item| {
-            let managed_priority = u8::from(item.migration_id.is_some());
-            (std::cmp::Reverse(managed_priority), std::cmp::Reverse(item.size_bytes))
+    #[allow(clippy::too_many_arguments)]
+    fn fs_scan_with_reader(
+        &self,
+        root_drive: char,
+        cfg: &Config,
+        migrations: &[Migration],
+        excluded_paths: &[String],
+        cancel: Arc<AtomicBool>,
+        on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
+        reader: Arc<dyn FsReader>,
+        drive_type_fn: &dyn Fn(char) -> DriveKind,
+    ) -> Result<ScanOutcome, ScanDriveError> {
+        on_progress(ScanProgressEvent {
+            scanned_records: 0,
+            scanned_dirs: 0,
+            scanned_files: 0,
+            estimated_record_slots: 0,
+            current_phase: CurrentPhase::WalkingFs,
         });
 
+        let worker_count = concurrency_for(drive_type_fn, root_drive);
+        let (mut graph, scanned_files, entry_errors) = coordinator_run(
+            reader,
+            root_drive,
+            excluded_paths,
+            worker_count,
+            cancel.clone(),
+            on_progress.clone(),
+        )?;
+
+        on_progress(ScanProgressEvent {
+            scanned_records: 0,
+            scanned_dirs: graph.nodes.len() as u64,
+            scanned_files,
+            estimated_record_slots: 0,
+            current_phase: CurrentPhase::Annotating,
+        });
+
+        // 标注阶段只取副作用（preset/visible/excluded 等），丢弃其 RootFileSummary。
+        let _ = annotate_graph_with_callbacks(
+            &mut graph,
+            cfg,
+            migrations,
+            &junction::exists,
+            &|source| junction::verify(source),
+            &dir_size,
+            0,
+        );
+
+        // filesystem 降级路径自构 RootFileSummary：无系统元数据，结果不完整。
+        let (root_direct_size, root_direct_count) = graph
+            .nodes
+            .get(&graph.root)
+            .map(|n| (n.direct_file_size_bytes, n.direct_file_count))
+            .unwrap_or((0, 0));
+        let root_summary = RootFileSummary {
+            direct_file_size_bytes: root_direct_size,
+            direct_file_count: root_direct_count,
+            system_metadata_size_bytes: None,
+            total_known_size_bytes: root_direct_size,
+            incomplete: true,
+        };
+
         let scan_id = generate_scan_id();
-        let (store, diagnostics) = tree_store_from_scan_items(output.items, output.stats, scan_id);
+        let store = materialize(&graph,
+            root_summary,
+            ScanSource::Filesystem,
+            scan_id,
+        );
+
+        let diagnostics = ScanDiagnostics {
+            scanned_records: 0,
+            scanned_dirs: graph.nodes.len() as u64,
+            scanned_files,
+            skipped_records: entry_errors,
+            orphan_entries: graph.orphan_count(),
+            hard_link_entries: 0,
+        };
 
         Ok(ScanOutcome {
             store: Arc::new(store),
@@ -1770,90 +2390,6 @@ fn generate_scan_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos().to_string())
         .unwrap_or_else(|_| "0".to_string())
-}
-
-fn tree_store_from_scan_items(
-    items: Vec<ScanItem>,
-    stats: ScanStats,
-    scan_id: String,
-) -> (TreeStore, ScanDiagnostics) {
-    let root_summary = RootFileSummary {
-        direct_file_size_bytes: 0,
-        direct_file_count: 0,
-        system_metadata_size_bytes: None,
-        total_known_size_bytes: 0,
-        incomplete: true,
-    };
-
-    let mut nodes = HashMap::new();
-    let mut roots = Vec::new();
-    let mut recommended = Vec::new();
-
-    for item in &items {
-        let norm_path = normalize(&item.path);
-        let is_reparse = item.is_junction;
-        let tree_node = TreeNode {
-            path: item.path.clone(),
-            display_name: item.display_name.clone(),
-            size_bytes: item.size_bytes,
-            linked_target_size_bytes: None,
-            file_count: 0,
-            dir_count: 0,
-            depth: 0,
-            is_reparse,
-            reparse_tag: None,
-            is_junction: item.is_junction,
-            access_state: if item.inaccessible {
-                AccessState::Inaccessible
-            } else {
-                AccessState::Accessible
-            },
-            matched_preset: item.matched_preset.clone(),
-            category: item.category.clone(),
-            auto_migrate: item.auto_migrate,
-            scan_status: item.scan_status.clone(),
-            migration_id: item.migration_id.clone(),
-            child_count: 0,
-            filtered_child_count: 0,
-        };
-        nodes.insert(norm_path.clone(), tree_node);
-        roots.push(norm_path.clone());
-
-        if item.matched_preset.is_some()
-            && item.scan_status.is_none()
-            && !is_reparse
-            && !item.inaccessible
-        {
-            recommended.push(norm_path.clone());
-        }
-    }
-
-    let children: HashMap<String, Vec<String>> = HashMap::new();
-    let parent: HashMap<String, String> = HashMap::new();
-    let filtered_root_count = 0;
-
-    let store = TreeStore::from_parts(
-        scan_id,
-        ScanSource::Filesystem,
-        root_summary,
-        nodes,
-        children,
-        parent,
-        roots,
-        filtered_root_count,
-        recommended,
-    );
-
-    let diagnostics = ScanDiagnostics {
-        scanned_records: 0,
-        scanned_dirs: stats.scanned_dirs,
-        scanned_files: stats.scanned_files,
-        skipped_records: 0,
-        orphan_entries: 0,
-        hard_link_entries: 0,
-    };
-
-    (store, diagnostics)
 }
 
 #[cfg(windows)]
@@ -3629,6 +4165,380 @@ mod tests {
             let page1 = store.children_page(r"C:\", 0, 0);
             assert_eq!(page1.items.len(), 1);
             assert_eq!(page1.total, 3, "total 不受 limit clamp 影响");
+        }
+    }
+
+    // ===== T9：有界并发 filesystem 降级扫描测试 =====
+    mod fs_fallback {
+        use super::*;
+        use crate::models::{ScanConfig, ScanSource};
+        use std::collections::HashMap;
+
+        #[allow(clippy::type_complexity)]
+        type MockTree = HashMap<String, Vec<FsEntryResult>>;
+
+        struct MockFsReader {
+            dirs: MockTree,
+            per_call_delay: Duration,
+        }
+
+        impl MockFsReader {
+            fn new(dirs: MockTree) -> Self {
+                Self {
+                    dirs,
+                    per_call_delay: Duration::ZERO,
+                }
+            }
+
+            fn with_delay(dirs: MockTree, per_call_delay: Duration) -> Self {
+                Self {
+                    dirs,
+                    per_call_delay,
+                }
+            }
+        }
+
+        impl FsReader for MockFsReader {
+            fn read_dir(&self, path: &str) -> Result<Vec<FsEntryResult>, FsEntryError> {
+                if !self.per_call_delay.is_zero() {
+                    std::thread::sleep(self.per_call_delay);
+                }
+                match self.dirs.get(&normalize(path)).cloned() {
+                    Some(entries) if entries.len() == 1 => match &entries[0] {
+                        // 测试约定：单条 Err((String::new(), AccessDenied)) 表示整目录访问被拒。
+                        Err((name, FsEntryError::AccessDenied)) if name.is_empty() => {
+                            Err(FsEntryError::AccessDenied)
+                        }
+                        _ => Ok(entries),
+                    },
+                    Some(entries) => Ok(entries),
+                    None => Err(FsEntryError::Io {
+                        message: format!("not found: {}", path),
+                    }),
+                }
+            }
+        }
+
+        fn entry(name: &str, is_dir: bool, size: u64) -> FsEntryResult {
+            Ok(FsEntry {
+                name: name.into(),
+                is_dir,
+                file_size: size,
+                reparse_tag: None,
+            })
+        }
+
+        fn reparse_dir(name: &str, tag: u32) -> FsEntryResult {
+            Ok(FsEntry {
+                name: name.into(),
+                is_dir: true,
+                file_size: 0,
+                reparse_tag: Some(tag),
+            })
+        }
+
+        fn err_entry(name: &str, err: FsEntryError) -> FsEntryResult {
+            Err((name.into(), err))
+        }
+
+        fn tree() -> MockTree {
+            let mut dirs = HashMap::new();
+            dirs.insert(
+                normalize("C:\\"),
+                vec![
+                    entry("pagefile.sys", false, 1024),
+                    entry("Users", true, 0),
+                    entry("ProgramData", true, 0),
+                ],
+            );
+            dirs.insert(
+                normalize("C:\\Users"),
+                vec![entry("alice", true, 0), entry("bob", true, 0)],
+            );
+            dirs.insert(
+                normalize("C:\\Users\\alice"),
+                vec![
+                    entry("docs", true, 0),
+                    entry("a.txt", false, 100),
+                    entry("b.txt", false, 200),
+                ],
+            );
+            dirs.insert(
+                normalize("C:\\Users\\alice\\docs"),
+                vec![entry("c.txt", false, 300)],
+            );
+            dirs.insert(normalize("C:\\Users\\bob"), vec![entry("d.txt", false, 400)]);
+            dirs.insert(normalize("C:\\ProgramData"), vec![]);
+            dirs
+        }
+
+        fn run_coordinator(
+            dirs: MockTree,
+            excluded_paths: &[String],
+            worker_count: usize,
+        ) -> (DirectoryGraph, u64, u64) {
+            let reader: Arc<dyn FsReader> = Arc::new(MockFsReader::new(dirs));
+            coordinator_run(
+                reader,
+                'C',
+                excluded_paths,
+                worker_count,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(|_| {}),
+            )
+            .unwrap()
+        }
+
+        fn run_fs_scan(dirs: MockTree, excluded_paths: &[String]) -> ScanOutcome {
+            let engine = RealScanEngine;
+            let cfg = Config {
+                schema_version: 1,
+                repository: "D:\\repo".into(),
+                scan: ScanConfig {
+                    min_size_mb: 0,
+                    exclude_paths: excluded_paths.to_vec(),
+                },
+                presets: Vec::new(),
+            };
+            engine
+                .fs_scan_with_reader(
+                    'C',
+                    &cfg,
+                    &[],
+                    excluded_paths,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(|_| {}),
+                    Arc::new(MockFsReader::new(dirs)),
+                    &|_| DriveKind::Fixed,
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn fs_scan_produces_real_tree_matching_mft_contract() {
+            let (graph, _, _) = run_coordinator(tree(), &[], 2);
+            assert!(graph.nodes.len() > 1);
+            assert!(!graph.children.is_empty());
+
+            let root = graph.nodes.get(&graph.root).unwrap();
+            assert_eq!(root.path, "C:\\");
+            assert_eq!(root.display_name, "C");
+
+            let users_norm = normalize("C:\\Users");
+            let users_ref = graph
+                .nodes
+                .iter()
+                .find(|(_, n)| normalize(&n.path) == users_norm)
+                .map(|(r, _)| *r)
+                .unwrap();
+            assert!(graph.children.get(&graph.root).unwrap().contains(&users_ref));
+        }
+
+        #[test]
+        fn root_id_comes_from_actual_insertion() {
+            let (graph, _, _) = run_coordinator(tree(), &[], 2);
+            let root = graph.nodes.get(&graph.root).unwrap();
+            assert_eq!(root.path, "C:\\");
+            // 根 id 不是硬编码的占位值，而是 coordinator 插入根节点后从 nodes 读取的 hash。
+            assert_eq!(graph.root.record_no, stable_hash_path(&normalize("C:\\")));
+        }
+
+        #[test]
+        fn file_count_accumulated_globally() {
+            let (graph, scanned_files, _) = run_coordinator(tree(), &[], 2);
+            assert_eq!(scanned_files, 5); // pagefile + a + b + c + d
+            let root = graph.nodes.get(&graph.root).unwrap();
+            assert_eq!(root.direct_file_count, 1); // pagefile.sys
+            assert_eq!(root.subtree_file_count, 5);
+        }
+
+        #[test]
+        fn excluded_subtree_marked() {
+            let excluded = vec!["C:\\Users\\alice".to_string()];
+            let (graph, _, _) = run_coordinator(tree(), &excluded, 2);
+            let alice_norm = normalize("C:\\Users\\alice");
+            let alice = graph
+                .nodes
+                .values()
+                .find(|n| normalize(&n.path) == alice_norm)
+                .unwrap();
+            assert!(alice.excluded);
+            assert!(!alice.visible);
+
+            let users_norm = normalize("C:\\Users");
+            let users = graph
+                .nodes
+                .values()
+                .find(|n| normalize(&n.path) == users_norm)
+                .unwrap();
+            // alice 子树不计入 Users 祖先
+            assert_eq!(users.subtree_file_count, 1); // bob/d.txt
+        }
+
+        #[test]
+        fn reparse_does_not_descend_into_target() {
+            let mut dirs = tree();
+            // 在根目录下挂一个 reparse point。worker 对每个 entry 处理：发现 reparse_tag 后
+            // 仍入图但不把它的 entry name 当作普通子目录读 target。
+            let root_entries = dirs.get_mut(&normalize("C:\\")).unwrap();
+            root_entries.push(reparse_dir("junction", 0xA0000003));
+            // 模拟 reparse target 内部的内容目录，确认不会被读取。
+            dirs.insert(
+                normalize("C:\\junction"),
+                vec![entry("inside.txt", false, 9999)],
+            );
+
+            let (graph, scanned_files, _) = run_coordinator(dirs, &[], 2);
+            let junction_norm = normalize("C:\\junction");
+            let junction = graph
+                .nodes
+                .values()
+                .find(|n| normalize(&n.path) == junction_norm);
+            assert!(junction.is_some(), "reparse 点本身应入图");
+            let junction = junction.unwrap();
+            assert_eq!(junction.reparse_tag, Some(0xA0000003));
+            // 未下钻 target，inside.txt 不入图、不计入 files。
+            assert!(!graph
+                .nodes
+                .values()
+                .any(|n| n.path == "C:\\junction\\inside.txt"));
+            assert_eq!(scanned_files, 5);
+        }
+
+        #[test]
+        fn access_denied_marked_inaccessible() {
+            let mut dirs = tree();
+            dirs.insert(
+                normalize("C:\\Users\\bob"),
+                vec![Err((String::new(), FsEntryError::AccessDenied))],
+            );
+            let (graph, _, _) = run_coordinator(dirs, &[], 2);
+            let bob_norm = normalize("C:\\Users\\bob");
+            let bob = graph
+                .nodes
+                .values()
+                .find(|n| normalize(&n.path) == bob_norm)
+                .unwrap();
+            assert_eq!(bob.access_state, AccessState::Inaccessible);
+            assert_eq!(bob.direct_dir_count, 0);
+        }
+
+        #[test]
+        fn entry_error_not_silently_accessible() {
+            let mut dirs = tree();
+            dirs.get_mut(&normalize("C:\\"))
+                .unwrap()
+                .push(err_entry(
+                    "badfile.dll",
+                    FsEntryError::Io {
+                        message: "crc error".into(),
+                    },
+                ));
+            let (graph, _, _) = run_coordinator(dirs, &[], 2);
+            // 该 entry 未产生节点，也不应把任何现有节点误标 Accessible。
+            let root = graph.nodes.get(&graph.root).unwrap();
+            assert_eq!(root.access_state, AccessState::Unknown);
+        }
+
+        #[test]
+        fn cancel_does_not_publish_partial_tree() {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let cancel_setter = cancel.clone();
+            // 每个 read_dir 强制 10ms 延迟，确保 5ms 后设置 cancel 时扫描仍在进行。
+            let reader: Arc<dyn FsReader> = Arc::new(MockFsReader::with_delay(
+                tree(),
+                Duration::from_millis(10),
+            ));
+
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(5));
+                cancel_setter.store(true, Ordering::Relaxed);
+            });
+
+            let result = coordinator_run(
+                reader,
+                'C',
+                &[],
+                2,
+                cancel,
+                Arc::new(|_| {}),
+            );
+            assert!(matches!(result, Err(ScanDriveError::Cancelled)));
+        }
+
+        #[test]
+        fn worker_count_upper_bound() {
+            let fixed = |_: char| DriveKind::Fixed;
+            let removable = |_: char| DriveKind::Removable;
+            let network = |_: char| DriveKind::Network;
+
+            let fixed_count = concurrency_for(&fixed, 'C');
+            assert!((1..=8).contains(&fixed_count));
+
+            assert_eq!(concurrency_for(&removable, 'C'), 1);
+            assert_eq!(concurrency_for(&network, 'C'), 1);
+        }
+
+        #[test]
+        fn root_file_summary_injection() {
+            let outcome = run_fs_scan(tree(), &[]);
+            let summary = outcome.store.root_file_summary();
+            assert_eq!(summary.system_metadata_size_bytes, None);
+            assert!(summary.incomplete);
+            assert_eq!(summary.direct_file_count, 1); // pagefile.sys
+            assert_eq!(summary.direct_file_size_bytes, 1024);
+            assert_eq!(summary.total_known_size_bytes, 1024);
+            assert_eq!(outcome.diagnostics.scanned_records, 0);
+            assert_eq!(outcome.diagnostics.hard_link_entries, 0);
+            assert_eq!(outcome.store.source(), ScanSource::Filesystem);
+        }
+
+        #[test]
+        fn root_direct_files_injected() {
+            let mut dirs = tree();
+            dirs.insert(
+                normalize("C:\\"),
+                vec![
+                    entry("pagefile.sys", false, 1024),
+                    entry("hiberfil.sys", false, 2048),
+                    entry("Users", true, 0),
+                    entry("ProgramData", true, 0),
+                ],
+            );
+            let outcome = run_fs_scan(dirs, &[]);
+            let summary = outcome.store.root_file_summary();
+            assert_eq!(summary.direct_file_count, 2);
+            assert_eq!(summary.direct_file_size_bytes, 3072);
+        }
+
+        #[test]
+        fn subtree_aggregation_matches_mft_semantics() {
+            // 与 T4 graph_construction_is_order_independent 同构：
+            // C:\ root.txt=100
+            // C:\Users\alice\docs\b.txt=300
+            // C:\Users\alice\a.txt=500
+            let mut dirs = HashMap::new();
+            dirs.insert(
+                normalize("C:\\"),
+                vec![
+                    entry("root.txt", false, 100),
+                    entry("Users", true, 0),
+                ],
+            );
+            dirs.insert(normalize("C:\\Users"), vec![entry("alice", true, 0)]);
+            dirs.insert(
+                normalize("C:\\Users\\alice"),
+                vec![entry("docs", true, 0), entry("a.txt", false, 500)],
+            );
+            dirs.insert(normalize("C:\\Users\\alice\\docs"), vec![entry("b.txt", false, 300)]);
+
+            let (graph, _, _) = run_coordinator(dirs, &[], 2);
+            let root = graph.nodes.get(&graph.root).unwrap();
+            assert_eq!(root.direct_file_size_bytes, 100);
+            assert_eq!(root.direct_file_count, 1);
+            assert_eq!(root.subtree_size_bytes, 900);
+            assert_eq!(root.subtree_file_count, 3);
+            assert_eq!(root.subtree_dir_count, 4); // C:\ + Users + alice + docs
         }
     }
 }
