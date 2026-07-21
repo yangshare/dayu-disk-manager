@@ -11,6 +11,78 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
+/// 在单个 write lock 内原子失效当前扫描树。
+///
+/// 取出 store（take），从取出的 store 读 source 决定 auto_rescan，
+/// 清 current_scan，emit 失效事件。即使 emit 失败，current_scan 也已清（旧 scan id stale）。
+///
+/// 调用方按 outcome.source_changed 决定**是否调**本函数：source_changed=false 不调。
+/// 本函数内部不做 source_changed 判断（它只管 take+emit）。
+fn invalidate_scan_tree(app: &AppHandle, state: &AppState, outcome: &OperationOutcome) {
+    let taken = {
+        let mut guard = state.current_scan.write().unwrap();
+        guard.take()
+    };
+    let auto_rescan = match taken {
+        Some(store) => store.source() == ScanSource::Mft,
+        None => false,
+    };
+    // emit 在锁外（避免 emit 阻塞持锁）。即使事件投递失败，旧 scan id 也已 stale。
+    let _ = app.emit(
+        "dayu://scan-invalidated",
+        ScanInvalidatedEvent {
+            reason: outcome.reason.clone(),
+            auto_rescan,
+        },
+    );
+}
+
+/// 纯函数版失效辅助：用于单元测试注入 take_fn/emit_fn。
+///
+/// take_fn 在调用方提供的 current_scan 上取 Option<Arc<TreeStore>>；
+/// emit_fn 接收 (reason, auto_rescan) 元组用于断言（emit 抛错时 fn 内部决定）。
+#[cfg(test)]
+fn invalidate_scan_tree_impl<F, G>(
+    outcome: &OperationOutcome,
+    take_fn: F,
+    mut emit_fn: G,
+) where
+    F: FnOnce() -> Option<Arc<TreeStore>>,
+    G: FnMut(&str, bool) -> Result<(), ()>,
+{
+    let taken = take_fn();
+    let auto_rescan = match taken {
+        Some(store) => store.source() == ScanSource::Mft,
+        None => false,
+    };
+    let _ = emit_fn(&outcome.reason, auto_rescan);
+}
+
+/// 把 migrator 返回的 Result<_, (AppError, OperationOutcome)> 转 AppError，
+/// 失败时若 outcome.source_changed=true 同步触发扫描树失效。
+///
+/// 调用方只接 AppError 向上抛；outcome 用于本地副作用。
+fn propagate_migrator_error(
+    app: &AppHandle,
+    state: &AppState,
+    err: (AppError, OperationOutcome),
+) -> AppError {
+    let (app_err, outcome) = err;
+    apply_outcome(&outcome, |o| invalidate_scan_tree(app, state, o));
+    app_err
+}
+
+/// 纯函数版 outcome 应用：仅当 outcome.source_changed=true 时调 on_invalidate_changed。
+/// 用于单元测试覆盖命令接线的成功/失败/部分失败三态。
+fn apply_outcome<F>(outcome: &OperationOutcome, mut on_invalidate_changed: F)
+where
+    F: FnMut(&OperationOutcome),
+{
+    if outcome.source_changed {
+        on_invalidate_changed(outcome);
+    }
+}
+
 #[tauri::command]
 pub async fn scan_drive(
     mode: ScanMode,
@@ -230,7 +302,17 @@ pub async fn start_migrate(
             *active = None;
         }
     }
-    task_result?
+
+    match task_result {
+        Ok(Ok((migration, outcome))) => {
+            if outcome.source_changed {
+                invalidate_scan_tree(&app, &state, &outcome);
+            }
+            Ok(migration)
+        }
+        Ok(Err(err)) => Err(propagate_migrator_error(&app, &state, err)),
+        Err(join_err) => Err(AppError::Store(format!("迁移任务失败: {join_err}"))),
+    }
 }
 
 #[tauri::command]
@@ -279,8 +361,17 @@ pub async fn start_restore(
             *active = None;
         }
     }
-    task_result??;
-    Ok(true)
+
+    match task_result {
+        Ok(Ok(outcome)) => {
+            if outcome.source_changed {
+                invalidate_scan_tree(&app, &state, &outcome);
+            }
+            Ok(true)
+        }
+        Ok(Err(err)) => Err(propagate_migrator_error(&app, &state, err)),
+        Err(join_err) => Err(AppError::Store(format!("还原任务失败: {join_err}"))),
+    }
 }
 
 #[tauri::command]
@@ -300,12 +391,23 @@ pub fn list_links(state: State<AppState>) -> AppResult<Vec<crate::app_state::Lin
 }
 
 #[tauri::command]
-pub fn break_link_cmd(migration_id: String, state: State<AppState>) -> AppResult<bool> {
+pub fn break_link_cmd(
+    migration_id: String,
+    app: AppHandle,
+    state: State<AppState>,
+) -> AppResult<bool> {
     let migs = state.store.load_migrations()?;
     let mig = migs.into_iter().find(|m| m.id == migration_id)
         .ok_or_else(|| AppError::Store("迁移记录不存在".into()))?;
-    migrator::break_link(&RealFileOps, &state.store, &state.history, &mig)?;
-    Ok(true)
+    match migrator::break_link(&RealFileOps, &state.store, &state.history, &mig) {
+        Ok(outcome) => {
+            if outcome.source_changed {
+                invalidate_scan_tree(&app, &state, &outcome);
+            }
+            Ok(true)
+        }
+        Err(err) => Err(propagate_migrator_error(&app, &state, err)),
+    }
 }
 
 #[tauri::command]
@@ -833,5 +935,212 @@ mod tests {
             assert!(!s.contains("shell:default"), "禁止 shell:default: {s}");
             assert!(!s.contains("process:"), "禁止 process 类 permission: {s}");
         }
+    }
+
+    // ===== T10: 文件系统操作后整树失效 =====
+
+    /// 构造合成 TreeStore 用于注入 current_scan。
+    fn synthetic_store(scan_id: &str, source: ScanSource) -> Arc<TreeStore> {
+        let summary = RootFileSummary {
+            direct_file_size_bytes: 0,
+            direct_file_count: 0,
+            system_metadata_size_bytes: None,
+            total_known_size_bytes: 0,
+            incomplete: false,
+        };
+        Arc::new(TreeStore::from_parts(
+            scan_id.into(),
+            source,
+            summary,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+            0,
+            Vec::new(),
+        ))
+    }
+
+    /// 1. 发布 ScanSource::Mft 合成 store，调失效，断言 current_scan 变 None + auto_rescan=true。
+    #[test]
+    fn invalidate_clears_published_mft_store_and_auto_rescans() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        *state.current_scan.write().unwrap() = Some(synthetic_store("old", ScanSource::Mft));
+
+        let outcome = OperationOutcome::changed("migrated");
+        let emitted = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+        let current_scan = state.current_scan.clone();
+        let emitted_c = emitted.clone();
+        invalidate_scan_tree_impl(
+            &outcome,
+            move || current_scan.write().unwrap().take(),
+            move |reason, auto_rescan| {
+                emitted_c.lock().unwrap().push((reason.to_string(), auto_rescan));
+                Ok(())
+            },
+        );
+
+        assert!(
+            state.current_scan.read().unwrap().is_none(),
+            "current_scan 应被 take 清空"
+        );
+        assert_eq!(
+            emitted.lock().unwrap().clone(),
+            vec![("migrated".to_string(), true)],
+            "auto_rescan 必须为 true（MFT 模式）"
+        );
+    }
+
+    /// 2. 发布 ScanSource::Filesystem store，调失效，断言 auto_rescan=false。
+    #[test]
+    fn invalidate_filesystem_store_no_auto_rescan() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        *state.current_scan.write().unwrap() = Some(synthetic_store("old", ScanSource::Filesystem));
+
+        let outcome = OperationOutcome::changed("migrated");
+        let emitted = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+        let current_scan = state.current_scan.clone();
+        let emitted_c = emitted.clone();
+        invalidate_scan_tree_impl(
+            &outcome,
+            move || current_scan.write().unwrap().take(),
+            move |reason, auto_rescan| {
+                emitted_c.lock().unwrap().push((reason.to_string(), auto_rescan));
+                Ok(())
+            },
+        );
+
+        assert!(state.current_scan.read().unwrap().is_none());
+        assert_eq!(
+            emitted.lock().unwrap().clone(),
+            vec![("migrated".to_string(), false)],
+            "filesystem 模式 auto_rescan=false"
+        );
+    }
+
+    /// 3. 无活跃扫描时调失效：auto_rescan=false 且不 panic。
+    #[test]
+    fn invalidate_when_no_store_no_auto_rescan() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        assert!(state.current_scan.read().unwrap().is_none());
+
+        let outcome = OperationOutcome::changed("migrated");
+        let emitted = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+        let current_scan = state.current_scan.clone();
+        let emitted_c = emitted.clone();
+        invalidate_scan_tree_impl(
+            &outcome,
+            move || current_scan.write().unwrap().take(),
+            move |reason, auto_rescan| {
+                emitted_c.lock().unwrap().push((reason.to_string(), auto_rescan));
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            emitted.lock().unwrap().clone(),
+            vec![("migrated".to_string(), false)],
+            "无 store 时 auto_rescan=false"
+        );
+    }
+
+    /// 4. emit 失败不影响 take 完成的 current_scan 清除（take 在锁内完成）。
+    #[test]
+    fn invalidate_clears_before_emit_failure() {
+        let state = temp_app_state(Arc::new(MockScanEngine::needs_elevation()));
+        *state.current_scan.write().unwrap() = Some(synthetic_store("old", ScanSource::Mft));
+
+        let outcome = OperationOutcome::changed("migrated");
+        let emitted = Arc::new(Mutex::new(false));
+        let current_scan = state.current_scan.clone();
+        let emitted_c = emitted.clone();
+        invalidate_scan_tree_impl(
+            &outcome,
+            move || current_scan.write().unwrap().take(),
+            move |_reason, _auto_rescan| {
+                *emitted_c.lock().unwrap() = true;
+                Err(())  // 模拟 emit 失败
+            },
+        );
+
+        // 关键断言：take 在锁内已完成，即使 emit 失败 current_scan 也已清。
+        assert!(state.current_scan.read().unwrap().is_none());
+        assert!(*emitted.lock().unwrap(), "emit_fn 应被调用过");
+    }
+
+    /// 5. start_migrate 成功路径（source_changed=true）应触发失效。
+    ///    通过 apply_outcome 纯函数验证命令接线语义。
+    #[test]
+    fn start_migrate_success_invalidates_tree() {
+        let outcome = OperationOutcome::changed("migrated");
+        let called = Arc::new(Mutex::new(false));
+        let called_c = called.clone();
+        apply_outcome(&outcome, move |_o| {
+            *called_c.lock().unwrap() = true;
+        });
+        assert!(*called.lock().unwrap(), "成功路径 source_changed=true 必须触发失效");
+        assert_eq!(outcome.reason, "migrated");
+    }
+
+    /// 6. start_migrate 失败但完全回滚（source_changed=false）不应触发失效。
+    #[test]
+    fn start_migrate_rolled_back_failure_does_not_invalidate() {
+        let outcome = OperationOutcome::unchanged("migrate_rolled_back");
+        let called = Arc::new(Mutex::new(false));
+        let called_c = called.clone();
+        apply_outcome(&outcome, move |_o| {
+            *called_c.lock().unwrap() = true;
+        });
+        assert!(!*called.lock().unwrap(), "完全回滚的失败不应触发失效");
+        assert_eq!(outcome.reason, "migrate_rolled_back");
+    }
+
+    /// 7. start_migrate 改名后失败（source_changed=true）必须触发失效。
+    #[test]
+    fn start_migrate_partial_failure_source_changed_invalidates() {
+        let outcome = OperationOutcome::changed("migrate_partial");
+        let called = Arc::new(Mutex::new(false));
+        let called_c = called.clone();
+        apply_outcome(&outcome, move |_o| {
+            *called_c.lock().unwrap() = true;
+        });
+        assert!(*called.lock().unwrap(), "源路径已变的失败必须触发失效");
+        assert_eq!(outcome.reason, "migrate_partial");
+    }
+
+    /// 8. start_restore 成功（source_changed=true）应触发失效。
+    #[test]
+    fn start_restore_success_invalidates() {
+        let outcome = OperationOutcome::changed("restored");
+        let called = Arc::new(Mutex::new(false));
+        let called_c = called.clone();
+        apply_outcome(&outcome, move |_o| {
+            *called_c.lock().unwrap() = true;
+        });
+        assert!(*called.lock().unwrap(), "start_restore 成功必须触发失效");
+    }
+
+    /// 9. break_link 成功（source_changed=true）应触发失效。
+    #[test]
+    fn break_link_success_invalidates() {
+        let outcome = OperationOutcome::changed("broken_link");
+        let called = Arc::new(Mutex::new(false));
+        let called_c = called.clone();
+        apply_outcome(&outcome, move |_o| {
+            *called_c.lock().unwrap() = true;
+        });
+        assert!(*called.lock().unwrap(), "break_link 成功必须触发失效");
+    }
+
+    /// 10. break_link 失败（remove_junction 失败 source_changed=false）不应失效。
+    #[test]
+    fn break_link_failure_does_not_invalidate() {
+        let outcome = OperationOutcome::unchanged("break_link_rolled_back");
+        let called = Arc::new(Mutex::new(false));
+        let called_c = called.clone();
+        apply_outcome(&outcome, move |_o| {
+            *called_c.lock().unwrap() = true;
+        });
+        assert!(!*called.lock().unwrap(), "break_link 失败 source_changed=false 不应触发失效");
     }
 }

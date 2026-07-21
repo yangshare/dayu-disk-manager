@@ -309,6 +309,45 @@ pub struct ScanProgressEvent {
     pub current_phase: CurrentPhase,
 }
 
+// ===== Operation outcome (后端内部使用) =====
+
+/// 文件系统操作的结果状态：是否改变了源路径/链接形态。
+///
+/// 简报第4条：migrator 必须返回明确的 source_changed，pending/manual-confirm
+/// 按实际路径变化决定是否失效，不能简单按 Ok/Err 猜测。
+///
+/// 成功路径：source_changed=true（路径布局已改变）。完全回滚的失败：
+/// source_changed=false。源路径已变化但记录失败等部分成功：source_changed=true。
+#[derive(Debug, Clone)]
+pub struct OperationOutcome {
+    /// 操作是否使源路径或链接形态发生实质性变化。
+    pub source_changed: bool,
+    /// 失效原因（用于事件 reason 字段）。如 "migrated"/"restored"/"broken_link"/"migrate_partial"。
+    pub reason: String,
+}
+
+impl OperationOutcome {
+    pub fn changed(reason: impl Into<String>) -> Self {
+        Self { source_changed: true, reason: reason.into() }
+    }
+
+    pub fn unchanged(reason: impl Into<String>) -> Self {
+        Self { source_changed: false, reason: reason.into() }
+    }
+}
+
+// ===== Scan invalidated event (后端 emit -> 前端) =====
+
+/// 失效事件载荷。T11/T12 监听 `dayu://scan-invalidated`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanInvalidatedEvent {
+    /// "migrated"/"restored"/"broken_link"/"migrate_partial" 等
+    pub reason: String,
+    /// 仅被取出的 store.source 为 MFT 时 true；filesystem 模式或无 store 为 false
+    pub auto_rescan: bool,
+}
+
 // ===== Precheck =====
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

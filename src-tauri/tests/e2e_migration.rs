@@ -36,7 +36,9 @@ fn full_pipeline_migrate_then_restore_preserves_data() {
         target_volume_serial: "D".into(),
     };
     let cancel = AtomicBool::new(false);
-    let m = migrator::migrate(&RealFileOps, &store, &journal, &history, &plan, &|_| {}, &cancel).unwrap();
+    // T10 ripple effect: migrate/restore now return (Migration|(), OperationOutcome)
+    // to carry source_changed；e2e 测试保留原有断言，仅解构 outcome。
+    let (m, _outcome) = migrator::migrate(&RealFileOps, &store, &journal, &history, &plan, &|_| {}, &cancel).unwrap();
     assert_eq!(m.status, MigrationStatus::Active);
 
     // junction 解析正常
@@ -47,7 +49,7 @@ fn full_pipeline_migrate_then_restore_preserves_data() {
     assert!(!plan.target.join("link/secret.bin").exists());
 
     // 还原
-    migrator::restore(&RealFileOps, &store, &journal, &history, &m, &|_| {}, &cancel).unwrap();
+    let _restore_outcome = migrator::restore(&RealFileOps, &store, &journal, &history, &m, &|_| {}, &cancel).unwrap();
     assert!(!dayu_disk_manager_lib::junction::exists(&src));
     assert!(src.join("docs/readme.md").exists(), "还原后数据完整");
 }
