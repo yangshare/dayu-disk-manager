@@ -197,11 +197,13 @@ fn migration_scan_status(migration: &Migration, link_valid: bool) -> ScanItemSta
 
 fn scan_status_priority(status: &ScanItemStatus) -> u8 {
     match status {
+        // 仅用于 matching_migration 的优先级选择。ExistingLink 不在迁移候选集中
+        //（由阶段 1 的 junction 分支单独赋值），故与 Contains 变体同归 0。
         ScanItemStatus::LinkBroken => 4,
         ScanItemStatus::MigrationPending => 3,
         ScanItemStatus::Migrated => 2,
-        ScanItemStatus::ExistingLink => 1,
-        ScanItemStatus::ContainsMigrated | ScanItemStatus::ContainsLink => 0,
+        ScanItemStatus::ExistingLink | ScanItemStatus::ContainsMigrated
+        | ScanItemStatus::ContainsLink => 0,
     }
 }
 
@@ -290,6 +292,24 @@ pub fn annotate_graph_with_callbacks(
         }
     }
 
+    // 迁移路径预索引：与 preset_by_path 同理，一次性规范化所有 represented
+    // migration 的 source，避免阶段 1 对每个节点 × 每条 migration 重复 normalize
+    // （O(V×M) 堆分配）。同一 source 可有多条 migration，保留 Vec 以便按优先级择优。
+    let mut migration_index: HashMap<String, Vec<&Migration>> = HashMap::new();
+    for migration in migrations {
+        if !represents_migrated_link(&migration.status) {
+            continue;
+        }
+        let normalized_source = normalize(&migration.source);
+        if normalized_source.is_empty() {
+            continue;
+        }
+        migration_index
+            .entry(normalized_source)
+            .or_default()
+            .push(migration);
+    }
+
     // 阶段 1：预设与 junction 分类，并为每个节点选择精确迁移状态。
     for node in graph.nodes.values_mut() {
         node.matched_preset = None;
@@ -316,18 +336,20 @@ pub fn annotate_graph_with_callbacks(
             node.is_junction = junction_exists(Path::new(&node.path));
         }
 
-        let matching_migration = migrations
-            .iter()
-            .filter(|migration| represents_migrated_link(&migration.status))
-            .filter(|migration| normalize(&migration.source) == normalized_path)
-            .map(|migration| {
-                let status = migration_scan_status(
-                    migration,
-                    link_valid(Path::new(&migration.source)),
-                );
-                (migration, status)
-            })
-            .max_by_key(|(_, status)| scan_status_priority(status));
+        let matching_migration = migration_index
+            .get(&normalized_path)
+            .and_then(|candidates| {
+                candidates
+                    .iter()
+                    .map(|&migration| {
+                        let status = migration_scan_status(
+                            migration,
+                            link_valid(Path::new(&migration.source)),
+                        );
+                        (migration, status)
+                    })
+                    .max_by_key(|(_, status)| scan_status_priority(status))
+            });
 
         if let Some((migration, status)) = matching_migration {
             node.migration_id = Some(migration.id.clone());
@@ -442,6 +464,13 @@ pub fn annotate_graph_with_callbacks(
 ///
 /// T4 的 `DirectoryGraph` 不携带 MFT skipped record，因此由调用方显式传入；
 /// `skipped_records > 0` 时结果标记为不完整。
+///
+/// **filesystem 模式语义（T9 接入时处理）：** 此处始终返回
+/// `Some(graph.system_metadata_size_bytes)`，因为 `DirectoryGraph.system_metadata_size_bytes`
+/// 是 `u64`（MFT 路径汇总 0..15 系统记录）。filesystem 降级路径没有 NTFS 系统元数据
+/// 概念，T9 接入时应让该路径返回 `None`（例如用独立标志位区分 MFT/filesystem 来源，
+/// 或在 filesystem 路径不调用本函数而由 T9 自行构造 summary）。本函数当前只服务于
+/// MFT 路径。
 pub fn build_root_summary(graph: &DirectoryGraph, skipped_records: u64) -> RootFileSummary {
     let (direct_file_size_bytes, direct_file_count) = graph
         .nodes
