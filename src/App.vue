@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { onMounted } from 'vue'
 import { RouterView, RouterLink } from 'vue-router'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -6,8 +7,20 @@ import {
   BarChart3, FolderKanban, Link2, History, Settings,
   Minus, Square, X, ShieldCheck, Sparkles,
 } from '@lucide/vue'
+import { ipc } from './ipc/invoke'
+import { useScanStore } from './stores/scan'
 
 const appWindow = isTauri() ? getCurrentWindow() : null
+const scanStore = useScanStore()
+
+onMounted(async () => {
+  await scanStore.initialize()
+  try {
+    if (await ipc.takeStartupScanIntent()) await scanStore.scan('mft')
+  } catch (startupError) {
+    scanStore.error = String(startupError)
+  }
+})
 
 function isInteractiveTarget(target: EventTarget | null) {
   return target instanceof Element

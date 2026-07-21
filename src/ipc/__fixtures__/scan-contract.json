@@ -1,0 +1,56 @@
+{
+  "scanModes": ["auto", "mft", "filesystem"],
+  "scanSources": ["mft", "filesystem"],
+  "currentPhases": ["reading_mft", "aggregating", "annotating", "walking_fs"],
+  "fastScanFailures": [
+    { "kind": "unsupported_filesystem", "actual": "exfat" },
+    { "kind": "unsupported_ntfs_version", "major": 1, "minor": 2 },
+    { "kind": "invalid_volume_data" },
+    { "kind": "root_record_missing" },
+    { "kind": "excessive_record_errors", "skipped": 1, "scanned": 2 },
+    { "kind": "io", "code": 5 },
+    { "kind": "io", "code": null }
+  ],
+  "scanDriveResults": [
+    { "kind": "needs_elevation" },
+    {
+      "kind": "fast_scan_unavailable",
+      "reason": { "kind": "invalid_volume_data" }
+    },
+    {
+      "kind": "complete",
+      "snapshot": {
+        "scanId": "fixture-scan",
+        "source": "mft",
+        "roots": [],
+        "filteredRootCount": 0,
+        "rootFileSummary": {
+          "directFileSizeBytes": 0,
+          "directFileCount": 0,
+          "systemMetadataSizeBytes": null,
+          "totalKnownSizeBytes": 0,
+          "incomplete": false
+        },
+        "diagnostics": {
+          "scannedRecords": 0,
+          "scannedDirs": 0,
+          "scannedFiles": 0,
+          "skippedRecords": 0,
+          "orphanEntries": 0,
+          "hardLinkEntries": 0
+        }
+      }
+    }
+  ],
+  "scanProgress": {
+    "scannedRecords": 1,
+    "scannedDirs": 2,
+    "scannedFiles": 3,
+    "estimatedRecordSlots": 4,
+    "currentPhase": "aggregating"
+  },
+  "invalidatedEvents": [
+    { "reason": "migrated", "autoRescan": true },
+    { "reason": "restored", "autoRescan": false }
+  ]
+}

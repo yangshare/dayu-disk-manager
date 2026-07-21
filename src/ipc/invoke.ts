@@ -1,10 +1,18 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
-  ScanItem, Migration, LinkItem, HistoryEntry, Config, PrecheckReport,
+  ScanMode, ScanDriveResult, ChildPage, RevealLevel, TreeNode,
+  Migration, LinkItem, HistoryEntry, Config, PrecheckReport,
 } from './types'
 
 export const ipc = {
-  scanDrives: () => invoke<ScanItem[]>('scan_drives'),
+  scanDrive: (mode: ScanMode) => invoke<ScanDriveResult>('scan_drive', { mode }),
+  expandNode: (scanId: string, path: string, offset: number, limit: number) =>
+    invoke<ChildPage>('expand_node', { scanId, path, offset, limit }),
+  revealNode: (scanId: string, path: string, limit: number) =>
+    invoke<RevealLevel[]>('reveal_node', { scanId, path, limit }),
+  listRecommended: (scanId: string) => invoke<TreeNode[]>('list_recommended', { scanId }),
+  restartElevated: () => invoke<boolean>('restart_elevated'),
+  takeStartupScanIntent: () => invoke<boolean>('take_startup_scan_intent'),
   cancelScan: () => invoke<boolean>('cancel_scan'),
   precheckMigrate: (src: string) => invoke<PrecheckReport>('precheck_migrate', { src }),
   startMigrate: (migrationId: string, src: string, presetId: string | null) =>
