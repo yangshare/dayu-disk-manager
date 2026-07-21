@@ -1,6 +1,6 @@
 use crate::models::{
-    AccessState, Config, Migration, MigrationStatus, Preset, PresetCategory, RootFileSummary,
-    ScanItem, ScanItemStatus,
+    AccessState, ChildPage, Config, Migration, MigrationStatus, Preset, PresetCategory,
+    RevealLevel, RootFileSummary, ScanItem, ScanItemStatus, ScanSource, TreeNode,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -74,7 +74,7 @@ pub fn matches_preset(actual_path: &str, preset: &Preset) -> bool {
     })
 }
 
-fn normalize(p: &str) -> String {
+pub(crate) fn normalize(p: &str) -> String {
     p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
@@ -1243,6 +1243,321 @@ pub fn build_graph(index: &MftIndex, excluded_paths: &[String], root_drive: char
     }
 }
 
+// ===== TreeStore =====
+
+/// 不可变树快照，供分页 / reveal / recommended 查询。
+#[derive(Debug, Clone)]
+pub struct TreeStore {
+    pub(crate) scan_id: String,
+    pub(crate) source: ScanSource,
+    pub(crate) root_file_summary: RootFileSummary,
+    pub(crate) nodes: HashMap<String, TreeNode>,
+    pub(crate) children: HashMap<String, Vec<String>>,
+    pub(crate) parent: HashMap<String, String>,
+    pub(crate) roots: Vec<String>,
+    pub(crate) filtered_root_count: u32,
+    pub(crate) recommended: Vec<String>,
+}
+
+impl TreeStore {
+    /// 从各分片构造 `TreeStore`。
+    pub(crate) fn from_parts(
+        scan_id: String,
+        source: ScanSource,
+        root_file_summary: RootFileSummary,
+        nodes: HashMap<String, TreeNode>,
+        children: HashMap<String, Vec<String>>,
+        parent: HashMap<String, String>,
+        roots: Vec<String>,
+        filtered_root_count: u32,
+        recommended: Vec<String>,
+    ) -> Self {
+        Self {
+            scan_id,
+            source,
+            root_file_summary,
+            nodes,
+            children,
+            parent,
+            roots,
+            filtered_root_count,
+            recommended,
+        }
+    }
+
+    pub fn scan_id(&self) -> &str {
+        &self.scan_id
+    }
+
+    pub fn source(&self) -> ScanSource {
+        self.source
+    }
+
+    pub fn root_file_summary(&self) -> &RootFileSummary {
+        &self.root_file_summary
+    }
+
+    pub fn filtered_root_count(&self) -> u32 {
+        self.filtered_root_count
+    }
+
+    pub fn roots(&self) -> Vec<TreeNode> {
+        self.roots
+            .iter()
+            .filter_map(|p| self.nodes.get(p).cloned())
+            .collect()
+    }
+
+    pub fn node(&self, path: &str) -> Option<&TreeNode> {
+        self.nodes.get(&normalize(path))
+    }
+
+    pub fn children_page(&self, path: &str, offset: u32, limit: u32) -> ChildPage {
+        let limit = limit.clamp(1, 500);
+        let all = self.children.get(&normalize(path)).cloned().unwrap_or_default();
+        let total = all.len() as u32;
+        if offset >= total {
+            return ChildPage {
+                items: Vec::new(),
+                total,
+                next_offset: None,
+            };
+        }
+        let end = (offset + limit).min(total);
+        let items = all[offset as usize..end as usize]
+            .iter()
+            .filter_map(|p| self.nodes.get(p).cloned())
+            .collect();
+        let next_offset = if end < total { Some(end) } else { None };
+        ChildPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    pub fn recommended(&self) -> Vec<TreeNode> {
+        self.recommended
+            .iter()
+            .filter_map(|p| self.nodes.get(p).cloned())
+            .collect()
+    }
+
+    pub fn reveal_pages(&self, path: &str, limit: u32) -> Result<Vec<RevealLevel>, crate::error::AppError> {
+        let target_norm = normalize(path);
+        if !self.nodes.contains_key(&target_norm) {
+            return Err(crate::error::AppError::Store(format!("reveal 目标不存在: {}", path)));
+        }
+        let limit = limit.clamp(1, 500);
+
+        // 沿 parent 索引从 target 回溯到根，得到 [target, ..., 一级子]。
+        // 一级子的 parent == root_norm；root_norm 不在 nodes 中，回溯遇到它即停止
+        // （根不作为可 reveal 的层级节点，只作为第一层的 parent_path）。
+        let mut chain: Vec<String> = vec![target_norm.clone()];
+        let mut cur = target_norm.clone();
+        while let Some(p) = self.parent.get(&cur) {
+            if *p == cur {
+                break; // 防御自环
+            }
+            if !self.nodes.contains_key(p) {
+                break; // p 是根（不在 nodes），停止回溯
+            }
+            chain.push(p.clone());
+            cur = p.clone();
+        }
+        // chain: [target, ..., 一级子] -> 反转为 [一级子, ..., target]
+        chain.reverse();
+
+        let root_norm = normalize(r"c:\");
+        let root_display = r"c:\".to_string();
+        let mut levels: Vec<RevealLevel> = Vec::new();
+        for (i, child_norm) in chain.iter().enumerate() {
+            // 该层的 parent：第 0 层是根，其余层是 chain[i-1]。
+            let parent_norm = if i == 0 { root_norm.clone() } else { chain[i - 1].clone() };
+            let parent_display = if i == 0 {
+                root_display.clone()
+            } else {
+                self.nodes
+                    .get(&chain[i - 1])
+                    .map(|n| n.path.clone())
+                    .unwrap_or_else(|| chain[i - 1].clone())
+            };
+            // 定位到包含 child_norm 的实际页（目标可能不在该层第一页）。
+            let kids = self.children.get(&parent_norm).cloned().unwrap_or_default();
+            let idx = kids.iter().position(|p| p == child_norm).unwrap_or(0) as u32;
+            let page_offset = (idx / limit) * limit;
+            let page = self.children_page(&parent_display, page_offset, limit);
+            levels.push(RevealLevel { parent_path: parent_display, page });
+        }
+        Ok(levels)
+    }
+}
+
+// ===== Materialize =====
+
+/// 将 `DirectoryGraph` 物化为不可变 `TreeStore`。
+///
+/// 只保留 `visible == true` 的目录节点；
+/// 内部路径 key 使用统一的大小写无关规范化形式（`crate::scanner::normalize`）。
+pub fn materialize(
+    graph: &DirectoryGraph,
+    root_file_summary: RootFileSummary,
+    source: ScanSource,
+    scan_id: String,
+) -> TreeStore {
+    // 第 1 步：FileRef -> 规范化 path 映射（仅 visible 节点）
+    let mut ref_to_path: HashMap<FileRef, String> = HashMap::new();
+    for (fr, node) in &graph.nodes {
+        if node.visible {
+            ref_to_path.insert(*fr, normalize(&node.path));
+        }
+    }
+
+    let root_norm = normalize(r"c:\");
+
+    // 第 2 步：构建 children（size 降序，path 升序）+ parent 两个 map
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    let mut parent: HashMap<String, String> = HashMap::new();
+
+    for (parent_fr, child_frs) in &graph.children {
+        let parent_norm = if *parent_fr == graph.root {
+            root_norm.clone()
+        } else if let Some(pn) = graph.nodes.get(parent_fr) {
+            if !pn.visible {
+                continue;
+            }
+            normalize(&pn.path)
+        } else {
+            continue;
+        };
+
+        let mut visible_children: Vec<(u64, String)> = Vec::new();
+        for child_fr in child_frs {
+            if let Some(child_node) = graph.nodes.get(child_fr) {
+                if child_node.visible {
+                    let child_norm = normalize(&child_node.path);
+                    visible_children.push((child_node.subtree_size_bytes, child_norm.clone()));
+                    parent.insert(child_norm, parent_norm.clone());
+                }
+            }
+        }
+        // size 降序；同 size 用规范化 path 升序。
+        visible_children.sort_by(|a, b| {
+            b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+        });
+        let child_paths: Vec<String> = visible_children.into_iter().map(|(_, p)| p).collect();
+        children.insert(parent_norm.clone(), child_paths);
+    }
+
+    // 第 3 步：构建 nodes map（visible 节点 -> TreeNode）
+    let mut nodes: HashMap<String, TreeNode> = HashMap::new();
+    for (fr, node) in &graph.nodes {
+        if !node.visible {
+            continue;
+        }
+        let norm_path = ref_to_path.get(fr).cloned().unwrap_or_else(|| normalize(&node.path));
+        let child_list = children.get(&norm_path).cloned().unwrap_or_default();
+        let child_count = child_list.len() as u32;
+        let filtered_child_count = graph
+            .children
+            .get(fr)
+            .map(|kids| {
+                kids.iter()
+                    .filter(|c| {
+                        graph
+                            .nodes
+                            .get(c)
+                            .map(|n| !n.visible && !n.excluded)
+                            .unwrap_or(false)
+                    })
+                    .count() as u32
+            })
+            .unwrap_or(0);
+
+        nodes.insert(
+            norm_path.clone(),
+            TreeNode {
+                path: node.path.clone(),
+                display_name: node.display_name.clone(),
+                size_bytes: node.subtree_size_bytes,
+                linked_target_size_bytes: node.linked_target_size_bytes,
+                file_count: node.subtree_file_count,
+                dir_count: node.subtree_dir_count,
+                depth: node.depth,
+                is_reparse: node.reparse_tag.is_some(),
+                reparse_tag: node.reparse_tag,
+                is_junction: node.is_junction,
+                access_state: node.access_state,
+                matched_preset: node.matched_preset.clone(),
+                category: node.category.clone(),
+                auto_migrate: node.auto_migrate,
+                scan_status: node.scan_status.clone(),
+                migration_id: node.migration_id.clone(),
+                child_count,
+                filtered_child_count,
+            },
+        );
+    }
+
+    // 第 4 步：roots（direct children of root, size 降序）
+    let mut root_children: Vec<(u64, String)> = children
+        .get(&root_norm)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| nodes.get(&p).map(|n| (n.size_bytes, p)))
+        .collect();
+    root_children.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let roots: Vec<String> = root_children.into_iter().map(|(_, p)| p).collect();
+
+    // filtered_root_count: graph.children[graph.root] 中 !visible && !excluded 的子数
+    let filtered_root_count = graph
+        .children
+        .get(&graph.root)
+        .map(|kids| {
+            kids.iter()
+                .filter(|c| {
+                    graph
+                        .nodes
+                        .get(c)
+                        .map(|n| !n.visible && !n.excluded)
+                        .unwrap_or(false)
+                })
+                .count() as u32
+        })
+        .unwrap_or(0);
+
+    // 第 5 步：recommended
+    let mut recommended_candidates: Vec<(u64, String)> = Vec::new();
+    for (norm_path, node) in &nodes {
+        if node.matched_preset.is_some()
+            && node.scan_status.is_none()
+            && !node.is_reparse
+            && node.access_state != AccessState::Inaccessible
+        {
+            recommended_candidates.push((node.size_bytes, norm_path.clone()));
+        }
+    }
+    recommended_candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+    });
+    let recommended: Vec<String> = recommended_candidates
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect();
+
+    TreeStore::from_parts(
+        scan_id,
+        source,
+        root_file_summary,
+        nodes,
+        children,
+        parent,
+        roots,
+        filtered_root_count,
+        recommended,
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2711,6 +3026,268 @@ mod tests {
             assert_eq!(summary.system_metadata_size_bytes, Some(0));
             assert!(!summary.incomplete);
             assert_eq!(summary.total_known_size_bytes, 123);
+        }
+    }
+
+    // ===== T6：materialize 与 TreeStore 分页/reveal 测试 =====
+    mod materialize_tests {
+        use super::*;
+        use crate::models::{RootFileSummary, ScanSource};
+        use std::collections::HashMap;
+
+        fn fr(no: u64) -> FileRef {
+            FileRef { record_no: no, sequence: 1 }
+        }
+
+        /// 构造一个 visible 目录节点（其余字段取默认/零值）。
+        fn vnode(no: u64, path: &str, depth: u32, size: u64) -> DirectoryNode {
+            DirectoryNode {
+                file_ref: fr(no),
+                path: path.into(),
+                display_name: path.rsplit('\\').next().unwrap_or(path).into(),
+                depth,
+                reparse_tag: None,
+                is_junction: false,
+                direct_file_size_bytes: 0,
+                direct_file_count: 0,
+                direct_dir_count: 0,
+                subtree_size_bytes: size,
+                subtree_file_count: 0,
+                subtree_dir_count: 1,
+                excluded: false,
+                reachable_from_root: true,
+                matched_preset: None,
+                category: None,
+                auto_migrate: false,
+                access_state: AccessState::Unknown,
+                scan_status: None,
+                migration_id: None,
+                linked_target_size_bytes: None,
+                visible: true,
+            }
+        }
+
+        fn graph(nodes: Vec<DirectoryNode>, edges: &[(u64, u64)]) -> DirectoryGraph {
+            let mut nm = HashMap::new();
+            for n in nodes {
+                nm.insert(n.file_ref, n);
+            }
+            let mut children: HashMap<FileRef, Vec<FileRef>> = HashMap::new();
+            for &(p, c) in edges {
+                children.entry(fr(p)).or_default().push(fr(c));
+            }
+            DirectoryGraph {
+                nodes: nm,
+                root: fr(5),
+                children,
+                system_metadata_size_bytes: 0,
+                diagnostics: GraphDiagnostics::default(),
+                excluded_subtree_size_bytes: 0,
+            }
+        }
+
+        fn empty_summary() -> RootFileSummary {
+            RootFileSummary {
+                direct_file_size_bytes: 0,
+                direct_file_count: 0,
+                system_metadata_size_bytes: None,
+                total_known_size_bytes: 0,
+                incomplete: false,
+            }
+        }
+
+        #[test]
+        fn materialize_filters_invisible_nodes() {
+            let mut b = vnode(11, r"C:\B", 1, 200);
+            b.visible = false;
+            let g = graph(vec![vnode(10, r"C:\A", 1, 100), b], &[(5, 10), (5, 11)]);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            assert!(store.node(r"C:\A").is_some());
+            assert!(store.node(r"C:\B").is_none(), "不可见节点不应进入 TreeStore");
+            let roots: Vec<String> = store.roots().into_iter().map(|n| n.path).collect();
+            assert_eq!(roots, vec![r"C:\A".to_string()]);
+        }
+
+        #[test]
+        fn materialize_size_descending_with_path_tiebreak() {
+            let d = vnode(20, r"C:\D", 1, 200);
+            let a = vnode(21, r"C:\A", 1, 100);
+            let b = vnode(22, r"C:\B", 1, 100);
+            let c = vnode(23, r"C:\C", 1, 100);
+            let g = graph(vec![d, a, b, c], &[(5, 20), (5, 21), (5, 22), (5, 23)]);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            let roots: Vec<String> = store.roots().into_iter().map(|n| n.path).collect();
+            // size 降序：D(200) 第一；A/B/C 同 100，按规范化 path 升序
+            assert_eq!(
+                roots,
+                vec![
+                    r"C:\D".to_string(),
+                    r"C:\A".to_string(),
+                    r"C:\B".to_string(),
+                    r"C:\C".to_string()
+                ]
+            );
+        }
+
+        #[test]
+        fn materialize_child_count_and_filtered_count() {
+            let a = vnode(30, r"C:\A", 1, 500);
+            let a1 = vnode(31, r"C:\A\A1", 2, 100);
+            let mut a2 = vnode(32, r"C:\A\A2", 2, 50);
+            a2.visible = false; // filtered：非排除、不可见
+            let mut a3 = vnode(33, r"C:\A\A3", 2, 50);
+            a3.visible = false;
+            a3.excluded = true; // excluded：不计入 filtered
+            let g = graph(vec![a, a1, a2, a3], &[(5, 30), (30, 31), (30, 32), (30, 33)]);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            let node_a = store.node(r"C:\A").unwrap();
+            assert_eq!(node_a.child_count, 1, "只有 A1 可见");
+            assert_eq!(node_a.filtered_child_count, 1, "只有 A2 是非排除不可见");
+        }
+
+        #[test]
+        fn materialize_recommended_eligibility() {
+            let mut a = vnode(40, r"C:\A", 1, 100);
+            a.matched_preset = Some("p1".into());
+            let mut b = vnode(41, r"C:\B", 1, 100);
+            b.matched_preset = Some("p1".into());
+            b.scan_status = Some(ScanItemStatus::Migrated);
+            let mut c = vnode(42, r"C:\C", 1, 100);
+            c.matched_preset = Some("p1".into());
+            c.reparse_tag = Some(0xA0000003);
+            let mut d = vnode(43, r"C:\D", 1, 100);
+            d.matched_preset = Some("p1".into());
+            d.access_state = AccessState::Inaccessible;
+            let e = vnode(44, r"C:\E", 1, 100); // 无预设
+            let g = graph(
+                vec![a, b, c, d, e],
+                &[(5, 40), (5, 41), (5, 42), (5, 43), (5, 44)],
+            );
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            let rec: Vec<String> = store.recommended().into_iter().map(|n| n.path).collect();
+            assert_eq!(rec, vec![r"C:\A".to_string()], "只有 A 满足全部推荐条件");
+        }
+
+        #[test]
+        fn materialize_roots_and_filtered_root_count() {
+            let a = vnode(50, r"C:\A", 1, 100);
+            let mut b = vnode(51, r"C:\B", 1, 50);
+            b.visible = false; // filtered
+            let mut c = vnode(52, r"C:\C", 1, 50);
+            c.visible = false;
+            c.excluded = true;
+            let g = graph(vec![a, b, c], &[(5, 50), (5, 51), (5, 52)]);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            let roots: Vec<String> = store.roots().into_iter().map(|n| n.path).collect();
+            assert_eq!(roots, vec![r"C:\A".to_string()]);
+            assert_eq!(store.filtered_root_count(), 1, "只有 B 是非排除不可见的一级子");
+        }
+
+        #[test]
+        fn children_page_limit_clamp() {
+            let mut nodes = Vec::new();
+            let mut edges = Vec::new();
+            for i in 0..501u64 {
+                let path = format!(r"C:\N{}", i);
+                nodes.push(vnode(100 + i, &path, 1, 1000 - i));
+                edges.push((5, 100 + i));
+            }
+            let g = graph(nodes, &edges);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            let p1 = store.children_page(r"C:\", 0, 0);
+            assert_eq!(p1.items.len(), 1, "limit=0 clamp 到 1");
+            let p500 = store.children_page(r"C:\", 0, 1000);
+            assert_eq!(p500.items.len(), 500, "limit=1000 clamp 到 500");
+            assert_eq!(p500.total, 501);
+            assert_eq!(p500.next_offset, Some(500));
+        }
+
+        #[test]
+        fn children_page_offset_boundary() {
+            let a = vnode(60, r"C:\A", 1, 300);
+            let b = vnode(61, r"C:\B", 1, 200);
+            let c = vnode(62, r"C:\C", 1, 100);
+            let g = graph(vec![a, b, c], &[(5, 60), (5, 61), (5, 62)]);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            let over = store.children_page(r"C:\", 3, 10);
+            assert_eq!(over.items.len(), 0);
+            assert_eq!(over.total, 3);
+            assert_eq!(over.next_offset, None);
+            let mid = store.children_page(r"C:\", 1, 1);
+            assert_eq!(mid.items.len(), 1);
+            assert_eq!(mid.items[0].path, r"C:\B"); // size 降序 A,B,C -> offset1 是 B
+            assert_eq!(mid.next_offset, Some(2));
+        }
+
+        #[test]
+        fn reveal_pages_cross_page_chain() {
+            let a = vnode(70, r"C:\A", 1, 300);
+            let b = vnode(71, r"C:\A\B", 2, 200);
+            let t = vnode(72, r"C:\A\B\Target", 3, 100);
+            let g = graph(vec![a, b, t], &[(5, 70), (70, 71), (71, 72)]);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            let levels = store.reveal_pages(r"C:\A\B\Target", 100).unwrap();
+            assert_eq!(levels.len(), 3);
+            assert_eq!(levels[0].parent_path, r"c:\");
+            assert!(levels[0].page.items.iter().any(|n| n.path == r"C:\A"));
+            assert_eq!(levels[1].parent_path, r"C:\A");
+            assert!(levels[1].page.items.iter().any(|n| n.path == r"C:\A\B"));
+            assert_eq!(levels[2].parent_path, r"C:\A\B");
+            assert!(levels[2].page.items.iter().any(|n| n.path == r"C:\A\B\Target"));
+        }
+
+        #[test]
+        fn reveal_pages_missing_target_returns_error() {
+            let a = vnode(80, r"C:\A", 1, 100);
+            let g = graph(vec![a], &[(5, 80)]);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            assert!(store.reveal_pages(r"C:\Nope", 100).is_err());
+        }
+
+        #[test]
+        fn reveal_pages_locates_target_off_first_page() {
+            // 250 个一级子，size 递减（1000..750）确保按 size 降序后 index 与创建顺序一致。
+            // 目标 = 第 200 个子（index 199）。limit=100 -> page_offset=100（第二页 index 100..199）。
+            let mut nodes = Vec::new();
+            let mut edges = Vec::new();
+            for i in 0..250u64 {
+                let path = format!(r"C:\D{}", i);
+                nodes.push(vnode(200 + i, &path, 1, 1000 - i));
+                edges.push((5, 200 + i));
+            }
+            let target_path = format!(r"C:\D{}", 199);
+            let g = graph(nodes, &edges);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            let levels = store.reveal_pages(&target_path, 100).unwrap();
+            assert_eq!(levels.len(), 1, "一级目标只有一层");
+            assert_eq!(levels[0].parent_path, r"c:\");
+            assert_eq!(levels[0].page.items.len(), 100);
+            assert!(
+                levels[0].page.items.iter().any(|n| n.path == target_path),
+                "目标应在其所在页内被定位"
+            );
+            assert!(
+                !levels[0].page.items.iter().any(|n| n.path == r"C:\D0"),
+                "第一页首个不应出现在目标所在页"
+            );
+        }
+
+        #[test]
+        fn children_page_limit_clamp_preserves_total() {
+            // 3 个子；limit 极大被 clamp 到 500，但 total 仍为实际子数 3。
+            let a = vnode(90, r"C:\A", 1, 300);
+            let b = vnode(91, r"C:\B", 1, 200);
+            let c = vnode(92, r"C:\C", 1, 100);
+            let g = graph(vec![a, b, c], &[(5, 90), (5, 91), (5, 92)]);
+            let store = materialize(&g, empty_summary(), ScanSource::Mft, "s1".into());
+            let page = store.children_page(r"C:\", 0, 10000);
+            assert_eq!(page.items.len(), 3, "clamp 到 500 但不足 500 返回全部");
+            assert_eq!(page.total, 3);
+            assert_eq!(page.next_offset, None);
+            // limit=0 clamp 到 1，total 不受影响
+            let page1 = store.children_page(r"C:\", 0, 0);
+            assert_eq!(page1.items.len(), 1);
+            assert_eq!(page1.total, 3, "total 不受 limit clamp 影响");
         }
     }
 }

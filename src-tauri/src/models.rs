@@ -77,6 +77,14 @@ pub struct Migration {
 }
 
 // ===== Scan =====
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanSource {
+    Mft,
+    Filesystem,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanItemStatus {
@@ -104,6 +112,44 @@ pub struct RootFileSummary {
     pub system_metadata_size_bytes: Option<u64>,
     pub total_known_size_bytes: u64,
     pub incomplete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeNode {
+    pub path: String,
+    pub display_name: String,
+    pub size_bytes: u64,
+    pub linked_target_size_bytes: Option<u64>,
+    pub file_count: u64,
+    pub dir_count: u64,
+    pub depth: u32,
+    pub is_reparse: bool,
+    pub reparse_tag: Option<u32>,
+    pub is_junction: bool,
+    pub access_state: AccessState,
+    pub matched_preset: Option<String>,
+    pub category: Option<PresetCategory>,
+    pub auto_migrate: bool,
+    pub scan_status: Option<ScanItemStatus>,
+    pub migration_id: Option<String>,
+    pub child_count: u32,
+    pub filtered_child_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildPage {
+    pub items: Vec<TreeNode>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevealLevel {
+    pub parent_path: String,
+    pub page: ChildPage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

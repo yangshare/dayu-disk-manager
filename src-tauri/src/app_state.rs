@@ -1,7 +1,8 @@
 use crate::journal::Journal;
 use crate::models::JournalEntry;
+use crate::scanner::TreeStore;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::AtomicBool;
 
 /// 链接列表项（list_links 返回）。定义于此，commands.rs 复用。
@@ -26,6 +27,8 @@ pub struct AppState {
     pub cancel_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     /// 当前扫描任务的取消令牌；无任务时为 None
     pub scan_cancel_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// 当前扫描快照（None = 无活跃扫描结果）
+    pub current_scan: Arc<RwLock<Option<Arc<TreeStore>>>>,
 }
 
 /// 启动时根据 journal 恢复决策。

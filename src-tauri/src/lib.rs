@@ -17,7 +17,7 @@ pub mod process_probe;
 pub mod win32;
 
 use app_state::AppState;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -34,9 +34,12 @@ pub fn run() {
     }
 
     let state = AppState {
-        store, journal, history,
+        store,
+        journal,
+        history,
         cancel_token: Arc::new(Mutex::new(None)),
         scan_cancel_token: Arc::new(Mutex::new(None)),
+        current_scan: Arc::new(RwLock::new(None)),
     };
 
     tauri::Builder::default()
