@@ -32,8 +32,21 @@ jobs:
           else
             VERSION="v$(grep -o '"version": *"[^"]*"' src-tauri/tauri.conf.json | head -1 | sed -E 's/.*"version": *"([^"]*)".*/\1/')"
           fi
+          APP_VERSION="${VERSION#v}"
+          if ! [[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::版本必须是语义化版本（例如 v0.1.2），实际为: $VERSION"
+            exit 1
+          fi
           echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Resolved version: $VERSION"
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          echo "Resolved release version: $VERSION (app version: $APP_VERSION)"
+
+      - name: Set Tauri bundle version
+        shell: bash
+        run: |
+          # Tauri uses tauri.conf.json to name installers and set Windows file metadata.
+          # Keep the repository configuration untouched while making the pushed tag canonical.
+          printf '{"version":"%s"}\n' "$APP_VERSION" > src-tauri/tauri.release.conf.json
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -68,4 +81,4 @@ jobs:
           releaseBody: '请下载对应的 .msi 或 .exe 安装包。'
           releaseDraft: false
           prerelease: false
-          args: --target x86_64-pc-windows-msvc
+          args: --target x86_64-pc-windows-msvc --config src-tauri/tauri.release.conf.json
