@@ -54,4 +54,22 @@ describe('ProgressStage', () => {
     expect(wrapper.text()).toContain('已发现文件')
     expect(wrapper.text()).toContain('42')
   })
+
+  it('uses restore-specific labels and status copy', () => {
+    const wrapper = mount(ProgressStage, {
+      props: {
+        operation: 'restore',
+        progress: {
+          taskId: 'restore-1',
+          stage: 'removing_junction',
+          percent: 70,
+          message: '删除 junction',
+        },
+      },
+    })
+
+    expect(wrapper.text()).toContain('还原任务正在后台执行')
+    expect(wrapper.text()).toContain('移除链接')
+    expect(wrapper.text()).toContain('恢复普通目录')
+  })
 })

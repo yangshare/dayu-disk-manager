@@ -1,9 +1,9 @@
 use crate::app_state::{recover_pending_decisions, AppState};
 use crate::error::{AppError, AppResult};
-use crate::file_ops::RealFileOps;
+use crate::file_ops::{FileOps, RealFileOps};
 use crate::migrator::{self, MigratePlan};
 use crate::models::*;
-use crate::safety::{migration_conflict, precheck, Win32Probe};
+use crate::safety::{managed_root_conflict, migration_conflict, precheck, Win32Probe};
 use crate::scanner::{self, ScanDriveError, TreeStore};
 use crate::win32::{ElevationOutcome, VolumeError};
 use std::path::PathBuf;
@@ -269,6 +269,9 @@ pub async fn start_migrate(
     if let Some(conflict) = migration_conflict(&src_path, &existing) {
         return Err(AppError::Conflict(conflict));
     }
+    if let Some(conflict) = managed_root_conflict(&src_path, &cfg) {
+        return Err(AppError::Conflict(conflict));
+    }
     let preset = preset_id
         .as_ref()
         .and_then(|id| cfg.presets.iter().find(|p| &p.id == id));
@@ -360,6 +363,40 @@ pub fn cancel_migrate(state: State<AppState>) -> bool {
     false
 }
 
+/// 进程在 restore 的复制阶段前意外退出时，journal 只会停在 `created`。
+/// 该状态尚未改动 source junction；清理本次专属 tmp 后可安全重试。
+/// 其它阶段可能已移除 junction 或切换目录，必须保留给人工恢复处理。
+fn release_retryable_restore_lock<F>(
+    journal: &crate::journal::Journal,
+    migration_id: &str,
+    mut cleanup_tmp: F,
+) -> AppResult<bool>
+where
+    F: FnMut(&std::path::Path) -> AppResult<()>,
+{
+    let task_id = format!("restore-{migration_id}");
+    let pending = journal.recover_pending()?;
+    let Some(entry) = pending.into_iter().find(|entry| entry.task_id == task_id) else {
+        return Ok(false);
+    };
+
+    if entry.op != "restore" || entry.migration_id != migration_id {
+        return Err(AppError::Conflict(format!(
+            "任务 {task_id} 的 journal 记录不匹配，无法自动恢复"
+        )));
+    }
+    if entry.stage != "created" {
+        return Err(AppError::Conflict(format!(
+            "检测到中断的还原任务，当前阶段为 {}，请先处理恢复建议",
+            entry.stage
+        )));
+    }
+
+    cleanup_tmp(std::path::Path::new(&entry.tmp))?;
+    journal.cancel(&task_id)?;
+    Ok(true)
+}
+
 #[tauri::command]
 pub async fn start_restore(
     migration_id: String,
@@ -380,6 +417,26 @@ pub async fn start_restore(
             return Err(AppError::Conflict("已有迁移或还原任务正在运行".into()));
         }
         *active = Some(cancel.clone());
+    }
+    let cleanup_result = release_retryable_restore_lock(&state.journal, &migration_id, |tmp| {
+        let ops = RealFileOps;
+        if ops.is_reparse_point(tmp) {
+            return Err(AppError::Conflict(format!(
+                "中断还原的临时路径是链接，拒绝自动清理: {}",
+                tmp.display()
+            )));
+        }
+        ops.remove_tree(tmp)
+    });
+    if let Err(err) = cleanup_result {
+        let mut active = cancel_slot.lock().unwrap();
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+        {
+            *active = None;
+        }
+        return Err(err);
     }
     let task_cancel = cancel.clone();
     let store = state.store.clone();
@@ -638,6 +695,76 @@ mod tests {
 
     fn no_op_progress() -> Arc<dyn Fn(ScanProgressEvent) + Send + Sync> {
         Arc::new(|_| {})
+    }
+
+    #[test]
+    fn retryable_created_restore_lock_cleans_tmp_and_allows_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = crate::journal::Journal::new(dir.path().join("journal.jsonl")).unwrap();
+        let tmp = dir.path().join("restore-tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("partial.bin"), b"partial").unwrap();
+        journal
+            .begin(
+                "restore-m1",
+                "m1",
+                "restore",
+                "C:/source",
+                "D:/target",
+                &tmp.to_string_lossy(),
+                "C:/source.old",
+            )
+            .unwrap();
+
+        let released = release_retryable_restore_lock(&journal, "m1", |path| {
+            std::fs::remove_dir_all(path)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(released);
+        assert!(!tmp.exists());
+        assert!(journal.recover_pending().unwrap().is_empty());
+        assert!(
+            journal
+                .begin(
+                    "restore-m1",
+                    "m1",
+                    "restore",
+                    "C:/source",
+                    "D:/target",
+                    &tmp.to_string_lossy(),
+                    "C:/source.old",
+                )
+                .is_ok(),
+            "释放后同一还原任务应可重试"
+        );
+    }
+
+    #[test]
+    fn later_restore_stage_requires_manual_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = crate::journal::Journal::new(dir.path().join("journal.jsonl")).unwrap();
+        journal
+            .begin(
+                "restore-m2",
+                "m2",
+                "restore",
+                "C:/source",
+                "D:/target",
+                "C:/restore-tmp",
+                "C:/source.old",
+            )
+            .unwrap();
+        journal.mark_stage("restore-m2", "restore_copied").unwrap();
+
+        let result =
+            release_retryable_restore_lock(&journal, "m2", |_| panic!("后续阶段不应自动清理"));
+
+        assert!(
+            matches!(result, Err(AppError::Conflict(message)) if message.contains("restore_copied"))
+        );
+        assert_eq!(journal.recover_pending().unwrap().len(), 1);
     }
 
     #[test]

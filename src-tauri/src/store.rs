@@ -129,10 +129,12 @@ pub fn default_config() -> Config {
     }
 }
 
-/// 旧配置（无 presets 或为空）补齐内置 presets。
+/// 补齐后续版本新增的内置 presets，同时保留用户已有的同 ID 自定义项。
 fn ensure_presets(mut cfg: Config) -> Config {
-    if cfg.presets.is_empty() {
-        cfg.presets = default_presets();
+    for built_in in default_presets() {
+        if !cfg.presets.iter().any(|preset| preset.id == built_in.id) {
+            cfg.presets.push(built_in);
+        }
     }
     cfg
 }
@@ -234,6 +236,15 @@ pub fn default_presets() -> Vec<Preset> {
             vec![]
         ),
         p!(
+            "uv-cache",
+            "uv 缓存",
+            PresetCategory::DevCache,
+            true,
+            "uv-cache",
+            vec!["%LOCALAPPDATA%/uv/cache".into()],
+            vec![]
+        ),
+        p!(
             "jetbrains",
             "JetBrains 配置",
             PresetCategory::Ide,
@@ -293,6 +304,35 @@ mod tests {
         assert_eq!(cfg.scan.min_size_mb, 500);
         assert!(!cfg.presets.is_empty(), "默认 presets 必须被注入");
         assert!(cfg.presets.iter().any(|p| p.id == "wechat"));
+        assert!(cfg.presets.iter().any(|p| p.id == "uv-cache"));
+    }
+
+    #[test]
+    fn ensure_presets_adds_new_builtin_without_replacing_custom_definition() {
+        let mut config = default_config();
+        config.presets.retain(|preset| preset.id != "uv-cache");
+        config
+            .presets
+            .iter_mut()
+            .find(|preset| preset.id == "npm-cache")
+            .unwrap()
+            .name = "我的 npm 缓存".into();
+
+        let upgraded = ensure_presets(config);
+
+        assert!(upgraded
+            .presets
+            .iter()
+            .any(|preset| preset.id == "uv-cache"));
+        assert_eq!(
+            upgraded
+                .presets
+                .iter()
+                .find(|preset| preset.id == "npm-cache")
+                .unwrap()
+                .name,
+            "我的 npm 缓存"
+        );
     }
 
     #[test]

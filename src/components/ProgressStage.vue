@@ -4,9 +4,14 @@ import { Check, Circle, LoaderCircle } from '@lucide/vue'
 import type { ProgressEvent } from '../ipc/types'
 import { formatSize } from '../ipc/types'
 
-const props = defineProps<{ progress: ProgressEvent | null }>()
+const props = withDefaults(defineProps<{
+  progress: ProgressEvent | null
+  operation?: 'migrate' | 'restore'
+}>(), {
+  operation: 'migrate',
+})
 
-const stages = [
+const migrationStages = [
   { key: 'copying', label: '复制文件' },
   { key: 'verifying', label: '校验数据' },
   { key: 'renaming_source', label: '切换源目录' },
@@ -16,8 +21,22 @@ const stages = [
   { key: 'cleaning', label: '完成清理' },
 ]
 
+const restoreStages = [
+  { key: 'copying', label: '复制回源盘' },
+  { key: 'verifying', label: '校验数据' },
+  { key: 'removing_junction', label: '移除链接' },
+  { key: 'switching', label: '恢复普通目录' },
+  { key: 'cleaning', label: '完成清理' },
+]
+
+const stages = computed(() => props.operation === 'restore' ? restoreStages : migrationStages)
+const stageTrackStyle = computed(() => ({
+  gridTemplateColumns: `repeat(${stages.value.length}, minmax(78px, 1fr))`,
+  minWidth: `${stages.value.length * 92}px`,
+}))
+
 const currentStageIndex = computed(() => {
-  const index = stages.findIndex((stage) => stage.key === props.progress?.stage)
+  const index = stages.value.findIndex((stage) => stage.key === props.progress?.stage)
   return index < 0 ? 0 : index
 })
 
@@ -47,7 +66,7 @@ function stageState(index: number) {
       <div class="status-mark"><LoaderCircle :size="18" /></div>
       <div class="status-copy">
         <strong>{{ progress.message }}</strong>
-        <span>{{ progress.transfer?.phase === 'preparing' ? '准备阶段' : '迁移任务正在后台执行' }}</span>
+        <span>{{ progress.transfer?.phase === 'preparing' ? '准备阶段' : (operation === 'restore' ? '还原任务正在后台执行' : '迁移任务正在后台执行') }}</span>
       </div>
       <div class="percent"><strong>{{ safePercent }}%</strong><span>总进度</span></div>
     </div>
@@ -73,7 +92,7 @@ function stageState(index: number) {
     </div>
 
     <div class="stage-scroll">
-      <ol class="stage-track">
+      <ol class="stage-track" :style="stageTrackStyle">
         <li v-for="(stage, index) in stages" :key="stage.key" :class="stageState(index)">
           <span class="stage-icon">
             <Check v-if="stageState(index) === 'completed'" :size="12" />
@@ -111,7 +130,7 @@ function stageState(index: number) {
 .current-path span { color: var(--text-tertiary); font-size: 10px; white-space: nowrap; }
 .current-path code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stage-scroll { margin-top: 18px; overflow-x: auto; }
-.stage-track { display: grid; min-width: 650px; grid-template-columns: repeat(7, minmax(78px, 1fr)); margin: 0; padding: 0; list-style: none; }
+.stage-track { display: grid; margin: 0; padding: 0; list-style: none; }
 .stage-track li { position: relative; display: flex; flex-direction: column; align-items: center; gap: 7px; color: var(--text-tertiary); font-size: 10px; text-align: center; }
 .stage-track li::before { position: absolute; z-index: 0; top: 10px; right: 50%; left: -50%; height: 1px; content: ''; background: #dedee4; }
 .stage-track li:first-child::before { display: none; }

@@ -176,6 +176,25 @@ pub fn matches_preset(actual_path: &str, preset: &Preset) -> bool {
     })
 }
 
+/// 若 `actual_path` 位于预设根目录内部，返回该根目录的可读路径。
+///
+/// 应用缓存经常在根目录内以 sibling rename 的方式提交文件。只迁移其中一个
+/// 子目录会把 rename 变为跨卷操作，因此预设根目录是不可拆分的迁移边界。
+pub fn preset_root_for_descendant(actual_path: &str, preset: &Preset) -> Option<String> {
+    let actual = normalize(actual_path);
+    preset.match_paths.iter().find_map(|tmpl| {
+        let root = expand_env(tmpl)
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_string();
+        let normalized_root = normalize(&root);
+        actual
+            .strip_prefix(&normalized_root)
+            .is_some_and(|rest| rest.starts_with('\\'))
+            .then_some(root)
+    })
+}
+
 pub(crate) fn normalize(p: &str) -> String {
     p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }

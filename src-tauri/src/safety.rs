@@ -2,7 +2,7 @@
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::{Config, Migration, MigrationStatus, PrecheckReport, Preset};
-use crate::scanner::matches_preset;
+use crate::scanner::{matches_preset, preset_root_for_descendant};
 use std::path::Path;
 
 /// 系统探针抽象：盘空间、卷信息、占用进程、运行中进程。
@@ -104,6 +104,20 @@ pub fn migration_conflict(src: &Path, existing: &[Migration]) -> Option<String> 
     None
 }
 
+/// 预设的迁移根目录不可拆分。跨卷迁移其内部子目录后，应用从根目录创建的
+/// 临时文件无法再原子改名到该子目录，典型表现为 Windows `ERROR_NOT_SAME_DEVICE`。
+pub fn managed_root_conflict(src: &Path, config: &Config) -> Option<String> {
+    let src = src.to_string_lossy();
+    config.presets.iter().find_map(|preset| {
+        preset_root_for_descendant(&src, preset).map(|root| {
+            format!(
+                "源目录位于“{}”管理根目录内部，不能单独跨卷迁移；请迁移整个 {}，否则应用的原子重命名可能失败",
+                preset.name, root
+            )
+        })
+    })
+}
+
 pub fn precheck(
     src: &Path,
     config: &Config,
@@ -118,6 +132,11 @@ pub fn precheck(
 
     // 1. 重复或重叠迁移
     if let Some(conflict) = migration_conflict(src, existing) {
+        blockers.push(conflict);
+    }
+
+    // 1b. 预设路径是应用的迁移边界，不能把其内部目录单独改为跨卷 junction。
+    if let Some(conflict) = managed_root_conflict(src, config) {
         blockers.push(conflict);
     }
 
@@ -298,6 +317,72 @@ mod tests {
             &probe,
         );
         assert!(report.ok, "blockers: {:?}", report.blockers);
+    }
+
+    fn atomic_root_preset(root: &str) -> Preset {
+        Preset {
+            id: "atomic-root".into(),
+            name: "测试缓存".into(),
+            category: PresetCategory::DevCache,
+            match_paths: vec![root.into()],
+            match_processes: vec![],
+            auto_migrate: true,
+            target_subdir: "atomic-root".into(),
+        }
+    }
+
+    #[test]
+    fn blocks_child_of_managed_root_to_preserve_atomic_renames() {
+        let probe = Mock {
+            free: 10_000_000_000,
+            ntfs: true,
+            serial: "DDDD".into(),
+            locked: None,
+            running: vec![],
+        };
+        let mut config = cfg_repo("D:/Migrated");
+        config.presets = vec![atomic_root_preset("C:/Users/x/AppData/Local/uv/cache")];
+
+        let report = precheck(
+            Path::new("C:/Users/x/AppData/Local/uv/cache/archive-v0"),
+            &config,
+            &[],
+            1_000,
+            &probe,
+        );
+
+        assert!(!report.ok);
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("不能单独跨卷迁移") && blocker.contains("uv\\cache")));
+    }
+
+    #[test]
+    fn allows_the_managed_root_itself() {
+        let config = Config {
+            presets: vec![atomic_root_preset("C:/Users/x/AppData/Local/uv/cache")],
+            ..cfg_repo("D:/Migrated")
+        };
+
+        assert!(
+            managed_root_conflict(Path::new("C:/Users/x/AppData/Local/uv/cache"), &config)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn does_not_block_a_similarly_named_sibling_of_managed_root() {
+        let config = Config {
+            presets: vec![atomic_root_preset("C:/Users/x/AppData/Local/uv/cache")],
+            ..cfg_repo("D:/Migrated")
+        };
+
+        assert!(managed_root_conflict(
+            Path::new("C:/Users/x/AppData/Local/uv/cache-backup"),
+            &config
+        )
+        .is_none());
     }
 
     #[test]
