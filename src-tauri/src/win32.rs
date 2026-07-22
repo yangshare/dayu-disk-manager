@@ -763,6 +763,29 @@ pub fn read_volume_data(vol: &VolumeHandle) -> Result<VolumeData, VolumeError> {
     assemble_volume_data(bytes, bytes_returned as usize)
 }
 
+/// 当前进程可用物理内存（字节）。
+///
+/// 用于把 MFT 快速扫描的内存上限从硬编码改为按物理内存动态计算，
+/// 让大物理内存的机器也能扫大卷，同时在小内存机器上自动收紧。
+/// `GlobalMemoryStatusEx` 报告的是全机总量；进程实际可用受 OS 提交上限与
+/// 其他进程占用影响，但作为"MFT 缓冲预算"的上界已足够保守。
+/// 失败时返回 `None`，调用方退回硬下限。
+#[cfg(windows)]
+pub fn available_physical_memory_bytes() -> Option<u64> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // GlobalMemoryStatusEx 几乎不会失败（仅在 dwLength 非法时返回 FALSE）。
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok.is_err() {
+        return None;
+    }
+    Some(status.ullTotalPhys)
+}
+
 /// 读取指定文件参考号对应的 MFT 记录。
 ///
 /// - `file_reference`：请求的参考号（任意 64 位；驱动会向下取到最近的有效记录）。
@@ -968,6 +991,12 @@ pub fn read_volume_data(_vol: &VolumeHandle) -> Result<VolumeData, VolumeError> 
         code: u32::MAX,
         operation: "read_volume_data/not_windows",
     })
+}
+
+/// 非 windows 平台返回 `None`，使 MFT 缓冲预算退回硬下限。
+#[cfg(not(windows))]
+pub fn available_physical_memory_bytes() -> Option<u64> {
+    None
 }
 
 #[cfg(not(windows))]

@@ -277,7 +277,26 @@ pub struct DataRun {
 /// Fast scan keeps the raw MFT and its parsed index in memory. Refuse volumes
 /// that would exceed this bounded working set and let the caller use filesystem
 /// scanning instead.
-const MAX_IN_MEMORY_MFT_BYTES: u64 = 512 * 1024 * 1024;
+///
+/// 历史值是固定的 512MB——对开发机/游戏机那种文件数爆炸的卷（MFT 动辄 1–2GB）
+/// 一律拦截。改为按物理内存动态计算：默认取物理内存的 1/3（预留索引放大与
+/// 进程其它占用），下限保底 `MIN_IN_MEMORY_MFT_BYTES`（512MB，小内存机器也不至于
+/// 全拦），上限 `MAX_IN_MEMORY_MFT_BYTES`（避免极端机器一次性预留过多）。
+/// 查询物理内存失败时退回 `MIN_IN_MEMORY_MFT_BYTES`，保守可扫。
+const MIN_IN_MEMORY_MFT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_IN_MEMORY_MFT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// 计算 `$MFT` 缓冲的内存预算上限（字节）。
+///
+/// 快速扫描峰值约等于「原始 MFT 字节 + 解析后索引」，索引开销通常为原始
+/// 体积的 0.5–1 倍，故取物理内存的 1/3 作为缓冲上界，给索引与进程其它占用留余量。
+/// 返回值落在 `[MIN, MAX]` 之间；查询物理内存失败或非 windows 时退回 `MIN`。
+fn mft_memory_budget() -> u64 {
+    match crate::win32::available_physical_memory_bytes() {
+        Some(phys) => (phys / 3).clamp(MIN_IN_MEMORY_MFT_BYTES, MAX_IN_MEMORY_MFT_BYTES),
+        None => MIN_IN_MEMORY_MFT_BYTES,
+    }
+}
 
 /// 直接统计的文件计数与字节数（directory 直接下钻累加，非递归子目录）。
 ///
@@ -1260,7 +1279,7 @@ fn validate_volume_data(volume_data: &VolumeData) -> Result<(), MftError> {
 }
 
 fn mft_buffer_capacity(valid_len: u64) -> Result<usize, MftError> {
-    if valid_len > MAX_IN_MEMORY_MFT_BYTES {
+    if valid_len > mft_memory_budget() {
         return Err(MftError::MftTooLarge { bytes: valid_len });
     }
     usize::try_from(valid_len).map_err(|_| MftError::MftTooLarge { bytes: valid_len })
@@ -2887,12 +2906,36 @@ mod tests {
     }
 
     #[test]
-    fn mft_buffer_capacity_rejects_oversized_mft() {
-        let too_large = MAX_IN_MEMORY_MFT_BYTES + 1;
-        assert!(matches!(
-            mft_buffer_capacity(too_large),
-            Err(MftError::MftTooLarge { bytes }) if bytes == too_large
-        ));
+    fn mft_memory_budget_stays_bounded() {
+        let budget = mft_memory_budget();
+        // 无论物理内存多大，预算都夹在硬下限与硬上限之间。
+        assert!(
+            budget >= MIN_IN_MEMORY_MFT_BYTES && budget <= MAX_IN_MEMORY_MFT_BYTES,
+            "budget {budget} 越出 [{}, {}]",
+            MIN_IN_MEMORY_MFT_BYTES,
+            MAX_IN_MEMORY_MFT_BYTES
+        );
+    }
+
+    #[test]
+    fn mft_buffer_capacity_boundary_matches_dynamic_budget() {
+        // 阈值改为按物理内存动态计算后，不再用固定常量断言；
+        // 改为基于"当前平台实际预算"做边界验证，避免在不同内存规格机器上 flaky。
+        let budget = mft_memory_budget();
+
+        // 恰好等于预算上限：可扫（边界含）。
+        assert!(
+            mft_buffer_capacity(budget).is_ok(),
+            "等于预算上限 {} 应被接受",
+            budget
+        );
+        // 超过预算上限：拒绝，且 bytes 原样回传（供前端展示与降级确认）。
+        let too_large = budget + 1;
+        assert!(
+            matches!(mft_buffer_capacity(too_large),
+                     Err(MftError::MftTooLarge { bytes }) if bytes == too_large),
+            "超过预算上限应被拒绝并回传原始字节数"
+        );
     }
 
     #[test]
