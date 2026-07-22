@@ -232,6 +232,7 @@ fn minimal_snapshot() -> ScanSnapshot {
             skipped_records: 0,
             orphan_entries: 0,
             hard_link_entries: 0,
+            unresolved_extensions: 0,
         },
     }
 }

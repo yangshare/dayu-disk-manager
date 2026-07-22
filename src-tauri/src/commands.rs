@@ -723,6 +723,7 @@ mod tests {
             skipped_records: 0,
             orphan_entries: 0,
             hard_link_entries: 0,
+            unresolved_extensions: 0,
         };
         let state = temp_app_state(Arc::new(MockScanEngine::success(
             new_store.clone(),

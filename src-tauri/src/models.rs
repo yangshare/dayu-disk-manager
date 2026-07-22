@@ -132,6 +132,8 @@ pub struct ScanDiagnostics {
     pub skipped_records: u64,
     pub orphan_entries: u64,
     pub hard_link_entries: u64,
+    /// MFT 路径下循环结束仍未合并到 base 的 extension 数；filesystem 路径恒 0。
+    pub unresolved_extensions: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -374,6 +376,7 @@ mod tests {
                 skipped_records: 0,
                 orphan_entries: 0,
                 hard_link_entries: 0,
+                unresolved_extensions: 0,
             },
         }
     }
@@ -429,7 +432,8 @@ mod tests {
                         "scannedFiles": 0,
                         "skippedRecords": 0,
                         "orphanEntries": 0,
-                        "hardLinkEntries": 0
+                        "hardLinkEntries": 0,
+                        "unresolvedExtensions": 0
                     }
                 }
             })

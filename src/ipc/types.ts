@@ -116,6 +116,7 @@ export interface ScanDiagnostics {
   skippedRecords: number
   orphanEntries: number
   hardLinkEntries: number
+  unresolvedExtensions: number
 }
 
 export interface RootFileSummary {

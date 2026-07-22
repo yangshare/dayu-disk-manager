@@ -1985,6 +1985,7 @@ impl RealScanEngine {
             skipped_records: index.skipped_records,
             orphan_entries: graph.orphan_count(),
             hard_link_entries: index.hard_link_entries,
+            unresolved_extensions: index.unresolved_extensions,
         };
 
         Ok(ScanOutcome {
@@ -2102,6 +2103,7 @@ impl RealScanEngine {
             skipped_records: entry_errors,
             orphan_entries: graph.orphan_count(),
             hard_link_entries: 0,
+            unresolved_extensions: 0,
         };
 
         Ok(ScanOutcome {
@@ -2237,6 +2239,7 @@ mod tests {
                 skipped_records: 0,
                 scanned_files: 0,
                 hard_link_entries: 0,
+                unresolved_extensions: 0,
             }
         }
 

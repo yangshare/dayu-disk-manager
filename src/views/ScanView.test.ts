@@ -99,6 +99,7 @@ function snapshot(
       skippedRecords: 0,
       orphanEntries: 0,
       hardLinkEntries: 0,
+      unresolvedExtensions: 0,
     },
   }
 }

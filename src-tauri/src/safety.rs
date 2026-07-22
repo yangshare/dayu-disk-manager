@@ -160,7 +160,7 @@ pub fn precheck(
             0
         }
     };
-    let need = src_size + safety_margin(src_size);
+    let need = src_size.saturating_add(safety_margin(src_size));
     if free < need {
         blockers.push(format!(
             "目标盘空间不足：需 {} 字节（含安全余量），实有 {}",

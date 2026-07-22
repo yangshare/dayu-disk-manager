@@ -1181,6 +1181,9 @@ pub struct MftIndex {
     pub scanned_files: u64,
     /// 额外长名入口数（硬链接诊断）。
     pub hard_link_entries: u64,
+    /// 循环结束时仍未合并到 base 的 extension 记录数（base 缺失/损坏）。
+    /// 这些记录的 logical_size 没有并入任何文件，暴露损坏 MFT 的诊断缺口。
+    pub unresolved_extensions: u64,
 }
 
 /// 记录读取器抽象。
@@ -1470,12 +1473,15 @@ pub fn enumerate_mft(
         scanned_files += 1;
     }
 
+    let unresolved_extensions = pending_extensions.values().map(|v| v.len() as u64).sum();
+
     Ok(MftIndex {
         records,
         scanned_records,
         skipped_records,
         scanned_files,
         hard_link_entries,
+        unresolved_extensions,
     })
 }
 
@@ -2637,6 +2643,24 @@ mod tests {
         let index = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap();
         assert_eq!(index.skipped_records, 4); // 1 bad + 3 missing (2..4 not in mock)
         assert!(!index.records.contains_key(&1));
+    }
+
+    #[test]
+    fn enumeration_counts_orphan_extensions_as_unresolved() {
+        // extension 指向不存在的 base record_no=99；循环结束 base 仍缺失 → unresolved。
+        let mut records = HashMap::new();
+        records.insert(
+            0,
+            build_minimal_file_record(0, (5u64 << 48) | 5u64, "mft", 0),
+        );
+        records.insert(5, build_directory_record(0, (5u64 << 48) | 5u64, "root"));
+        // record 1 是指向 base 99 的 extension（base 99 不存在）
+        records.insert(1, build_extension_record(1, 99, 4096));
+        let reader = MockReader::from_records(records, TEST_RECORD_SIZE);
+        let vd = test_volume_data(6);
+        let index = enumerate_mft(&reader, vd, &mut || false, &mut |_| {}).unwrap();
+        assert_eq!(index.unresolved_extensions, 1);
+        assert!(!index.records.contains_key(&1)); // extension 不独立成记录
     }
 
     #[test]

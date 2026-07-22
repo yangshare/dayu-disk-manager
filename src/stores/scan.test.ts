@@ -67,6 +67,7 @@ function snapshot(id: string, source: 'mft' | 'filesystem' = 'mft', roots = [nod
       skippedRecords: 0,
       orphanEntries: 0,
       hardLinkEntries: 0,
+      unresolvedExtensions: 0,
     },
   }
 }
