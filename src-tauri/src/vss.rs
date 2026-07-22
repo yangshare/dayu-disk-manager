@@ -93,13 +93,6 @@ mod imp {
     const VSS_OBJECT_SNAPSHOT: i32 = 3; // VSS_OBJECT_TYPE::Snapshot
     /// IVssAsync::Wait 的无限等待（Win32 INFINITE = 0xFFFFFFFF）。
     const WAIT_INFINITE: u32 = u32::MAX;
-    /// CLSCTX_SERVER = INPROC_SERVER(1) | LOCAL_SERVER(4) | REMOTE_SERVER(16)。
-    const CLSCTX_SERVER: u32 = 0x1 | 0x4 | 0x10;
-
-    /// IVssBackupComponents 的接口 ID（665c1d5f-c218-414d-a05d-7fef5f9d5c86）。
-    const IID_IVSS_BACKUP_COMPONENTS: Guid =
-        Guid::from_u128(0x665c1d5f_c218_414d_a05d_7fef5f9d5c86);
-
     // =========================================================================
     // 手写 IVssBackupComponents vtable
     //
@@ -182,25 +175,14 @@ mod imp {
 
     // ---- 需要的 FFI（windows-rs 未导出部分，手写 extern）----
 
-    // CoCreateInstance 的原始 5 参版本（windows-rs 只暴露泛型包装，需显式 riid）。
-    #[link(name = "ole32")]
-    extern "system" {
-        #[link_name = "CoCreateInstance"]
-        fn co_create_instance(
-            rclsid: *const Guid,
-            punk_outer: *mut c_void,
-            dwclsctx: u32,
-            riid: *const Guid,
-            ppv: *mut *mut c_void,
-        ) -> Hr;
-    }
-
-    // 释放 `VSS_SNAPSHOT_PROP` 内由 VSS 分配的字符串。
+    // `windows-rs` 未导出 VSS 的工厂函数，直接调用 vssapi.dll 导出。
     // 导出名经 dumpbin 核对（vssapi.dll，非 Internal 变体）；返回 void。
     // 用 raw-dylib 直接按 DLL 导出名生成桩：vssapi.lib 在现代 SDK 中不含这些符号
     // （API 集转发），raw-dylib 绕过 import lib，从 vssapi.dll 导出表直接链接。
     #[link(name = "vssapi", kind = "raw-dylib")]
     extern "system" {
+        #[link_name = "CreateVssBackupComponentsInternal"]
+        fn create_vss_backup_components(pp_backup: *mut RawPtr) -> Hr;
         fn VssFreeSnapshotProperties(p_prop: *mut windows::Win32::Storage::Vss::VSS_SNAPSHOT_PROP);
     }
 
@@ -305,24 +287,19 @@ mod imp {
         Ok(from_wide_ptr(buf.as_ptr()))
     }
 
-    /// `CoCreateInstance(VSSCoordinator, IID_IVssBackupComponents)`。
+    /// 通过 VSS 官方工厂创建 `IVssBackupComponents`。
+    ///
+    /// `VSSCoordinator` 不支持以 `IVssBackupComponents` 作为 `CoCreateInstance`
+    /// 请求 IID，会返回 `E_NOINTERFACE`。`CreateVssBackupComponentsInternal` 是
+    /// `CreateVssBackupComponents` 宏所解析到的实际 vssapi 导出。
     fn create_backup_components() -> AppResult<RawPtr> {
-        use windows::Win32::Storage::Vss::VSSCoordinator;
         let mut ppv: RawPtr = ptr::null_mut();
-        let hr = unsafe {
-            co_create_instance(
-                &VSSCoordinator,
-                ptr::null_mut(),
-                CLSCTX_SERVER,
-                &IID_IVSS_BACKUP_COMPONENTS,
-                &mut ppv,
-            )
-        };
-        if let Err(e) = check(hr, "CoCreateInstance(VSSCoordinator)") {
+        let hr = unsafe { create_vss_backup_components(&mut ppv) };
+        if let Err(e) = check(hr, "CreateVssBackupComponents") {
             return Err(e);
         }
         if ppv.is_null() {
-            return Err(VssError::Internal("CoCreateInstance 返回空指针".to_string()).into());
+            return Err(VssError::Internal("CreateVssBackupComponents 返回空指针".to_string()).into());
         }
         Ok(ppv)
     }
