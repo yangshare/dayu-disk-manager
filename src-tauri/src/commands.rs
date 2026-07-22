@@ -137,6 +137,7 @@ async fn scan_drive_impl(
     }
 
     match task_result {
+        Ok(Ok(_)) if cancel.load(Ordering::Relaxed) => Err(AppError::Cancelled),
         Ok(Ok(outcome)) => {
             // 先发布 store，再从同一 store 构造 snapshot。
             {
@@ -608,30 +609,42 @@ mod tests {
 
     struct MockScanEngine {
         result: Mutex<Option<Result<ScanOutcome, ScanDriveError>>>,
+        cancel_before_return: bool,
     }
 
     impl MockScanEngine {
         fn success(store: Arc<TreeStore>, diagnostics: ScanDiagnostics) -> Self {
             Self {
                 result: Mutex::new(Some(Ok(ScanOutcome { store, diagnostics }))),
+                cancel_before_return: false,
+            }
+        }
+
+        fn success_after_cancellation(store: Arc<TreeStore>, diagnostics: ScanDiagnostics) -> Self {
+            Self {
+                result: Mutex::new(Some(Ok(ScanOutcome { store, diagnostics }))),
+                cancel_before_return: true,
             }
         }
 
         fn needs_elevation() -> Self {
             Self {
                 result: Mutex::new(Some(Err(ScanDriveError::NeedsElevation))),
+                cancel_before_return: false,
             }
         }
 
         fn fast_scan_failure(f: FastScanFailure) -> Self {
             Self {
                 result: Mutex::new(Some(Err(ScanDriveError::FastScanFailure(f)))),
+                cancel_before_return: false,
             }
         }
 
         fn cancelled() -> Self {
             Self {
                 result: Mutex::new(Some(Err(ScanDriveError::Cancelled))),
+                cancel_before_return: false,
             }
         }
     }
@@ -644,14 +657,19 @@ mod tests {
             _cfg: Config,
             _migrations: Vec<Migration>,
             _excluded_paths: Vec<String>,
-            _cancel: Arc<AtomicBool>,
+            cancel: Arc<AtomicBool>,
             _on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
         ) -> Result<ScanOutcome, ScanDriveError> {
-            self.result
+            let result = self
+                .result
                 .lock()
                 .unwrap()
                 .take()
-                .expect("MockScanEngine 只能使用一次")
+                .expect("MockScanEngine 只能使用一次");
+            if self.cancel_before_return {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            result
         }
     }
 
@@ -836,6 +854,43 @@ mod tests {
                 .as_ref()
                 .map(|s| s.scan_id().to_string()),
             Some("old".to_string())
+        );
+    }
+
+    #[test]
+    fn late_cancellation_does_not_publish_completed_snapshot() {
+        let old_store = empty_store("old");
+        let new_store = empty_store("new");
+        let diagnostics = ScanDiagnostics {
+            scanned_records: 1,
+            scanned_dirs: 0,
+            scanned_files: 0,
+            skipped_records: 0,
+            orphan_entries: 0,
+            hard_link_entries: 0,
+            unresolved_extensions: 0,
+        };
+        let state = temp_app_state(Arc::new(MockScanEngine::success_after_cancellation(
+            new_store,
+            diagnostics,
+        )));
+        *state.current_scan.write().unwrap() = Some(old_store);
+
+        let result = tauri::async_runtime::block_on(scan_drive_impl(
+            ScanMode::Auto,
+            &state,
+            no_op_progress(),
+        ));
+
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert_eq!(
+            state
+                .current_scan
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|store| store.scan_id()),
+            Some("old")
         );
     }
 

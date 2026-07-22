@@ -85,12 +85,13 @@ fn fixture_mirrors_rust_scan_contract() {
         ]),
     );
 
-    // FastScanFailure 6 个 kind（含 io code null+具体）。
+    // FastScanFailure 7 个 kind（含 io code null+具体）。
     let failure_actual: Value = serde_json::to_value(&[
         FastScanFailure::UnsupportedFilesystem {
             actual: "exfat".into(),
         },
         FastScanFailure::UnsupportedNtfsVersion { major: 1, minor: 2 },
+        FastScanFailure::MftTooLarge { bytes: 536_870_913 },
         FastScanFailure::InvalidVolumeData,
         FastScanFailure::RootRecordMissing,
         FastScanFailure::ExcessiveRecordErrors {
@@ -194,9 +195,9 @@ fn fixture_extra_keys_not_silently_ignored() {
         "CurrentPhase variant 数与 fixture currentPhases 数应一致",
     );
     assert_eq!(
-        7,
+        8,
         fixture["fastScanFailures"].as_array().unwrap().len(),
-        "FastScanFailure 6 kind + io 两种 code = 7 fixture 项",
+        "FastScanFailure 7 kind + io 两种 code = 8 fixture 项",
     );
     assert_eq!(
         3,

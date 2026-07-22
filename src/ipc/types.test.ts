@@ -36,14 +36,15 @@ describe('Rust IPC JSON 合约', () => {
     const failures = fixture.fastScanFailures as FastScanFailure[]
     const kinds = failures.map((failure) => failure.kind)
     expect(kinds).toEqual([
-      'unsupported_filesystem', 'unsupported_ntfs_version', 'invalid_volume_data',
+      'unsupported_filesystem', 'unsupported_ntfs_version', 'mft_too_large', 'invalid_volume_data',
       'root_record_missing', 'excessive_record_errors', 'io', 'io',
     ])
     expect(failures[0]).toMatchObject({ actual: 'exfat' })
     expect(failures[1]).toMatchObject({ major: 1, minor: 2 })
-    expect(failures[4]).toMatchObject({ skipped: 1, scanned: 2 })
-    expect(failures[5]).toMatchObject({ code: 5 })
-    expect(failures[6]).toMatchObject({ code: null })
+    expect(failures[2]).toMatchObject({ bytes: 536870913 })
+    expect(failures[5]).toMatchObject({ skipped: 1, scanned: 2 })
+    expect(failures[6]).toMatchObject({ code: 5 })
+    expect(failures[7]).toMatchObject({ code: null })
   })
 
   it('解码扫描进度和失效事件的 camelCase 字段', () => {

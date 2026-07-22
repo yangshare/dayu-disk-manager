@@ -5,6 +5,7 @@
   "fastScanFailures": [
     { "kind": "unsupported_filesystem", "actual": "exfat" },
     { "kind": "unsupported_ntfs_version", "major": 1, "minor": 2 },
+    { "kind": "mft_too_large", "bytes": 536870913 },
     { "kind": "invalid_volume_data" },
     { "kind": "root_record_missing" },
     { "kind": "excessive_record_errors", "skipped": 1, "scanned": 2 },

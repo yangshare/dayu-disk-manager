@@ -20,6 +20,8 @@ function failureDescription(reason: FastScanFailure): string {
       return `当前卷的文件系统（${reason.actual}）不支持 MFT 快速扫描。`
     case 'unsupported_ntfs_version':
       return `当前 NTFS 版本（${reason.major}.${reason.minor}）不受快速扫描支持。`
+    case 'mft_too_large':
+      return `MFT 元数据过大（${Math.ceil(reason.bytes / 1024 / 1024)} MB），无法在安全内存范围内快速扫描。`
     case 'invalid_volume_data':
       return '卷元数据无效，无法安全执行 MFT 快速扫描。'
     case 'root_record_missing':

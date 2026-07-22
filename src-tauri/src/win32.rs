@@ -845,8 +845,14 @@ pub fn read_volume_bytes_at(
     unsafe { SetFilePointerEx(vol.handle, start_byte_offset as i64, None, FILE_BEGIN) }
         .map_err(|e| map_win32_error(e, "SetFilePointerEx"))?;
 
-    let mut out = Vec::with_capacity(byte_count as usize);
-    let mut remaining = byte_count as usize;
+    let byte_count = usize::try_from(byte_count).map_err(|_| VolumeError::InvalidVolumeData)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(byte_count)
+        .map_err(|_| VolumeError::Io {
+            code: 8, // ERROR_NOT_ENOUGH_MEMORY
+            operation: "read_volume_bytes_at/allocate",
+        })?;
+    let mut remaining = byte_count;
     let mut buf = vec![0u8; READ_VOLUME_CHUNK];
     while remaining > 0 {
         let to_read = remaining.min(READ_VOLUME_CHUNK);

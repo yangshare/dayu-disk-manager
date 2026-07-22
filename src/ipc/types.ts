@@ -90,6 +90,7 @@ export type ScanMode = 'auto' | 'mft' | 'filesystem'
 export type FastScanFailure =
   | { kind: 'unsupported_filesystem'; actual: string }
   | { kind: 'unsupported_ntfs_version'; major: number; minor: number }
+  | { kind: 'mft_too_large'; bytes: number }
   | { kind: 'invalid_volume_data' }
   | { kind: 'root_record_missing' }
   | { kind: 'excessive_record_errors'; skipped: number; scanned: number }

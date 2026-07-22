@@ -1976,6 +1976,10 @@ impl RealScanEngine {
 
         let mut graph = build_graph(&index, excluded_paths, root_drive);
 
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ScanDriveError::Cancelled);
+        }
+
         on_progress(ScanProgressEvent {
             scanned_records: index.scanned_records,
             scanned_dirs: graph.nodes.len() as u64,
@@ -1993,6 +1997,10 @@ impl RealScanEngine {
             &dir_size,
             index.skipped_records,
         );
+
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ScanDriveError::Cancelled);
+        }
 
         let scan_id = generate_scan_id();
         let store = materialize(&graph, root_summary, ScanSource::Mft, scan_id);
@@ -2079,6 +2087,10 @@ impl RealScanEngine {
             on_progress.clone(),
         )?;
 
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ScanDriveError::Cancelled);
+        }
+
         on_progress(ScanProgressEvent {
             scanned_records: 0,
             scanned_dirs: graph.nodes.len() as u64,
@@ -2097,6 +2109,10 @@ impl RealScanEngine {
             &dir_size,
             0,
         );
+
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ScanDriveError::Cancelled);
+        }
 
         // filesystem 降级路径自构 RootFileSummary：无系统元数据，结果不完整。
         let (root_direct_size, root_direct_count) = graph
@@ -2169,6 +2185,9 @@ fn map_mft_error(e: MftError) -> ScanDriveError {
         }
         MftError::InvalidVolumeData => {
             ScanDriveError::FastScanFailure(FastScanFailure::InvalidVolumeData)
+        }
+        MftError::MftTooLarge { bytes } => {
+            ScanDriveError::FastScanFailure(FastScanFailure::MftTooLarge { bytes })
         }
         MftError::RootRecordMissing => {
             ScanDriveError::FastScanFailure(FastScanFailure::RootRecordMissing)

@@ -106,6 +106,7 @@ pub enum ScanDriveResult {
 pub enum FastScanFailure {
     UnsupportedFilesystem { actual: String },
     UnsupportedNtfsVersion { major: u16, minor: u16 },
+    MftTooLarge { bytes: u64 },
     InvalidVolumeData,
     RootRecordMissing,
     ExcessiveRecordErrors { skipped: u64, scanned: u64 },
@@ -452,6 +453,10 @@ mod tests {
             (
                 FastScanFailure::UnsupportedNtfsVersion { major: 1, minor: 2 },
                 serde_json::json!({ "kind": "unsupported_ntfs_version", "major": 1, "minor": 2 }),
+            ),
+            (
+                FastScanFailure::MftTooLarge { bytes: 536_870_913 },
+                serde_json::json!({ "kind": "mft_too_large", "bytes": 536_870_913 }),
             ),
             (
                 FastScanFailure::InvalidVolumeData,
