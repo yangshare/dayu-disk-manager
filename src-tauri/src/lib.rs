@@ -12,6 +12,7 @@ pub mod process_probe;
 pub mod safety;
 pub mod scanner;
 pub mod store;
+pub mod vss;
 
 #[cfg(windows)]
 pub mod win32;

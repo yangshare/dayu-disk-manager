@@ -261,9 +261,17 @@ pub async fn start_migrate(
     migration_id: String,
     src: String,
     preset_id: Option<String>,
+    enable_vss: bool,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<Migration> {
+    // VSS 需要管理员权限（CoCreateInstance(VSSCoordinator) 在非提升进程会失败）。
+    // 在加锁之前预检，避免占用 cancel_token 后又因权限报错返回。
+    if enable_vss && !crate::win32::is_elevated_current() {
+        return Err(AppError::Conflict(
+            "VSS 需要管理员权限，请以管理员身份重新启动".into(),
+        ));
+    }
     let cfg = state.store.load_config()?;
     let src_path = PathBuf::from(&src);
     let existing = state.store.load_migrations()?;
@@ -302,6 +310,7 @@ pub async fn start_migrate(
         preset_id: preset_id.clone(),
         source_volume_serial: src_serial,
         target_volume_serial: tgt_serial,
+        enable_vss,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_slot = state.cancel_token.clone();
@@ -318,16 +327,40 @@ pub async fn start_migrate(
     let journal = state.journal.clone();
     let history = state.history.clone();
     let task_result = tauri::async_runtime::spawn_blocking(move || {
-        migrator::migrate(
+        let on_progress = move |e: ProgressEvent| {
+            let _ = app2.emit("dayu://progress", e);
+        };
+        // VSS 快照必须在本工作线程内构造与释放（COM 线程亲和性），
+        // 与 migrate_with_snapshot 在同一线程完成、同一线程 drop。
+        let snapshot = if plan.enable_vss {
+            let vol_root = match crate::win32::volume_root(&plan.src) {
+                Ok(v) => v,
+                Err(e) => return Err((e, OperationOutcome::unchanged("vss_failed"))),
+            };
+            on_progress(ProgressEvent::new(
+                &plan.task_id,
+                "snapshot",
+                0,
+                "创建卷影快照（绕过被占用文件）",
+            ));
+            // 失败策略（v1）：报错+引导，不静默降级。
+            // AccessDenied → Conflict 提示提权；其它 → AppError::Vss，由用户决定重试或关 VSS。
+            match crate::vss::create_snapshot(&vol_root) {
+                Ok(g) => Some(g),
+                Err(e) => return Err((e, OperationOutcome::unchanged("vss_failed"))),
+            }
+        } else {
+            None
+        };
+        migrator::migrate_with_snapshot(
             &RealFileOps,
             &store,
             &journal,
             &history,
             &plan,
-            &move |e: ProgressEvent| {
-                let _ = app2.emit("dayu://progress", e);
-            },
+            &on_progress,
             &task_cancel,
+            snapshot,
         )
     })
     .await
@@ -401,9 +434,15 @@ where
 #[tauri::command]
 pub async fn start_restore(
     migration_id: String,
+    enable_vss: bool,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<bool> {
+    if enable_vss && !crate::win32::is_elevated_current() {
+        return Err(AppError::Conflict(
+            "VSS 需要管理员权限，请以管理员身份重新启动".into(),
+        ));
+    }
     let migs = state.store.load_migrations()?;
     let mig = migs
         .into_iter()
@@ -444,16 +483,37 @@ pub async fn start_restore(
     let journal = state.journal.clone();
     let history = state.history.clone();
     let task_result = tauri::async_runtime::spawn_blocking(move || {
-        migrator::restore(
+        let on_progress = move |e: ProgressEvent| {
+            let _ = app2.emit("dayu://progress", e);
+        };
+        // 还原的读源是 target 卷：对 target 所在卷建快照。COM 线程亲和，线程内构造与释放。
+        let snapshot = if enable_vss {
+            let vol_root = match crate::win32::volume_root(std::path::Path::new(&mig.target)) {
+                Ok(v) => v,
+                Err(e) => return Err((e, OperationOutcome::unchanged("vss_failed"))),
+            };
+            on_progress(ProgressEvent::new(
+                &format!("restore-{}", mig.id),
+                "snapshot",
+                0,
+                "创建卷影快照（绕过被占用文件）",
+            ));
+            match crate::vss::create_snapshot(&vol_root) {
+                Ok(g) => Some(g),
+                Err(e) => return Err((e, OperationOutcome::unchanged("vss_failed"))),
+            }
+        } else {
+            None
+        };
+        migrator::restore_with_snapshot(
             &RealFileOps,
             &store,
             &journal,
             &history,
             &mig,
-            &move |e: ProgressEvent| {
-                let _ = app2.emit("dayu://progress", e);
-            },
+            &on_progress,
             &task_cancel,
+            snapshot,
         )
     })
     .await

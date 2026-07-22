@@ -65,6 +65,7 @@ export interface PrecheckReport {
   blockers: string[]
   sourceSizeBytes: number
   targetFreeBytes: number
+  vssAvailable: boolean
 }
 
 export interface TransferProgress {

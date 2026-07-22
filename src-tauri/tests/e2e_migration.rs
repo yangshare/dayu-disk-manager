@@ -34,6 +34,7 @@ fn full_pipeline_migrate_then_restore_preserves_data() {
         preset_id: Some("wechat".into()),
         source_volume_serial: "C".into(),
         target_volume_serial: "D".into(),
+        enable_vss: false,
     };
     let cancel = AtomicBool::new(false);
     // T10 ripple effect: migrate/restore now return (Migration|(), OperationOutcome)

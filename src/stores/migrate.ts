@@ -12,6 +12,9 @@ export const useMigrateStore = defineStore('migrate', () => {
   const cancelling = ref(false)
   const progress = ref<ProgressEvent | null>(null)
   const result = ref<{ ok: boolean; message: string } | null>(null)
+  // VSS 开关：仅在管理员权限下可用（precheck.vssAvailable）。可用时默认勾选，
+  // 让迁移免疫被占用文件；不可用时锁定为 false。
+  const enableVss = ref(false)
   let unlisten: (() => void) | null = null
   let activeTaskId: string | null = null
 
@@ -19,7 +22,10 @@ export const useMigrateStore = defineStore('migrate', () => {
     prechecking.value = true
     error.value = null
     report.value = null
-    try { report.value = await ipc.precheckMigrate(src) }
+    try {
+      report.value = await ipc.precheckMigrate(src)
+      enableVss.value = report.value.vssAvailable
+    }
     catch (e) { error.value = String(e) }
     finally { prechecking.value = false }
   }
@@ -40,7 +46,7 @@ export const useMigrateStore = defineStore('migrate', () => {
     result.value = null
     try {
       await initListener(`task-${migrationId}`)
-      await ipc.startMigrate(migrationId, src, presetId)
+      await ipc.startMigrate(migrationId, src, presetId, enableVss.value)
       result.value = { ok: true, message: '迁移完成' }
     } catch (e) {
       result.value = { ok: false, message: String(e) }
@@ -65,5 +71,5 @@ export const useMigrateStore = defineStore('migrate', () => {
     unlisten?.()
     unlisten = null
   }
-  return { report, prechecking, error, running, cancelling, progress, result, precheck, run, cancel, cleanup }
+  return { report, prechecking, error, running, cancelling, progress, result, enableVss, precheck, run, cancel, cleanup }
 })

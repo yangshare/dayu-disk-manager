@@ -15,10 +15,11 @@ export const ipc = {
   takeStartupScanIntent: () => invoke<boolean>('take_startup_scan_intent'),
   cancelScan: () => invoke<boolean>('cancel_scan'),
   precheckMigrate: (src: string) => invoke<PrecheckReport>('precheck_migrate', { src }),
-  startMigrate: (migrationId: string, src: string, presetId: string | null) =>
-    invoke<Migration>('start_migrate', { migrationId, src, presetId }),
+  startMigrate: (migrationId: string, src: string, presetId: string | null, enableVss: boolean) =>
+    invoke<Migration>('start_migrate', { migrationId, src, presetId, enableVss }),
   cancelMigrate: () => invoke<boolean>('cancel_migrate'),
-  startRestore: (migrationId: string) => invoke<boolean>('start_restore', { migrationId }),
+  startRestore: (migrationId: string, enableVss: boolean) =>
+    invoke<boolean>('start_restore', { migrationId, enableVss }),
   listLinks: () => invoke<LinkItem[]>('list_links'),
   breakLink: (migrationId: string) => invoke<boolean>('break_link_cmd', { migrationId }),
   listHistory: (op?: string, from?: string, to?: string) =>

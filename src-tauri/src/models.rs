@@ -351,6 +351,9 @@ pub struct PrecheckReport {
     pub blockers: Vec<String>,
     pub source_size_bytes: u64,
     pub target_free_bytes: u64,
+    /// 当前进程是否以管理员身份运行——决定能否启用 VSS 卷影快照
+    /// 绕过被占用文件。非管理员时前端禁用 VSS 选项并提示提权。
+    pub vss_available: bool,
 }
 
 #[cfg(test)]

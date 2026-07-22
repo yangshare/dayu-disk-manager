@@ -234,12 +234,19 @@ pub fn precheck(
     }
 
     let ok = blockers.is_empty();
+    // VSS 需要管理员权限：CoCreateInstance(VSSCoordinator) 仅在提升进程可用。
+    // 不在此真正 CoCreate（避免阻塞主线程 / 留 COM 副作用），只判断权限。
+    #[cfg(windows)]
+    let vss_available = crate::win32::is_elevated_current();
+    #[cfg(not(windows))]
+    let vss_available = false;
     PrecheckReport {
         ok,
         warnings,
         blockers,
         source_size_bytes: src_size,
         target_free_bytes: free,
+        vss_available,
     }
 }
 
