@@ -172,9 +172,8 @@ pub fn migrate_with_snapshot(
     // 读源解析器：VSS 模式下读源走快照设备路径；非 VSS 走原始路径。
     let device = snapshot.as_ref().map(|g| g.device_path());
     let resolver = SrcResolver::new(&plan.src, device);
-    // snapshot 持有到函数末尾：所有 store/history/journal 命根子调用完成后，
-    // 函数返回时自然 drop 才释放快照（BackupComplete + DeleteSnapshots）。
-    let _snapshot_guard = snapshot;
+    // snapshot 作为参数自然持有到函数返回：所有 store/history/journal 命根子调用
+    // 完成后才随返回 drop，释放快照（BackupComplete + DeleteSnapshots）。
     let now = || chrono::Utc::now().to_rfc3339();
     let emit = |stage: &str, pct: u8, msg: &str| {
         on_progress(ProgressEvent::new(&plan.task_id, stage, pct, msg));
@@ -543,7 +542,6 @@ pub fn restore_with_snapshot(
     // 读 target 解析器：VSS 走快照设备路径，非 VSS 走原路径。
     let device = snapshot.as_ref().map(|g| g.device_path());
     let resolver = SrcResolver::new(&target, device);
-    let _snapshot_guard = snapshot;
 
     // source_changed：删 junction 之前为 false；删 junction 之后为 true（src 不再是 junction）。
     // 删 junction 后改名失败时重建 junction：仍然报告 true（删-重建过程 src 曾不是 junction）。

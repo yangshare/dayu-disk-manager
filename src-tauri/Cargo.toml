@@ -28,7 +28,9 @@ dirs = "5"
 
 [target.'cfg(windows)'.dependencies]
 junction = "1"
-trash = "5"
+# VSS initializes the migration worker as MTA. The recycle-bin implementation
+# runs on that worker after the junction is in place, so its COM mode must match.
+trash = { version = "5", default-features = false, features = ["coinit_multithreaded"] }
 windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",

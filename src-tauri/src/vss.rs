@@ -59,13 +59,13 @@ pub fn shadow_path(device: &str, original: &Path) -> PathBuf {
 #[cfg(windows)]
 mod imp {
     use crate::error::{AppError, AppResult};
+    use crate::win32::{from_wide, to_wide};
     use std::ffi::c_void;
     use std::ptr;
 
-    // 宽字符助手（与 win32.rs 同实现，模块私有，避免改动 win32.rs 可见性）。
-    fn to_wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
+    /// 取 NUL 终止的宽字符串指针长度并转 `String`。
+    ///
+    /// 复用 `win32::from_wide`（按 NUL 截断 + utf16 解码）；`p` 为空返回空串。
     fn from_wide_ptr(p: *const u16) -> String {
         if p.is_null() {
             return String::new();
@@ -75,8 +75,7 @@ mod imp {
             while *p.add(len) != 0 {
                 len += 1;
             }
-            let slice = std::slice::from_raw_parts(p, len);
-            String::from_utf16_lossy(slice)
+            from_wide(std::slice::from_raw_parts(p, len))
         }
     }
 
@@ -224,29 +223,27 @@ mod imp {
     }
 
     /// COM 单元 RAII：构造时 `CoInitializeEx(MULTITHREADED)`，drop 时 `CoUninitialize`。
-    struct ComInit {
-        uninit_on_drop: bool,
-    }
+    ///
+    /// 构造失败（返回 Err）不产生实例；凡成功构造者，`CoInitializeEx` 返回 S_OK/S_FALSE
+    /// 两种状态都要求配对一次 `CoUninitialize`，故 drop 无条件反初始化。
+    struct ComInit;
     impl ComInit {
         fn new() -> AppResult<Self> {
             use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
             let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
             let code = hr.0 as u32;
             // S_OK(0) 首次初始化；S_FALSE(1) 该线程已初始化（仍需配对 Uninitialize）。
-            let uninit = code == 0 || code == 1;
-            if !uninit {
+            if code != 0 && code != 1 {
                 // RPC_E_CHANGED_MODE(0x80010106) 等：本线程已属其它单元，无法用 MTA。
                 return Err(VssError::Com(format!("CoInitializeEx 失败: 0x{code:08X}")).into());
             }
-            Ok(Self { uninit_on_drop: uninit })
+            Ok(ComInit)
         }
     }
     impl Drop for ComInit {
         fn drop(&mut self) {
-            if self.uninit_on_drop {
-                // CoUninitialize 无返回值；吞错（与项目 VolumeHandle::drop 风格一致）。
-                unsafe { windows::Win32::System::Com::CoUninitialize() };
-            }
+            // CoUninitialize 无返回值；吞错（与项目 VolumeHandle::drop 风格一致）。
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
         }
     }
 
@@ -334,14 +331,9 @@ mod imp {
             // 全力清理，任何错误都吞掉（best-effort）。
             unsafe {
                 let v = vtbl(self.backup);
-                // 1. BackupComplete（异步）：通知 writer 备份结束。
-                let mut async_ptr: RawPtr = ptr::null_mut();
-                let _ = ((*v).BackupComplete)(self.backup, &mut async_ptr);
-                if !async_ptr.is_null() {
-                    use windows::core::Interface;
-                    let a: windows::Win32::Storage::Vss::IVssAsync = Interface::from_raw(async_ptr);
-                    let _ = a.Wait(WAIT_INFINITE); // drop a → Release
-                }
+                // 1. BackupComplete（异步）：通知 writer 备份结束。复用 run_async 统一
+                //    invoke→null 校验→Wait 流程，drop 时吞错。
+                let _ = run_async(self.backup, (*v).BackupComplete, "BackupComplete");
                 // 2. DeleteSnapshots（强制）：显式删除本快照。
                 let mut deleted: i32 = 0;
                 let mut nondeleted = Guid::zeroed();
@@ -384,19 +376,11 @@ mod imp {
                 ((*v).SetBackupState)(backup, false, false, VSS_BT_COPY, false),
                 "SetBackupState",
             )?;
-        }
-        // GatherWriterMetadata：收集 writer 元数据。部分 Win11 系统 writer 状态不稳，
-        // 其失败对“仅复制文件”的快照不致命 → 容忍失败继续。
-        let writer_meta_ok = unsafe {
-            run_async(backup, (*vtbl(backup)).GatherWriterMetadata, "GatherWriterMetadata").is_ok()
-        };
-        if writer_meta_ok {
-            unsafe {
-                check(((*vtbl(backup)).FreeWriterMetadata)(backup), "FreeWriterMetadata")?;
+            // GatherWriterMetadata：收集 writer 元数据。部分 Win11 系统 writer 状态不稳，
+            // 其失败对“仅复制文件”的快照不致命 → 容忍失败继续。
+            if run_async(backup, (*v).GatherWriterMetadata, "GatherWriterMetadata").is_ok() {
+                check(((*v).FreeWriterMetadata)(backup), "FreeWriterMetadata")?;
             }
-        }
-        unsafe {
-            let v = vtbl(backup);
             check(((*v).SetContext)(backup, VSS_CTX_BACKUP), "SetContext")?;
             let mut snapshot_set_id = Guid::zeroed();
             check(((*v).StartSnapshotSet)(backup, &mut snapshot_set_id), "StartSnapshotSet")?;

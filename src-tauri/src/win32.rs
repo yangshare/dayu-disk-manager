@@ -196,12 +196,12 @@ pub fn locked_processes(_path: &Path) -> AppResult<Option<Vec<String>>> {
 
 // ===== 辅助：宽字符转换 =====
 #[cfg(windows)]
-fn to_wide(s: &str) -> Vec<u16> {
+pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(windows)]
-fn from_wide(buf: &[u16]) -> String {
+pub(crate) fn from_wide(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
 }
