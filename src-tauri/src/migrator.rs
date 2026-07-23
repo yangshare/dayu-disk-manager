@@ -1,5 +1,5 @@
 use crate::error::{AppError, AppResult};
-use crate::file_ops::{CopyPhase, CopyProgress, FileOps};
+use crate::file_ops::{resolve_concurrency, CopyPhase, CopyProgress, FileOps};
 use crate::history::History;
 use crate::journal::Journal;
 use crate::models::{
@@ -7,6 +7,7 @@ use crate::models::{
 };
 use crate::store::Store;
 use crate::vss::{shadow_path, SnapshotGuard};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -140,6 +141,8 @@ pub struct MigratePlan {
     /// 是否启用 VSS 卷影快照绕过被占用文件。SnapshotGuard 不进 plan，
     /// 由调用方在 spawn_blocking 内构造后作为 migrate()/restore() 的独立参数传入。
     pub enable_vss: bool,
+    /// 复制并发度覆盖。`None` 走默认（min(逻辑核数, 8)）。当前不暴露前端配置。
+    pub copy_concurrency: Option<NonZeroUsize>,
 }
 
 pub fn migrate(
@@ -219,7 +222,7 @@ pub fn migrate_with_snapshot(
             "migrate_canceled",
         ));
     }
-    if let Err(e) = ops.copy_tree(
+    let outcome = match ops.copy_tree(
         resolver.read(),
         &plan.tmp,
         &|progress| {
@@ -233,23 +236,27 @@ pub fn migrate_with_snapshot(
             ))
         },
         &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+        resolve_concurrency(plan.copy_concurrency),
     ) {
-        let _ = ops.remove_tree(&plan.tmp);
-        if matches!(e, AppError::Cancelled) {
-            bail(
-                journal.cancel(&plan.task_id),
-                source_changed,
-                "migrate_rolled_back",
-            )?;
-        } else {
-            bail(
-                journal.fail(&plan.task_id, "复制失败"),
-                source_changed,
-                "migrate_rolled_back",
-            )?;
+        Ok(o) => o,
+        Err(e) => {
+            let _ = ops.remove_tree(&plan.tmp);
+            if matches!(e, AppError::Cancelled) {
+                bail(
+                    journal.cancel(&plan.task_id),
+                    source_changed,
+                    "migrate_rolled_back",
+                )?;
+            } else {
+                bail(
+                    journal.fail(&plan.task_id, "复制失败"),
+                    source_changed,
+                    "migrate_rolled_back",
+                )?;
+            }
+            return Err(fail(e, source_changed, "migrate_rolled_back"));
         }
-        return Err(fail(e, source_changed, "migrate_rolled_back"));
-    }
+    };
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = ops.remove_tree(&plan.tmp);
         bail(
@@ -264,19 +271,12 @@ pub fn migrate_with_snapshot(
         ));
     }
 
-    // 阶段 b：首次校验
+    // 阶段 b'：复核——零额外目录遍历，直接 diff 复制的两份 outcome manifest。
     emit(stage::VERIFYING, 60, "校验 manifest");
-    let m1 = bail(
-        ops.manifest(resolver.read()),
-        source_changed,
-        "migrate_rolled_back",
-    )?;
-    let m2 = bail(
-        ops.manifest(&plan.tmp),
-        source_changed,
-        "migrate_rolled_back",
-    )?;
-    if !ops.diff_manifests(&m1, &m2).is_empty() {
+    if !ops
+        .diff_manifests(&outcome.copied_manifest, &outcome.dst_manifest)
+        .is_empty()
+    {
         // 保留 tmp 供排查
         bail(
             journal.fail(&plan.task_id, "manifest 不一致"),
@@ -345,6 +345,7 @@ pub fn migrate_with_snapshot(
                 ))
             },
             &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+            1,
         ) {
             // 回滚：改回原名
             let _ = ops.rename(&plan.old_path, &plan.src);
@@ -600,6 +601,7 @@ pub fn restore_with_snapshot(
             ))
         },
         &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+        resolve_concurrency(None),
     ) {
         let _ = ops.remove_tree(&restore_tmp);
         if matches!(e, AppError::Cancelled) {
@@ -788,6 +790,7 @@ mod tests {
             source_volume_serial: "C".into(),
             target_volume_serial: "D".into(),
             enable_vss: false,
+            copy_concurrency: None,
         }
     }
 
@@ -891,8 +894,9 @@ mod tests {
             s: &Path,
             _d: &Path,
             _p: &dyn Fn(&crate::file_ops::CopyProgress),
-            _cancel: &dyn Fn() -> bool,
-        ) -> AppResult<()> {
+            _cancel: &(dyn Fn() -> bool + Sync),
+            _concurrency: usize,
+        ) -> AppResult<crate::file_ops::CopyOutcome> {
             self.copy_src_calls.borrow_mut().push(s.to_path_buf());
             // 区分阶段：复制阶段 src 是 plan.src，增量阶段 src 是 plan.old_path（含 dayu-old-）
             let is_incremental_stage = s
@@ -900,20 +904,22 @@ mod tests {
                 .and_then(|n| n.to_str())
                 .map(|n| n.contains("dayu-old-"))
                 .unwrap_or(false);
-            if is_incremental_stage {
-                if self.incremental_copy_ok {
-                    Ok(())
-                } else {
-                    Err(crate::error::AppError::Migrate(
-                        "incremental copy fail".into(),
-                    ))
-                }
+            let ok = if is_incremental_stage {
+                self.incremental_copy_ok
             } else {
-                if self.copy_ok {
-                    Ok(())
-                } else {
-                    Err(crate::error::AppError::Migrate("copy fail".into()))
-                }
+                self.copy_ok
+            };
+            if ok {
+                Ok(crate::file_ops::CopyOutcome {
+                    copied_manifest: Manifest { root: String::new(), entries: vec![] },
+                    dst_manifest: Manifest { root: String::new(), entries: vec![] },
+                    total_bytes: 0,
+                    total_files: 0,
+                })
+            } else {
+                Err(crate::error::AppError::Migrate(
+                    if is_incremental_stage { "incremental copy fail" } else { "copy fail" }.into(),
+                ))
             }
         }
         fn manifest(&self, s: &Path) -> AppResult<Manifest> {

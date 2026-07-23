@@ -1,6 +1,7 @@
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,37 @@ pub struct Manifest {
     pub entries: Vec<ManifestEntry>,
 }
 
+/// `copy_tree` 的产出：实际读入的源条目与实际落盘的目标条目各一份 manifest，
+/// 外加扫描阶段统计的总量。两份 manifest 由 migrator 的 b'/c' 直接 diff，
+/// 不再额外遍历目录。
+pub struct CopyOutcome {
+    /// 实际创建的目录/reparse 占位 + 实际成功读入的文件条目（size=实际读入字节）。
+    pub copied_manifest: Manifest,
+    /// 对应目标条目创建/写入后取得的实际元数据（文件 size=目标落盘字节）。
+    pub dst_manifest: Manifest,
+    pub total_bytes: u64,
+    pub total_files: u64,
+}
+
+/// 并发度解析：`None` 走默认 `min(available_parallelism, 8)`；`Some(n)` 原样使用
+/// （`NonZeroUsize` 从类型层保证 >= 1）。
+pub fn resolve_concurrency(override_: Option<NonZeroUsize>) -> usize {
+    match override_ {
+        Some(n) => n.get(),
+        None => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8),
+    }
+}
+
+/// 单个文件的复制任务（扫描阶段产出，并发阶段消费）。
+struct CopyTask {
+    src: PathBuf,
+    dst: PathBuf,
+    rel_path: String,
+}
+
 /// 文件操作抽象。生产用 RealFileOps，测试用 mock 实现。
 /// 复制期间持续回调准备/传输详情，并通过 should_cancel 支持及时取消。
 pub trait FileOps {
@@ -65,8 +97,9 @@ pub trait FileOps {
         src: &Path,
         dst: &Path,
         on_progress: &dyn Fn(&CopyProgress),
-        should_cancel: &dyn Fn() -> bool,
-    ) -> AppResult<()>;
+        should_cancel: &(dyn Fn() -> bool + Sync),
+        concurrency: usize,
+    ) -> AppResult<CopyOutcome>;
 
     /// 生成 src 目录的 manifest（不含 src 自身的 reparse point 内部，但含直接子项）。
     fn manifest(&self, src: &Path) -> AppResult<Manifest>;
@@ -115,62 +148,32 @@ where
     })
 }
 
-impl RealFileOps {
-    fn measure_tree(
-        &self,
-        src: &Path,
-        on_progress: &dyn Fn(&CopyProgress),
-        should_cancel: &dyn Fn() -> bool,
-    ) -> AppResult<(u64, u64)> {
-        let mut stack = vec![src.to_path_buf()];
-        let mut total_bytes = 0u64;
-        let mut total_files = 0u64;
-        let mut last_emit = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(Instant::now);
-
-        while let Some(current) = stack.pop() {
-            if should_cancel() {
-                return Err(AppError::Cancelled);
-            }
-            if !current.exists() {
-                continue;
-            }
-            if self.is_reparse_point(&current) && current != src {
-                continue;
-            }
-            if current.is_dir() {
-                for entry in std::fs::read_dir(&current)? {
-                    stack.push(entry?.path());
-                }
-            } else {
-                total_bytes = total_bytes.saturating_add(std::fs::metadata(&current)?.len());
-                total_files += 1;
-            }
-
-            if last_emit.elapsed() >= Duration::from_millis(200) {
-                on_progress(&CopyProgress {
-                    phase: CopyPhase::Preparing,
-                    completed_bytes: total_bytes,
-                    total_bytes: None,
-                    completed_files: total_files,
-                    total_files: None,
-                    current_path: Some(relative_display_path(src, &current)),
-                });
-                last_emit = Instant::now();
-            }
+/// 复制单个普通文件，返回实际读写的字节数。不回调进度（进度由调用方的主线程汇报器统一发出）。
+/// 每读完一个 buffer 块检查取消。
+fn copy_file_counted(
+    src: &Path,
+    dst: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> AppResult<u64> {
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    let mut input = std::fs::File::open(src)?;
+    let mut output = std::fs::File::create(dst)?;
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut copied = 0u64;
+    loop {
+        if should_cancel() {
+            return Err(AppError::Cancelled);
         }
-
-        on_progress(&CopyProgress {
-            phase: CopyPhase::Preparing,
-            completed_bytes: total_bytes,
-            total_bytes: None,
-            completed_files: total_files,
-            total_files: None,
-            current_path: None,
-        });
-        Ok((total_bytes, total_files))
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        copied = copied.saturating_add(read as u64);
     }
+    output.flush()?;
+    std::fs::set_permissions(dst, std::fs::metadata(src)?.permissions())?;
+    Ok(copied)
 }
 
 impl FileOps for RealFileOps {
@@ -179,70 +182,154 @@ impl FileOps for RealFileOps {
         src: &Path,
         dst: &Path,
         on_progress: &dyn Fn(&CopyProgress),
-        should_cancel: &dyn Fn() -> bool,
-    ) -> AppResult<()> {
-        let (total_bytes, total_files) = self.measure_tree(src, on_progress, should_cancel)?;
-        std::fs::create_dir_all(dst)?;
-        let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+        should_cancel: &(dyn Fn() -> bool + Sync),
+        _concurrency: usize,
+    ) -> AppResult<CopyOutcome> {
+        let mut copied_entries: Vec<ManifestEntry> = Vec::new();
+        let mut dst_entries: Vec<ManifestEntry> = Vec::new();
+        let mut tasks: Vec<CopyTask> = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut total_files = 0u64;
+
+        // 阶段①：单线程 stat-only 扫描，建目录、收集文件任务、记录目录/reparse 占位。
+        let mut stack = vec![(src.to_path_buf(), dst.to_path_buf(), String::new())];
+        let mut last_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        while let Some((cur_src, cur_dst, rel)) = stack.pop() {
+            if should_cancel() {
+                return Err(AppError::Cancelled);
+            }
+            if !cur_src.exists() {
+                continue;
+            }
+            let is_rp = self.is_reparse_point(&cur_src) && cur_src != *src;
+            if is_rp {
+                // 非 src 自身的 reparse point：建空目录占位；两份 manifest 记完全相同的
+                // 占位条目（rel_path/is_dir/size 三者一致），保证该条目 diff 为空。
+                std::fs::create_dir_all(&cur_dst)?;
+                let placeholder = ManifestEntry {
+                    rel_path: rel,
+                    is_dir: true,
+                    size: 0,
+                    mtime: 0,
+                    attrs: 0,
+                };
+                copied_entries.push(placeholder.clone());
+                dst_entries.push(placeholder);
+                continue;
+            }
+            if cur_src.is_dir() {
+                std::fs::create_dir_all(&cur_dst)?;
+                if cur_src != *src {
+                    copied_entries.push(ManifestEntry {
+                        rel_path: rel.clone(),
+                        is_dir: true,
+                        size: 0,
+                        mtime: 0,
+                        attrs: 0,
+                    });
+                    dst_entries.push(ManifestEntry {
+                        rel_path: rel.clone(),
+                        is_dir: true,
+                        size: 0,
+                        mtime: 0,
+                        attrs: 0,
+                    });
+                }
+                for entry in std::fs::read_dir(&cur_src)? {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    let child_rel = if rel.is_empty() {
+                        name.to_string_lossy().replace('\\', "/")
+                    } else {
+                        format!("{}/{}", rel, name.to_string_lossy())
+                    };
+                    stack.push((
+                        entry.path(),
+                        cur_dst.join(&name),
+                        child_rel,
+                    ));
+                }
+            } else {
+                // 文件：只 stat 预估总量并推入任务；不作为一致性基准。
+                total_bytes = total_bytes.saturating_add(std::fs::metadata(&cur_src)?.len());
+                total_files += 1;
+                tasks.push(CopyTask {
+                    src: cur_src,
+                    dst: cur_dst,
+                    rel_path: rel,
+                });
+                if last_emit.elapsed() >= Duration::from_millis(200) {
+                    on_progress(&CopyProgress {
+                        phase: CopyPhase::Preparing,
+                        completed_bytes: total_bytes,
+                        total_bytes: None,
+                        completed_files: total_files,
+                        total_files: None,
+                        current_path: None,
+                    });
+                    last_emit = Instant::now();
+                }
+            }
+        }
+        on_progress(&CopyProgress {
+            phase: CopyPhase::Preparing,
+            completed_bytes: total_bytes,
+            total_bytes: None,
+            completed_files: total_files,
+            total_files: None,
+            current_path: None,
+        });
+
+        // 阶段②（任务1：串行；任务2 改并发）。打开前重新检查：已不存在或已不再是
+        // 普通文件（含变为 reparse/目录）则跳过——这是源变化，交由 c' 对账，不算复制错误。
         let mut completed_bytes = 0u64;
         let mut completed_files = 0u64;
         let mut last_emit = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
-        while let Some((cur_src, cur_dst)) = stack.pop() {
+        for task in &tasks {
             if should_cancel() {
                 return Err(AppError::Cancelled);
             }
-            // 跳过 reparse point 的内容递归，但仍创建占位（见 is_reparse_point 处理）
-            let is_rp = self.is_reparse_point(&cur_src);
-            if !cur_src.exists() {
+            let still_plain_file = match std::fs::symlink_metadata(&task.src) {
+                Ok(m) => m.is_file() && !self.is_reparse_point(&task.src),
+                Err(_) => false,
+            };
+            if !still_plain_file {
                 continue;
             }
-            if is_rp && cur_src != *src {
-                // 非 src 自身的 reparse point：创建空目录占位，不进入
-                std::fs::create_dir_all(&cur_dst)?;
-                continue;
-            }
-            if cur_src.is_dir() {
-                std::fs::create_dir_all(&cur_dst)?;
-                for entry in std::fs::read_dir(&cur_src)? {
-                    let entry = entry?;
-                    let child_src = entry.path();
-                    let child_dst = cur_dst.join(entry.file_name());
-                    stack.push((child_src, child_dst));
-                }
-            } else {
-                copy_file_with_control(
-                    &cur_src,
-                    &cur_dst,
-                    should_cancel,
-                    &mut completed_bytes,
-                    &mut last_emit,
-                    |bytes| {
-                        on_progress(&CopyProgress {
-                            phase: CopyPhase::Copying,
-                            completed_bytes: bytes,
-                            total_bytes: Some(total_bytes),
-                            completed_files,
-                            total_files: Some(total_files),
-                            current_path: Some(relative_display_path(src, &cur_src)),
-                        });
-                    },
-                )?;
-                completed_files += 1;
-                if last_emit.elapsed() >= Duration::from_millis(100)
-                    || completed_files == total_files
-                {
-                    on_progress(&CopyProgress {
-                        phase: CopyPhase::Copying,
-                        completed_bytes,
-                        total_bytes: Some(total_bytes),
-                        completed_files,
-                        total_files: Some(total_files),
-                        current_path: Some(relative_display_path(src, &cur_src)),
-                    });
-                    last_emit = Instant::now();
-                }
+            let actual = copy_file_counted(&task.src, &task.dst, should_cancel)?;
+            completed_bytes = completed_bytes.saturating_add(actual);
+            completed_files += 1;
+            copied_entries.push(ManifestEntry {
+                rel_path: task.rel_path.clone(),
+                is_dir: false,
+                size: actual,
+                mtime: 0,
+                attrs: 0,
+            });
+            let dst_len = std::fs::symlink_metadata(&task.dst)?.len();
+            dst_entries.push(ManifestEntry {
+                rel_path: task.rel_path.clone(),
+                is_dir: false,
+                size: dst_len,
+                mtime: 0,
+                attrs: 0,
+            });
+            if last_emit.elapsed() >= Duration::from_millis(100)
+                || completed_files == total_files
+            {
+                on_progress(&CopyProgress {
+                    phase: CopyPhase::Copying,
+                    completed_bytes,
+                    total_bytes: Some(total_bytes),
+                    completed_files,
+                    total_files: Some(total_files),
+                    current_path: Some(PathBuf::from(&task.rel_path)),
+                });
+                last_emit = Instant::now();
             }
         }
         if total_files == 0 {
@@ -255,7 +342,19 @@ impl FileOps for RealFileOps {
                 current_path: None,
             });
         }
-        Ok(())
+
+        Ok(CopyOutcome {
+            copied_manifest: Manifest {
+                root: src.to_string_lossy().into(),
+                entries: copied_entries,
+            },
+            dst_manifest: Manifest {
+                root: dst.to_string_lossy().into(),
+                entries: dst_entries,
+            },
+            total_bytes,
+            total_files,
+        })
     }
 
     fn manifest(&self, src: &Path) -> AppResult<Manifest> {
@@ -414,43 +513,6 @@ fn rel_under(root: &Path, p: &Path) -> String {
         .unwrap_or_else(|_| p.to_string_lossy().into())
 }
 
-fn relative_display_path(root: &Path, path: &Path) -> PathBuf {
-    path.strip_prefix(root).unwrap_or(path).to_path_buf()
-}
-
-fn copy_file_with_control(
-    src: &Path,
-    dst: &Path,
-    should_cancel: &dyn Fn() -> bool,
-    completed_bytes: &mut u64,
-    last_emit: &mut Instant,
-    mut on_chunk: impl FnMut(u64),
-) -> AppResult<()> {
-    const BUFFER_SIZE: usize = 1024 * 1024;
-    let mut input = std::fs::File::open(src)?;
-    let mut output = std::fs::File::create(dst)?;
-    let mut buffer = vec![0u8; BUFFER_SIZE];
-
-    loop {
-        if should_cancel() {
-            return Err(AppError::Cancelled);
-        }
-        let read = input.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        output.write_all(&buffer[..read])?;
-        *completed_bytes = completed_bytes.saturating_add(read as u64);
-        if last_emit.elapsed() >= Duration::from_millis(100) {
-            on_chunk(*completed_bytes);
-            *last_emit = Instant::now();
-        }
-    }
-    output.flush()?;
-    std::fs::set_permissions(dst, std::fs::metadata(src)?.permissions())?;
-    Ok(())
-}
-
 fn copy_recursive(src: &Path, dst: &Path) -> AppResult<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dst)?;
@@ -467,10 +529,26 @@ fn copy_recursive(src: &Path, dst: &Path) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
     use tempfile::TempDir;
 
     fn ops() -> RealFileOps {
         RealFileOps
+    }
+
+    #[test]
+    fn resolve_concurrency_defaults_to_available_cores_capped_at_8() {
+        let default = resolve_concurrency(None);
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        assert_eq!(default, cores.min(8));
+        assert!(default >= 1);
+    }
+
+    #[test]
+    fn resolve_concurrency_override_is_used_verbatim() {
+        // 覆盖值原样使用（不 clamp）；NonZeroUsize 从类型层保证 >= 1。
+        assert_eq!(resolve_concurrency(Some(NonZeroUsize::new(1).unwrap())), 1);
+        assert_eq!(resolve_concurrency(Some(NonZeroUsize::new(3).unwrap())), 3);
     }
 
     #[test]
@@ -481,7 +559,7 @@ mod tests {
         std::fs::write(src.join("a.txt"), b"hello").unwrap();
         std::fs::write(src.join("sub/b.txt"), b"world").unwrap();
         let dst = root.path().join("dst");
-        ops().copy_tree(&src, &dst, &|_| {}, &|| false).unwrap();
+        ops().copy_tree(&src, &dst, &|_| {}, &|| false, 1).unwrap();
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
         assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"world");
     }
@@ -502,6 +580,7 @@ mod tests {
                 &dst,
                 &|progress| events.borrow_mut().push(progress.clone()),
                 &|| false,
+                1,
             )
             .unwrap();
 
@@ -530,7 +609,7 @@ mod tests {
         std::fs::write(src.join("a.bin"), vec![1u8; 1024]).unwrap();
         let dst = root.path().join("dst");
 
-        let result = ops().copy_tree(&src, &dst, &|_| {}, &|| true);
+        let result = ops().copy_tree(&src, &dst, &|_| {}, &|| true, 1);
         assert!(matches!(result, Err(AppError::Cancelled)));
         assert!(!dst.exists());
     }
@@ -548,7 +627,7 @@ mod tests {
         junction::create(&link_target, &inner_link).unwrap();
         // 复制 src 到 dst
         let dst = root.path().join("dst");
-        ops().copy_tree(&src, &dst, &|_| {}, &|| false).unwrap();
+        ops().copy_tree(&src, &dst, &|_| {}, &|| false, 1).unwrap();
         // link 应作为占位存在（不跟随源 reparse point 的内容递归）
         assert!(dst.join("link").exists());
         // 不应在 dst 中递归进入 target 的内容（secret.txt 不应出现）
@@ -562,7 +641,7 @@ mod tests {
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("a.txt"), b"hello").unwrap();
         let dst = root.path().join("dst");
-        ops().copy_tree(&src, &dst, &|_| {}, &|| false).unwrap();
+        ops().copy_tree(&src, &dst, &|_| {}, &|| false, 1).unwrap();
         let m1 = ops().manifest(&src).unwrap();
         let m2 = ops().manifest(&dst).unwrap();
         assert!(

@@ -355,6 +355,7 @@ pub async fn start_migrate(
         source_volume_serial: src_serial,
         target_volume_serial: tgt_serial,
         enable_vss,
+        copy_concurrency: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_slot = state.cancel_token.clone();
