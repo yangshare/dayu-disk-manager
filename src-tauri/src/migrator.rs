@@ -330,59 +330,105 @@ pub fn migrate_with_snapshot(
             "migrate_partial",
         )?;
     } else {
-        emit(stage::SYNCING, 80, "准备同步复制期间的变化");
-        if let Err(e) = ops.copy_tree(
-            &plan.old_path,
-            &plan.tmp,
-            &|progress| {
-                on_progress(transfer_event(
-                    &plan.task_id,
-                    stage::SYNCING,
-                    (80, 90),
-                    progress,
-                    "正在检查复制期间的变化",
-                    "正在同步复制期间的变化",
-                ))
-            },
-            &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-        ) {
-            // 回滚：改回原名
-            let _ = ops.rename(&plan.old_path, &plan.src);
-            if matches!(e, AppError::Cancelled) {
-                let _ = ops.remove_tree(&plan.tmp);
-                bail(
-                    journal.cancel(&plan.task_id),
-                    source_changed,
-                    "migrate_partial",
-                )?;
-            } else {
-                bail(
-                    journal.fail(&plan.task_id, "增量同步失败"),
-                    source_changed,
-                    "migrate_partial",
-                )?;
-            }
-            return Err(fail(e, source_changed, "migrate_partial"));
-        }
-        let m3 = bail(
+        emit(stage::SYNCING, 80, "检查复制期间的变化");
+        let old_manifest = bail(
             ops.manifest(&plan.old_path),
             source_changed,
             "migrate_partial",
         )?;
-        let m4 = bail(ops.manifest(&plan.tmp), source_changed, "migrate_partial")?;
-        if !ops.diff_manifests(&m3, &m4).is_empty() {
-            let _ = ops.rename(&plan.old_path, &plan.src);
-            bail(
-                journal.fail(&plan.task_id, "二次校验不一致"),
+        if ops
+            .diff_manifests(&outcome.copied_manifest, &old_manifest)
+            .is_empty()
+        {
+            // 源没变 -> 跳过补传（常态，省掉旧的全量重读）。
+        } else {
+            // 源变了（罕见）-> 先清空旧 tmp，再在空目录中全量补传。
+            // 不能原地覆盖：old_path 中已删除的条目必须从 tmp 消失。
+            if let Err(e) = ops.remove_tree(&plan.tmp) {
+                let _ = ops.rename(&plan.old_path, &plan.src);
+                bail(
+                    journal.fail(&plan.task_id, "清空临时目录失败"),
+                    source_changed,
+                    "migrate_partial",
+                )?;
+                return Err(fail(e, source_changed, "migrate_partial"));
+            }
+            let patch = match ops.copy_tree(
+                &plan.old_path,
+                &plan.tmp,
+                &|progress| {
+                    on_progress(transfer_event(
+                        &plan.task_id,
+                        stage::SYNCING,
+                        (80, 90),
+                        progress,
+                        "正在检查复制期间的变化",
+                        "正在同步复制期间的变化",
+                    ))
+                },
+                &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
+                resolve_concurrency(plan.copy_concurrency),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    // 回滚：改回原名
+                    let _ = ops.rename(&plan.old_path, &plan.src);
+                    if matches!(e, AppError::Cancelled) {
+                        let _ = ops.remove_tree(&plan.tmp);
+                        bail(
+                            journal.cancel(&plan.task_id),
+                            source_changed,
+                            "migrate_partial",
+                        )?;
+                    } else {
+                        bail(
+                            journal.fail(&plan.task_id, "增量同步失败"),
+                            source_changed,
+                            "migrate_partial",
+                        )?;
+                    }
+                    return Err(fail(e, source_changed, "migrate_partial"));
+                }
+            };
+            if !ops
+                .diff_manifests(&patch.copied_manifest, &patch.dst_manifest)
+                .is_empty()
+            {
+                let _ = ops.rename(&plan.old_path, &plan.src);
+                bail(
+                    journal.fail(&plan.task_id, "二次校验不一致"),
+                    source_changed,
+                    "migrate_partial",
+                )?;
+                return Err(fail(
+                    AppError::Migrate("增量后 manifest 不一致".into()),
+                    source_changed,
+                    "migrate_partial",
+                ));
+            }
+            // old_path 在改名后理论上不再被常规路径写入；仍复核一次，
+            // 保持现有"补传期间发生变化则回滚"的安全语义。
+            let final_old_manifest = bail(
+                ops.manifest(&plan.old_path),
                 source_changed,
                 "migrate_partial",
             )?;
-            return Err(fail(
-                AppError::Migrate("增量后 manifest 不一致".into()),
-                source_changed,
-                "migrate_partial",
-            ));
+            if !ops
+                .diff_manifests(&patch.copied_manifest, &final_old_manifest)
+                .is_empty()
+            {
+                let _ = ops.rename(&plan.old_path, &plan.src);
+                bail(
+                    journal.fail(&plan.task_id, "补传期间源发生变化"),
+                    source_changed,
+                    "migrate_partial",
+                )?;
+                return Err(fail(
+                    AppError::Migrate("补传期间源发生变化".into()),
+                    source_changed,
+                    "migrate_partial",
+                ));
+            }
         }
         bail(
             journal.mark_stage(&plan.task_id, "incremental_synced"),
@@ -860,6 +906,10 @@ mod tests {
         incremental_copy_ok: bool,
         /// 回收站 (to_recycle_bin) 是否成功
         recycle_ok: bool,
+        /// 复制期间源是否变化：true 时 c' 判定需增量补传。
+        source_changed_during_copy: bool,
+        /// 补传期间源是否继续变化：true 时 final 复核不一致 -> 回滚改名。
+        source_keeps_changing: bool,
         /// 记录每次 create_junction 的 (link, target) 实参，便于断言重建被调用。
         create_junction_calls: std::cell::RefCell<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
         /// 记录每次 copy_tree 的 src 实参（用于断言读源走快照、写源走原路径）。
@@ -868,6 +918,23 @@ mod tests {
         manifest_calls: std::cell::RefCell<Vec<std::path::PathBuf>>,
         /// 记录每次 rename 的 (from, to) 实参。
         rename_calls: std::cell::RefCell<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
+        /// manifest(old_path) 调用计数：区分 c' 增量前(第1次)与 final(第2次)。
+        manifest_old_count: std::cell::RefCell<usize>,
+    }
+
+    /// 与 MockOps::copy_tree 返回的 copied_manifest 内容一致的哨兵条目，
+    /// 用于让 b'(copied vs dst) 与 c' 源未变(copied vs old) 的真实 diff 为空。
+    fn mock_sentinel_manifest() -> Manifest {
+        Manifest {
+            root: String::new(),
+            entries: vec![crate::file_ops::ManifestEntry {
+                rel_path: "mocked.txt".into(),
+                is_dir: false,
+                size: 1,
+                mtime: 0,
+                attrs: 0,
+            }],
+        }
     }
 
     impl MockOps {
@@ -880,10 +947,13 @@ mod tests {
                 rename_source_ok: true,
                 incremental_copy_ok: true,
                 recycle_ok: true,
+                source_changed_during_copy: false,
+                source_keeps_changing: false,
                 create_junction_calls: RefCell::new(vec![]),
                 copy_src_calls: RefCell::new(vec![]),
                 manifest_calls: RefCell::new(vec![]),
                 rename_calls: RefCell::new(vec![]),
+                manifest_old_count: RefCell::new(0),
             }
         }
     }
@@ -898,7 +968,6 @@ mod tests {
             _concurrency: usize,
         ) -> AppResult<crate::file_ops::CopyOutcome> {
             self.copy_src_calls.borrow_mut().push(s.to_path_buf());
-            // 区分阶段：复制阶段 src 是 plan.src，增量阶段 src 是 plan.old_path（含 dayu-old-）
             let is_incremental_stage = s
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -911,8 +980,8 @@ mod tests {
             };
             if ok {
                 Ok(crate::file_ops::CopyOutcome {
-                    copied_manifest: Manifest { root: String::new(), entries: vec![] },
-                    dst_manifest: Manifest { root: String::new(), entries: vec![] },
+                    copied_manifest: mock_sentinel_manifest(),
+                    dst_manifest: mock_sentinel_manifest(),
                     total_bytes: 0,
                     total_files: 0,
                 })
@@ -924,17 +993,53 @@ mod tests {
         }
         fn manifest(&self, s: &Path) -> AppResult<Manifest> {
             self.manifest_calls.borrow_mut().push(s.to_path_buf());
-            Ok(Manifest {
-                root: String::new(),
-                entries: vec![],
-            })
-        }
-        fn diff_manifests(&self, _a: &Manifest, _b: &Manifest) -> Vec<String> {
-            if self.manifest_ok {
-                vec![]
+            let is_old = s
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains("dayu-old-"))
+                .unwrap_or(false);
+            if is_old {
+                let mut count = self.manifest_old_count.borrow_mut();
+                *count += 1;
+                // 第 1 次 = c' 增量前；第 2 次 = 补传后 final 复核。
+                let changed = if *count == 1 {
+                    self.source_changed_during_copy
+                } else {
+                    self.source_keeps_changing
+                };
+                if changed {
+                    Ok(Manifest { root: String::new(), entries: vec![] })
+                } else {
+                    Ok(mock_sentinel_manifest())
+                }
             } else {
-                vec!["f.txt".into()]
+                Ok(mock_sentinel_manifest())
             }
+        }
+        fn diff_manifests(&self, a: &Manifest, b: &Manifest) -> Vec<String> {
+            if !self.manifest_ok {
+                return vec!["f.txt".into()];
+            }
+            // 委托真实比较（与 RealFileOps::diff_manifests 等价：仅比 rel_path/is_dir/size）。
+            use std::collections::{HashMap, HashSet};
+            let map_a: HashMap<&str, &crate::file_ops::ManifestEntry> =
+                a.entries.iter().map(|e| (e.rel_path.as_str(), e)).collect();
+            let map_b: HashMap<&str, &crate::file_ops::ManifestEntry> =
+                b.entries.iter().map(|e| (e.rel_path.as_str(), e)).collect();
+            let mut keys: HashSet<&str> = map_a.keys().copied().collect();
+            keys.extend(map_b.keys().copied());
+            let mut diffs = Vec::new();
+            for k in keys {
+                match (map_a.get(k), map_b.get(k)) {
+                    (Some(x), Some(y)) => {
+                        if x.is_dir != y.is_dir || x.size != y.size {
+                            diffs.push(k.to_string());
+                        }
+                    }
+                    _ => diffs.push(k.to_string()),
+                }
+            }
+            diffs
         }
         fn rename(&self, f: &Path, t: &Path) -> AppResult<()> {
             self.rename_calls
@@ -1249,6 +1354,7 @@ mod tests {
         let plan = plan_for(dir.path(), "isf");
         let ops = {
             let mut o = MockOps::success_path();
+            o.source_changed_during_copy = true;
             o.incremental_copy_ok = false;
             o
         };
@@ -1315,6 +1421,85 @@ mod tests {
         assert!(!plan.tmp.exists(), "tmp 不应存在");
         // 无迁移记录落盘
         assert!(store.load_migrations().unwrap().is_empty());
+    }
+
+    // ===== T10 c' 降级路径测试 =====
+    //
+    // 用改造后的 MockOps 注入源变化，验证 c' 的四种行为：
+    // 源未变跳过补传 / 源变+增量失败回滚 / 源持续变化回滚 / 源变后稳定成功。
+
+    #[test]
+    fn migrate_c_prime_skips_sync_when_source_unchanged() {
+        // 源没变：c' 应跳过补传，不调用增量 copy_tree(old_path)。
+        let (dir, store, journal, history) = fixtures();
+        let plan = plan_for(dir.path(), "cprime-skip");
+        let ops = MockOps::success_path(); // source_changed_during_copy = false
+        let cancel = AtomicBool::new(false);
+        migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel).unwrap();
+        let copies = ops.copy_src_calls.borrow();
+        assert!(
+            !copies.iter().any(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("dayu-old-"))
+            }),
+            "源未变时 c' 不应调用增量 copy_tree(old_path)，实参: {copies:?}"
+        );
+    }
+
+    #[test]
+    fn migrate_c_prime_incremental_fail_rolls_back_rename() {
+        // 源变了 + 增量 copy_tree 失败 -> 回滚改名，source_changed=true，migrate_partial。
+        let (dir, store, journal, history) = fixtures();
+        let plan = plan_for(dir.path(), "cprime-incfail");
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.source_changed_during_copy = true;
+            o.incremental_copy_ok = false;
+            o
+        };
+        let cancel = AtomicBool::new(false);
+        let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
+        let (_e, outcome) = res.expect_err("源变+增量失败应回滚");
+        assert!(outcome.source_changed, "已改名，source_changed=true");
+        assert_eq!(outcome.reason, "migrate_partial");
+    }
+
+    #[test]
+    fn migrate_c_prime_source_keeps_changing_rolls_back_rename() {
+        // 源变了、增量成功、但补传期间源再变 -> final 复核不一致 -> 回滚改名。
+        let (dir, store, journal, history) = fixtures();
+        let plan = plan_for(dir.path(), "cprime-keepchanging");
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.source_changed_during_copy = true;
+            o.source_keeps_changing = true; // 补传后 final old_manifest 为空 -> diff 非空
+            o
+        };
+        let cancel = AtomicBool::new(false);
+        let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
+        let (_e, outcome) = res.expect_err("补传期间源再变应回滚");
+        assert!(outcome.source_changed, "已改名，source_changed=true");
+        assert_eq!(outcome.reason, "migrate_partial");
+    }
+
+    #[test]
+    fn migrate_c_prime_source_changed_then_stable_succeeds() {
+        // 源变了、增量补传成功、补传后源稳定 -> 最终建链成功。
+        let (dir, store, journal, history) = fixtures();
+        let plan = plan_for(dir.path(), "cprime-stable");
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.source_changed_during_copy = true;
+            o.source_keeps_changing = false; // final old_manifest = 哨兵 -> diff 空
+            o
+        };
+        let cancel = AtomicBool::new(false);
+        let (m, outcome) = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel)
+            .expect("源变后稳定补传应成功");
+        assert!(outcome.source_changed);
+        assert_eq!(outcome.reason, "migrated");
+        assert_eq!(m.status, MigrationStatus::Active);
     }
 
     // ===== T10 修复轮：成功路径命根子失败注入测试 =====
@@ -1504,10 +1689,15 @@ mod tests {
             renames.iter().any(|(f, _t)| *f == src),
             "改名源应作用于原路径 src，实参: {renames:?}"
         );
-        // old_path->src 的回滚不存在（成功路径），但 old_path->tmp 的增量 copy 首参是 old_path。
+        // c' 源未变：不调用增量 copy_tree(old_path)，而是扫描 old_path 记 manifest。
         assert!(
-            copy_calls.iter().any(|p| *p == old_path),
-            "增量同步应读 old_path 原路径，实参: {copy_calls:?}"
+            !copy_calls.iter().any(|p| *p == old_path),
+            "源未变时 c' 不应调用 copy_tree(old_path)，实参: {copy_calls:?}"
+        );
+        let manifest_calls = ops.manifest_calls.borrow();
+        assert!(
+            manifest_calls.iter().any(|p| *p == old_path),
+            "c' 应扫描 old_path 记 manifest，实参: {manifest_calls:?}"
         );
     }
 }
