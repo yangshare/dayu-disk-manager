@@ -793,4 +793,130 @@ mod tests {
         assert_eq!(std::fs::read(dst_multi.join("f0.txt")).unwrap(), vec![0u8; 64]);
         assert_eq!(std::fs::read(dst_multi.join("a/b/g0.txt")).unwrap(), vec![9u8; 128]);
     }
+
+    #[test]
+    fn copy_tree_preserves_empty_dirs_and_outcome_manifests_agree() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(src.join("empty/sub")).unwrap();
+        std::fs::write(src.join("keep.txt"), b"x").unwrap();
+        let dst = root.path().join("dst");
+        let outcome = ops()
+            .copy_tree(&src, &dst, &|_| {}, &|| false, 4)
+            .unwrap();
+        // 空目录被保留
+        assert!(dst.join("empty/sub").is_dir(), "空目录应被复制");
+        assert_eq!(std::fs::read(dst.join("keep.txt")).unwrap(), b"x");
+        // 两份 outcome manifest 真实 diff 为空（复制完整性 b'）
+        assert!(
+            ops().diff_manifests(&outcome.copied_manifest, &outcome.dst_manifest).is_empty(),
+            "copied 与 dst manifest 必须一致"
+        );
+        // copied manifest 应含 keep.txt（文件）与目录条目
+        let rels: Vec<&str> = outcome.copied_manifest.entries.iter().map(|e| e.rel_path.as_str()).collect();
+        assert!(rels.contains(&"keep.txt"));
+        assert!(rels.iter().any(|r| r.starts_with("empty")), "应含 empty 目录条目");
+    }
+
+    #[test]
+    fn copy_tree_skips_files_removed_after_scan_without_error() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("keep.txt"), b"keep").unwrap();
+        let gone_path = src.join("gone.txt");
+        std::fs::write(&gone_path, b"gone").unwrap();
+        let dst = root.path().join("dst");
+        // 阶段①扫描末尾会发一次最终 Preparing 事件；在其回调里删除 gone.txt，
+        // 使阶段② worker 打开它前 symlink_metadata 检查命中"已删除"-> 跳过。
+        let gone = gone_path.clone();
+        let outcome = ops()
+            .copy_tree(
+                &src,
+                &dst,
+                &|p| {
+                    if p.phase == CopyPhase::Preparing {
+                        let _ = std::fs::remove_file(&gone);
+                    }
+                },
+                &|| false,
+                1,
+            )
+            .unwrap();
+        // 不报错；keep.txt 正常复制
+        assert_eq!(std::fs::read(dst.join("keep.txt")).unwrap(), b"keep");
+        assert!(!dst.join("gone.txt").exists(), "被删文件不应出现在 dst");
+        // outcome 自洽：copied 与 dst 一致（均不含 gone）
+        assert!(
+            ops().diff_manifests(&outcome.copied_manifest, &outcome.dst_manifest).is_empty(),
+            "源变化跳过的条目不应造成 copied/dst 不一致"
+        );
+    }
+
+    #[test]
+    fn copy_tree_mid_copy_cancellation_returns_cancelled() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // 10MB 单文件：阶段①扫描 should_cancel 调用极少，阈值落在阶段②块复制中。
+        std::fs::write(src.join("big.bin"), vec![0u8; 10 * 1024 * 1024]).unwrap();
+        let dst = root.path().join("dst");
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = counter.clone();
+        let cancel = move || {
+            // 前 5 次（扫描 + 取任务 + 前几块）false，之后 true -> 块复制中途取消。
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 5
+        };
+        let result = ops().copy_tree(&src, &dst, &|_| {}, &cancel, 1);
+        assert!(matches!(result, Err(AppError::Cancelled)), "复制中途取消应返回 Cancelled");
+    }
+
+    #[test]
+    fn copy_tree_propagates_first_io_error() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("x.txt"), b"hello").unwrap();
+        let dst = root.path().join("dst");
+        std::fs::create_dir_all(dst.join("x.txt")).unwrap(); // 目标同名已是目录 -> create 失败
+        let result = ops().copy_tree(&src, &dst, &|_| {}, &|| false, 1);
+        assert!(result.is_err(), "dst 碰撞应作为 IO 错误传播");
+        // 不应是 Cancelled；应是 Io 错误（File::create 对目录失败）
+        assert!(!matches!(result, Err(AppError::Cancelled)));
+    }
+
+    #[test]
+    fn copy_tree_progress_never_exceeds_total() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.bin"), vec![1u8; 1024]).unwrap();
+        std::fs::write(src.join("b.bin"), vec![2u8; 2048]).unwrap();
+        let dst = root.path().join("dst");
+        let events = std::cell::RefCell::new(Vec::new());
+        ops()
+            .copy_tree(
+                &src,
+                &dst,
+                &|p| events.borrow_mut().push(p.clone()),
+                &|| false,
+                4,
+            )
+            .unwrap();
+        let events = events.into_inner();
+        let mut last_completed = 0u64;
+        for e in &events {
+            if e.phase == CopyPhase::Copying {
+                if let Some(total) = e.total_bytes {
+                    assert!(e.completed_bytes <= total, "completed_bytes 不得超过 total_bytes");
+                }
+                if let Some(total) = e.total_files {
+                    assert!(e.completed_files <= total, "completed_files 不得超过 total_files");
+                }
+                // 单调（主线程汇报器按原子累加值发出，clamp 后不减）
+                assert!(e.completed_bytes >= last_completed, "进度不得回退");
+                last_completed = e.completed_bytes;
+            }
+        }
+    }
 }
