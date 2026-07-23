@@ -47,7 +47,7 @@ pub struct ManifestEntry {
     pub rel_path: String,
     pub is_dir: bool,
     pub size: u64,
-    /// Unix 秒
+    /// Unix 纳秒。复制前记录源文件快照时用于检测同尺寸内容改写。
     pub mtime: i64,
     pub attrs: u32,
 }
@@ -61,7 +61,7 @@ pub struct Manifest {
 }
 
 /// `copy_tree` 的产出：实际读入的源条目与实际落盘的目标条目各一份 manifest，
-/// 外加扫描阶段统计的总量。两份 manifest 由 migrator 的 b'/c' 直接 diff，
+/// 外加扫描阶段统计的总量。b' 比较复制完整性，c' 比较源元数据快照，
 /// 不再额外遍历目录。
 pub struct CopyOutcome {
     /// 实际创建的目录/reparse 占位 + 实际成功读入的文件条目（size=实际读入字节）。
@@ -82,6 +82,33 @@ pub fn resolve_concurrency(override_: Option<NonZeroUsize>) -> usize {
             .unwrap_or(1)
             .min(8),
     }
+}
+
+/// 对比两份源快照。除路径、类型和大小外，源快照还必须匹配修改时间和属性；
+/// 这与复制完整性校验不同，后者不能比较目标端天然会变化的元数据。
+pub fn diff_source_snapshots(a: &Manifest, b: &Manifest) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let map_a: HashMap<&str, &ManifestEntry> =
+        a.entries.iter().map(|e| (e.rel_path.as_str(), e)).collect();
+    let map_b: HashMap<&str, &ManifestEntry> =
+        b.entries.iter().map(|e| (e.rel_path.as_str(), e)).collect();
+    let mut keys: std::collections::HashSet<&str> = map_a.keys().copied().collect();
+    keys.extend(map_b.keys().copied());
+
+    let mut diffs = Vec::new();
+    for key in keys {
+        match (map_a.get(key), map_b.get(key)) {
+            (Some(x), Some(y))
+                if x.is_dir == y.is_dir
+                    && x.size == y.size
+                    && x.mtime == y.mtime
+                    && x.attrs == y.attrs => {}
+            (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) => diffs.push(key.to_string()),
+            (None, None) => unreachable!("key is collected from both manifests"),
+        }
+    }
+    diffs
 }
 
 /// 单个文件的复制任务（扫描阶段产出，并发阶段消费）。
@@ -151,15 +178,20 @@ where
     })
 }
 
-/// 复制单个普通文件，返回实际读写的字节数。不回调进度（进度由调用方的主线程汇报器统一发出）。
+/// 复制单个普通文件，返回实际读写字节数及读取前的源文件快照。
 /// 每读完一个 buffer 块检查取消。
 fn copy_file_counted(
     src: &Path,
     dst: &Path,
+    rel_path: String,
     should_cancel: &(dyn Fn() -> bool + Sync),
-) -> AppResult<u64> {
+    completed_bytes: &AtomicU64,
+) -> AppResult<(u64, ManifestEntry)> {
     const BUFFER_SIZE: usize = 1024 * 1024;
     let mut input = std::fs::File::open(src)?;
+    // 在读取前取快照。后续同尺寸改写会在 c' 与改名后的 old_path 比较时被发现。
+    let source_metadata = input.metadata()?;
+    let source_entry = entry_from_metadata(rel_path, false, &source_metadata);
     let mut output = std::fs::File::create(dst)?;
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut copied = 0u64;
@@ -173,10 +205,11 @@ fn copy_file_counted(
         }
         output.write_all(&buffer[..read])?;
         copied = copied.saturating_add(read as u64);
+        completed_bytes.fetch_add(read as u64, Ordering::Relaxed);
     }
     output.flush()?;
-    std::fs::set_permissions(dst, std::fs::metadata(src)?.permissions())?;
-    Ok(copied)
+    std::fs::set_permissions(dst, source_metadata.permissions())?;
+    Ok((copied, source_entry))
 }
 
 impl FileOps for RealFileOps {
@@ -225,13 +258,7 @@ impl FileOps for RealFileOps {
             if cur_src.is_dir() {
                 std::fs::create_dir_all(&cur_dst)?;
                 if cur_src != *src {
-                    copied_entries.push(ManifestEntry {
-                        rel_path: rel.clone(),
-                        is_dir: true,
-                        size: 0,
-                        mtime: 0,
-                        attrs: 0,
-                    });
+                    copied_entries.push(entry_for(&cur_src, src, true)?);
                     dst_entries.push(ManifestEntry {
                         rel_path: rel.clone(),
                         is_dir: true,
@@ -258,6 +285,7 @@ impl FileOps for RealFileOps {
                 // 文件：只 stat 预估总量并推入任务；不作为一致性基准。
                 total_bytes = total_bytes.saturating_add(std::fs::metadata(&cur_src)?.len());
                 total_files += 1;
+                let current_path = PathBuf::from(&rel);
                 tasks.push(CopyTask {
                     src: cur_src,
                     dst: cur_dst,
@@ -270,7 +298,7 @@ impl FileOps for RealFileOps {
                         total_bytes: None,
                         completed_files: total_files,
                         total_files: None,
-                        current_path: None,
+                        current_path: Some(current_path),
                     });
                     last_emit = Instant::now();
                 }
@@ -289,6 +317,7 @@ impl FileOps for RealFileOps {
         // 注意：原子值用 Arc 包裹，让 N 个 worker 与主线程汇报器都能持有引用，避免被首个 worker 移动。
         let actual_bytes = Arc::new(AtomicU64::new(0));
         let actual_files = Arc::new(AtomicUsize::new(0));
+        let current_path: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let copied_files: Arc<Mutex<Vec<ManifestEntry>>> = Arc::new(Mutex::new(Vec::with_capacity(tasks.len())));
         let dst_files: Arc<Mutex<Vec<ManifestEntry>>> = Arc::new(Mutex::new(Vec::with_capacity(tasks.len())));
         let first_error: Arc<Mutex<Option<AppError>>> = Arc::new(Mutex::new(None));
@@ -308,6 +337,7 @@ impl FileOps for RealFileOps {
                 let active = Arc::clone(&active);
                 let actual_bytes = Arc::clone(&actual_bytes);
                 let actual_files = Arc::clone(&actual_files);
+                let current_path = Arc::clone(&current_path);
                 let ops = self;
                 s.spawn(move || loop {
                     if stop.load(Ordering::Relaxed) || should_cancel() {
@@ -319,6 +349,7 @@ impl FileOps for RealFileOps {
                         active.fetch_sub(1, Ordering::Relaxed);
                         break;
                     };
+                    *current_path.lock().unwrap() = Some(PathBuf::from(&task.rel_path));
                     // 打开前重新检查：已不存在或已不再是普通文件（含变 reparse/目录）则跳过，
                     // 交由 c' 对账，不算复制错误。
                     let still_plain = match std::fs::symlink_metadata(&task.src) {
@@ -328,17 +359,16 @@ impl FileOps for RealFileOps {
                     if !still_plain {
                         continue;
                     }
-                    match copy_file_counted(&task.src, &task.dst, should_cancel) {
-                        Ok(actual) => {
-                            actual_bytes.fetch_add(actual, Ordering::Relaxed);
+                    match copy_file_counted(
+                        &task.src,
+                        &task.dst,
+                        task.rel_path.clone(),
+                        should_cancel,
+                        actual_bytes.as_ref(),
+                    ) {
+                        Ok((_actual, source_entry)) => {
                             actual_files.fetch_add(1, Ordering::Relaxed);
-                            copied_files.lock().unwrap().push(ManifestEntry {
-                                rel_path: task.rel_path.clone(),
-                                is_dir: false,
-                                size: actual,
-                                mtime: 0,
-                                attrs: 0,
-                            });
+                            copied_files.lock().unwrap().push(source_entry);
                             match std::fs::symlink_metadata(&task.dst) {
                                 Ok(m) => dst_files.lock().unwrap().push(ManifestEntry {
                                     rel_path: task.rel_path,
@@ -379,7 +409,7 @@ impl FileOps for RealFileOps {
                     total_bytes: Some(total_bytes),
                     completed_files: done_files,
                     total_files: Some(total_files),
-                    current_path: None,
+                    current_path: current_path.lock().unwrap().clone(),
                 });
                 std::thread::sleep(Duration::from_millis(100));
                 // 若队列已空且无 worker 活跃，主线程也退出（避免空转）。
@@ -402,7 +432,7 @@ impl FileOps for RealFileOps {
             total_bytes: Some(total_bytes),
             completed_files: done_files,
             total_files: Some(total_files),
-            current_path: None,
+            current_path: current_path.lock().unwrap().clone(),
         });
 
         // 错误/取消优先于成功。
@@ -557,12 +587,16 @@ impl FileOps for RealFileOps {
 
 fn entry_for(p: &Path, root: &Path, is_dir: bool) -> AppResult<ManifestEntry> {
     let meta = std::fs::symlink_metadata(p)?;
+    Ok(entry_from_metadata(rel_under(root, p), is_dir, &meta))
+}
+
+fn entry_from_metadata(rel_path: String, is_dir: bool, meta: &std::fs::Metadata) -> ManifestEntry {
     let size = if is_dir { 0 } else { meta.len() };
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
     #[cfg(windows)]
     let attrs = {
@@ -571,13 +605,13 @@ fn entry_for(p: &Path, root: &Path, is_dir: bool) -> AppResult<ManifestEntry> {
     };
     #[cfg(not(windows))]
     let attrs = 0u32;
-    Ok(ManifestEntry {
-        rel_path: rel_under(root, p),
+    ManifestEntry {
+        rel_path,
         is_dir,
         size,
         mtime,
         attrs,
-    })
+    }
 }
 
 fn rel_under(root: &Path, p: &Path) -> String {
@@ -671,9 +705,10 @@ mod tests {
         assert_eq!(last.completed_files, 2);
         assert_eq!(last.total_files, Some(2));
         assert_eq!(last.percent(), 100);
-        // 并发模型下进度由原子计数器汇总，current_path 统一为 None；
-        // 串行（concurrency=1）也走同一实现，因此保持 None。
-        assert!(last.current_path.is_none());
+        assert!(
+            last.current_path.is_some(),
+            "复制完成事件应保留最后处理的相对路径"
+        );
     }
 
     #[test]
@@ -738,6 +773,50 @@ mod tests {
         let m2 = ops().manifest(&b).unwrap();
         let diff = ops().diff_manifests(&m1, &m2);
         assert!(diff.iter().any(|p| p == "f.txt"), "应检测到 f.txt 不一致");
+    }
+
+    #[test]
+    fn diff_source_snapshots_detects_same_size_write() {
+        let before = Manifest {
+            root: String::new(),
+            entries: vec![ManifestEntry {
+                rel_path: "f.txt".into(),
+                is_dir: false,
+                size: 3,
+                mtime: 100,
+                attrs: 0,
+            }],
+        };
+        let after = Manifest {
+            root: String::new(),
+            entries: vec![ManifestEntry {
+                rel_path: "f.txt".into(),
+                is_dir: false,
+                size: 3,
+                mtime: 101,
+                attrs: 0,
+            }],
+        };
+
+        assert_eq!(diff_source_snapshots(&before, &after), vec!["f.txt"]);
+    }
+
+    #[test]
+    fn copy_file_counted_updates_byte_counter_and_captures_source_snapshot() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("source.bin");
+        let dst = root.path().join("target.bin");
+        let bytes = vec![7u8; 2 * 1024 * 1024 + 1];
+        std::fs::write(&src, &bytes).unwrap();
+        let completed = AtomicU64::new(0);
+
+        let (copied, source_entry) =
+            copy_file_counted(&src, &dst, "source.bin".into(), &|| false, &completed).unwrap();
+
+        assert_eq!(copied, bytes.len() as u64);
+        assert_eq!(completed.load(Ordering::Relaxed), copied);
+        assert_eq!(source_entry.size, copied);
+        assert!(source_entry.mtime > 0);
     }
 
     #[test]
@@ -918,5 +997,11 @@ mod tests {
                 last_completed = e.completed_bytes;
             }
         }
+        assert!(
+            events
+                .iter()
+                .any(|e| e.phase == CopyPhase::Copying && e.current_path.is_some()),
+            "复制事件应包含正在处理的相对路径"
+        );
     }
 }

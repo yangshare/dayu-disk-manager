@@ -1,5 +1,7 @@
 use crate::error::{AppError, AppResult};
-use crate::file_ops::{resolve_concurrency, CopyPhase, CopyProgress, FileOps};
+use crate::file_ops::{
+    diff_source_snapshots, resolve_concurrency, CopyPhase, CopyProgress, FileOps,
+};
 use crate::history::History;
 use crate::journal::Journal;
 use crate::models::{
@@ -143,6 +145,25 @@ pub struct MigratePlan {
     pub enable_vss: bool,
     /// 复制并发度覆盖。`None` 走默认（min(逻辑核数, 8)）。当前不暴露前端配置。
     pub copy_concurrency: Option<NonZeroUsize>,
+}
+
+/// 源目录已改名后取消：恢复用户入口并清理临时复制，避免继续进入建链阶段。
+fn abort_if_cancelled_after_source_rename(
+    ops: &dyn FileOps,
+    journal: &Journal,
+    plan: &MigratePlan,
+    cancel: &AtomicBool,
+) -> Result<(), (AppError, OperationOutcome)> {
+    if !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    let _ = ops.rename(&plan.old_path, &plan.src);
+    let _ = ops.remove_tree(&plan.tmp);
+    journal
+        .cancel(&plan.task_id)
+        .map_err(|e| fail(e, true, "migrate_partial"))?;
+    Err(fail(AppError::Cancelled, true, "migrate_partial"))
 }
 
 pub fn migrate(
@@ -300,6 +321,20 @@ pub fn migrate_with_snapshot(
         "migrate_rolled_back",
     )?;
 
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = ops.remove_tree(&plan.tmp);
+        bail(
+            journal.cancel(&plan.task_id),
+            source_changed,
+            "migrate_rolled_back",
+        )?;
+        return Err(fail(
+            AppError::Cancelled,
+            source_changed,
+            "migrate_canceled",
+        ));
+    }
+
     // 阶段 c：改名源 + 增量同步 + 建链
     emit(stage::RENAMING_SOURCE, 70, "改名源目录");
     if let Err(e) = ops.rename(&plan.src, &plan.old_path) {
@@ -316,6 +351,7 @@ pub fn migrate_with_snapshot(
         source_changed,
         "migrate_partial",
     )?;
+    abort_if_cancelled_after_source_rename(ops, journal, plan, cancel)?;
 
     // 增量同步：old_path -> tmp（捕捉复制期间变化）
     //
@@ -336,10 +372,7 @@ pub fn migrate_with_snapshot(
             source_changed,
             "migrate_partial",
         )?;
-        if ops
-            .diff_manifests(&outcome.copied_manifest, &old_manifest)
-            .is_empty()
-        {
+        if diff_source_snapshots(&outcome.copied_manifest, &old_manifest).is_empty() {
             // 源没变 -> 跳过补传（常态，省掉旧的全量重读）。
         } else {
             // 源变了（罕见）-> 先清空旧 tmp，再在空目录中全量补传。
@@ -413,10 +446,7 @@ pub fn migrate_with_snapshot(
                 source_changed,
                 "migrate_partial",
             )?;
-            if !ops
-                .diff_manifests(&patch.copied_manifest, &final_old_manifest)
-                .is_empty()
-            {
+            if !diff_source_snapshots(&patch.copied_manifest, &final_old_manifest).is_empty() {
                 let _ = ops.rename(&plan.old_path, &plan.src);
                 bail(
                     journal.fail(&plan.task_id, "补传期间源发生变化"),
@@ -436,6 +466,8 @@ pub fn migrate_with_snapshot(
             "migrate_partial",
         )?;
     }
+
+    abort_if_cancelled_after_source_rename(ops, journal, plan, cancel)?;
 
     // tmp -> target 原子改名
     emit(stage::CREATING_JUNCTION, 90, "建立 junction");
@@ -810,7 +842,8 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
     use std::path::Path;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn fixtures() -> (TempDir, Store, Journal, History) {
@@ -910,6 +943,10 @@ mod tests {
         source_changed_during_copy: bool,
         /// 补传期间源是否继续变化：true 时 final 复核不一致 -> 回滚改名。
         source_keeps_changing: bool,
+        /// 首次 c' 源快照与 copied_manifest 同大小但 mtime 不同。
+        source_changed_same_size: bool,
+        /// 首次 c' 扫描结束时请求取消，用于验证快路径会回滚而非继续建链。
+        cancel_after_first_old_manifest: Option<Arc<AtomicBool>>,
         /// 记录每次 create_junction 的 (link, target) 实参，便于断言重建被调用。
         create_junction_calls: std::cell::RefCell<Vec<(std::path::PathBuf, std::path::PathBuf)>>,
         /// 记录每次 copy_tree 的 src 实参（用于断言读源走快照、写源走原路径）。
@@ -949,6 +986,8 @@ mod tests {
                 recycle_ok: true,
                 source_changed_during_copy: false,
                 source_keeps_changing: false,
+                source_changed_same_size: false,
+                cancel_after_first_old_manifest: None,
                 create_junction_calls: RefCell::new(vec![]),
                 copy_src_calls: RefCell::new(vec![]),
                 manifest_calls: RefCell::new(vec![]),
@@ -1001,6 +1040,11 @@ mod tests {
             if is_old {
                 let mut count = self.manifest_old_count.borrow_mut();
                 *count += 1;
+                if *count == 1 {
+                    if let Some(cancel) = &self.cancel_after_first_old_manifest {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
                 // 第 1 次 = c' 增量前；第 2 次 = 补传后 final 复核。
                 let changed = if *count == 1 {
                     self.source_changed_during_copy
@@ -1008,7 +1052,14 @@ mod tests {
                     self.source_keeps_changing
                 };
                 if changed {
-                    Ok(Manifest { root: String::new(), entries: vec![] })
+                    Ok(Manifest {
+                        root: String::new(),
+                        entries: vec![],
+                    })
+                } else if *count == 1 && self.source_changed_same_size {
+                    let mut manifest = mock_sentinel_manifest();
+                    manifest.entries[0].mtime = 1;
+                    Ok(manifest)
                 } else {
                     Ok(mock_sentinel_manifest())
                 }
@@ -1500,6 +1551,60 @@ mod tests {
         assert!(outcome.source_changed);
         assert_eq!(outcome.reason, "migrated");
         assert_eq!(m.status, MigrationStatus::Active);
+    }
+
+    #[test]
+    fn migrate_c_prime_same_size_source_change_triggers_full_sync() {
+        let (dir, store, journal, history) = fixtures();
+        let plan = plan_for(dir.path(), "cprime-samesize");
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.source_changed_same_size = true;
+            o
+        };
+        let cancel = AtomicBool::new(false);
+
+        migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel).unwrap();
+
+        assert!(
+            ops.copy_src_calls
+                .borrow()
+                .iter()
+                .any(|path| path == &plan.old_path),
+            "同大小但 mtime 改变必须触发 old_path -> tmp 全量补传"
+        );
+    }
+
+    #[test]
+    fn migrate_c_prime_honors_cancellation_after_source_snapshot() {
+        let (dir, store, journal, history) = fixtures();
+        let plan = plan_for(dir.path(), "cprime-cancel");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ops = {
+            let mut o = MockOps::success_path();
+            o.cancel_after_first_old_manifest = Some(Arc::clone(&cancel));
+            o
+        };
+
+        let (error, outcome) = migrate(
+            &ops,
+            &store,
+            &journal,
+            &history,
+            &plan,
+            &|_| {},
+            cancel.as_ref(),
+        )
+        .expect_err("c' 扫描期间取消必须回滚而非继续建链");
+
+        assert!(matches!(error, AppError::Cancelled));
+        assert!(outcome.source_changed);
+        assert_eq!(outcome.reason, "migrate_partial");
+        assert!(ops
+            .rename_calls
+            .borrow()
+            .iter()
+            .any(|(from, to)| { from == &plan.old_path && to == &plan.src }));
     }
 
     // ===== T10 修复轮：成功路径命根子失败注入测试 =====
