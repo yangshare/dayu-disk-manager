@@ -438,7 +438,7 @@ pub fn migrate_with_snapshot(
 
     // 阶段 d：先写迁移映射（命根子），再删原
     emit(stage::RECORDING, 95, "记录迁移映射");
-    let migration = Migration {
+    let mut migration = Migration {
         id: plan.migration_id.clone(),
         schema_version: 1,
         source: plan.src.to_string_lossy().replace('/', "\\"),
@@ -480,11 +480,11 @@ pub fn migrate_with_snapshot(
                 "migrate_partial",
             )?;
         }
-        Err(_) => {
+        Err(error) => {
             // junction 已建好、映射已落盘，仅 oldPath 未清理
-            let mut m = migration.clone();
-            m.status = MigrationStatus::OldPendingDelete;
-            let _ = store.upsert_migration(m);
+            migration.status = MigrationStatus::OldPendingDelete;
+            migration.pending_cleanup = Some(error.to_string());
+            let _ = store.upsert_migration(migration.clone());
         }
     }
 
@@ -1276,9 +1276,14 @@ mod tests {
             o
         };
         let res = migrate(&ops, &store, &journal, &history, &plan, &|_| {}, &cancel);
-        let (_mig, outcome) = res.expect("回收站失败降级仍应成功");
+        let (migration, outcome) = res.expect("回收站失败降级仍应成功");
         assert!(outcome.source_changed, "回收站失败降级 source_changed=true");
         assert_eq!(outcome.reason, "migrated");
+        assert_eq!(migration.status, MigrationStatus::OldPendingDelete);
+        assert_eq!(
+            store.load_migrations().unwrap()[0].status,
+            MigrationStatus::OldPendingDelete
+        );
     }
 
     /// T10 测试 12：复制阶段失败回滚无残留（src 未改名、无 junction、无 tmp）。

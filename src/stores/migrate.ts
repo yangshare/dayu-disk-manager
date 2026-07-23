@@ -46,8 +46,10 @@ export const useMigrateStore = defineStore('migrate', () => {
     result.value = null
     try {
       await initListener(`task-${migrationId}`)
-      await ipc.startMigrate(migrationId, src, presetId, enableVss.value)
-      result.value = { ok: true, message: '迁移完成' }
+      const migration = await ipc.startMigrate(migrationId, src, presetId, enableVss.value)
+      result.value = migration.status === 'old_pending_delete'
+        ? { ok: true, message: '迁移完成；旧目录未移入回收站，已保留等待清理。' }
+        : { ok: true, message: '迁移完成' }
     } catch (e) {
       result.value = { ok: false, message: String(e) }
     } finally {

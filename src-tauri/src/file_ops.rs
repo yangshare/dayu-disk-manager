@@ -101,6 +101,20 @@ pub trait FileOps {
 
 pub struct RealFileOps;
 
+/// `trash` 在 Windows 的 COM 初始化失败时会 panic，而不是返回 `Err`。
+/// 回收旧目录是迁移完成后的 best-effort 清理；把该 panic 转成普通错误，
+/// 由 migrator 保留 oldPath 并标记为待清理，不能让已建好的 junction 被误报失败。
+fn guard_recycle_bin<F>(operation: F) -> AppResult<()>
+where
+    F: FnOnce() -> AppResult<()>,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(|_| {
+        Err(AppError::Win32(
+            "回收站组件异常，旧目录已保留等待清理".into(),
+        ))
+    })
+}
+
 impl RealFileOps {
     fn measure_tree(
         &self,
@@ -317,8 +331,9 @@ impl FileOps for RealFileOps {
     fn to_recycle_bin(&self, path: &Path) -> AppResult<()> {
         #[cfg(windows)]
         {
-            trash::delete(path).map_err(|e| AppError::Win32(format!("trash::delete: {e}")))?;
-            Ok(())
+            guard_recycle_bin(|| {
+                trash::delete(path).map_err(|e| AppError::Win32(format!("trash::delete: {e}")))
+            })
         }
         #[cfg(not(windows))]
         {
@@ -582,5 +597,12 @@ mod tests {
         if res.is_ok() {
             assert!(!victim.exists());
         }
+    }
+
+    #[test]
+    fn recycle_bin_panic_is_returned_as_cleanup_error() {
+        let error = guard_recycle_bin(|| -> AppResult<()> { panic!("simulated recycle panic") })
+            .expect_err("第三方回收站组件 panic 必须降级为错误");
+        assert!(error.to_string().contains("旧目录已保留"));
     }
 }
