@@ -22,6 +22,9 @@ export const useMigrateStore = defineStore('migrate', () => {
     prechecking.value = true
     error.value = null
     report.value = null
+    // A new source directory starts a distinct migration flow.
+    progress.value = null
+    result.value = null
     try {
       report.value = await ipc.precheckMigrate(src)
       enableVss.value = report.value.vssAvailable
