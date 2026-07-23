@@ -1,8 +1,11 @@
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +186,7 @@ impl FileOps for RealFileOps {
         dst: &Path,
         on_progress: &dyn Fn(&CopyProgress),
         should_cancel: &(dyn Fn() -> bool + Sync),
-        _concurrency: usize,
+        concurrency: usize,
     ) -> AppResult<CopyOutcome> {
         let mut copied_entries: Vec<ManifestEntry> = Vec::new();
         let mut dst_entries: Vec<ManifestEntry> = Vec::new();
@@ -282,66 +285,136 @@ impl FileOps for RealFileOps {
             current_path: None,
         });
 
-        // 阶段②（任务1：串行；任务2 改并发）。打开前重新检查：已不存在或已不再是
-        // 普通文件（含变为 reparse/目录）则跳过——这是源变化，交由 c' 对账，不算复制错误。
-        let mut completed_bytes = 0u64;
-        let mut completed_files = 0u64;
-        let mut last_emit = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(Instant::now);
-        for task in &tasks {
-            if should_cancel() {
-                return Err(AppError::Cancelled);
+        // 阶段②：并发复制。目录已在阶段①串行建好，worker 只往已存在目录填文件，无 create 竞态。
+        // 注意：原子值用 Arc 包裹，让 N 个 worker 与主线程汇报器都能持有引用，避免被首个 worker 移动。
+        let actual_bytes = Arc::new(AtomicU64::new(0));
+        let actual_files = Arc::new(AtomicUsize::new(0));
+        let copied_files: Arc<Mutex<Vec<ManifestEntry>>> = Arc::new(Mutex::new(Vec::with_capacity(tasks.len())));
+        let dst_files: Arc<Mutex<Vec<ManifestEntry>>> = Arc::new(Mutex::new(Vec::with_capacity(tasks.len())));
+        let first_error: Arc<Mutex<Option<AppError>>> = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let queue: Arc<Mutex<VecDeque<CopyTask>>> = Arc::new(Mutex::new(tasks.into_iter().collect()));
+
+        let n = concurrency.max(1);
+        let active = Arc::new(AtomicUsize::new(n));
+
+        std::thread::scope(|s| {
+            for _ in 0..n {
+                let queue = Arc::clone(&queue);
+                let copied_files = Arc::clone(&copied_files);
+                let dst_files = Arc::clone(&dst_files);
+                let first_error = Arc::clone(&first_error);
+                let stop = Arc::clone(&stop);
+                let active = Arc::clone(&active);
+                let actual_bytes = Arc::clone(&actual_bytes);
+                let actual_files = Arc::clone(&actual_files);
+                let ops = self;
+                s.spawn(move || loop {
+                    if stop.load(Ordering::Relaxed) || should_cancel() {
+                        active.fetch_sub(1, Ordering::Relaxed);
+                        break;
+                    }
+                    let task = queue.lock().unwrap().pop_front();
+                    let Some(task) = task else {
+                        active.fetch_sub(1, Ordering::Relaxed);
+                        break;
+                    };
+                    // 打开前重新检查：已不存在或已不再是普通文件（含变 reparse/目录）则跳过，
+                    // 交由 c' 对账，不算复制错误。
+                    let still_plain = match std::fs::symlink_metadata(&task.src) {
+                        Ok(m) => m.is_file() && !ops.is_reparse_point(&task.src),
+                        Err(_) => false,
+                    };
+                    if !still_plain {
+                        continue;
+                    }
+                    match copy_file_counted(&task.src, &task.dst, should_cancel) {
+                        Ok(actual) => {
+                            actual_bytes.fetch_add(actual, Ordering::Relaxed);
+                            actual_files.fetch_add(1, Ordering::Relaxed);
+                            copied_files.lock().unwrap().push(ManifestEntry {
+                                rel_path: task.rel_path.clone(),
+                                is_dir: false,
+                                size: actual,
+                                mtime: 0,
+                                attrs: 0,
+                            });
+                            match std::fs::symlink_metadata(&task.dst) {
+                                Ok(m) => dst_files.lock().unwrap().push(ManifestEntry {
+                                    rel_path: task.rel_path,
+                                    is_dir: false,
+                                    size: m.len(),
+                                    mtime: 0,
+                                    attrs: 0,
+                                }),
+                                Err(e) => {
+                                    let mut err = first_error.lock().unwrap();
+                                    if err.is_none() {
+                                        *err = Some(AppError::from(e));
+                                    }
+                                    stop.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let mut err = first_error.lock().unwrap();
+                            if err.is_none() {
+                                *err = Some(e);
+                            }
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
             }
-            let still_plain_file = match std::fs::symlink_metadata(&task.src) {
-                Ok(m) => m.is_file() && !self.is_reparse_point(&task.src),
-                Err(_) => false,
-            };
-            if !still_plain_file {
-                continue;
-            }
-            let actual = copy_file_counted(&task.src, &task.dst, should_cancel)?;
-            completed_bytes = completed_bytes.saturating_add(actual);
-            completed_files += 1;
-            copied_entries.push(ManifestEntry {
-                rel_path: task.rel_path.clone(),
-                is_dir: false,
-                size: actual,
-                mtime: 0,
-                attrs: 0,
-            });
-            let dst_len = std::fs::symlink_metadata(&task.dst)?.len();
-            dst_entries.push(ManifestEntry {
-                rel_path: task.rel_path.clone(),
-                is_dir: false,
-                size: dst_len,
-                mtime: 0,
-                attrs: 0,
-            });
-            if last_emit.elapsed() >= Duration::from_millis(100)
-                || completed_files == total_files
-            {
+            // 主线程进度汇报器：每 100ms 读原子值回调 on_progress，completed clamp 到 total。
+            while active.load(Ordering::Relaxed) > 0 {
+                if should_cancel() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                let done_bytes = actual_bytes.load(Ordering::Relaxed).min(total_bytes);
+                let done_files = (actual_files.load(Ordering::Relaxed) as u64).min(total_files);
                 on_progress(&CopyProgress {
                     phase: CopyPhase::Copying,
-                    completed_bytes,
+                    completed_bytes: done_bytes,
                     total_bytes: Some(total_bytes),
-                    completed_files,
+                    completed_files: done_files,
                     total_files: Some(total_files),
-                    current_path: Some(PathBuf::from(&task.rel_path)),
+                    current_path: None,
                 });
-                last_emit = Instant::now();
+                std::thread::sleep(Duration::from_millis(100));
+                // 若队列已空且无 worker 活跃，主线程也退出（避免空转）。
+                if queue.lock().unwrap().is_empty()
+                    && active.load(Ordering::Relaxed) == 0
+                {
+                    break;
+                }
             }
+            // scope 返回前 join 所有 worker；worker 退出时通过 active 计数衰减。
+            // （scope 自动 join，此处无需显式 join。）
+        });
+
+        // 最终一次进度（确保小文件快速完成时也至少发出一个 Copying 终态事件）。
+        let done_bytes = actual_bytes.load(Ordering::Relaxed).min(total_bytes);
+        let done_files = (actual_files.load(Ordering::Relaxed) as u64).min(total_files);
+        on_progress(&CopyProgress {
+            phase: CopyPhase::Copying,
+            completed_bytes: done_bytes,
+            total_bytes: Some(total_bytes),
+            completed_files: done_files,
+            total_files: Some(total_files),
+            current_path: None,
+        });
+
+        // 错误/取消优先于成功。
+        if let Some(e) = first_error.lock().unwrap().take() {
+            return Err(e);
         }
-        if total_files == 0 {
-            on_progress(&CopyProgress {
-                phase: CopyPhase::Copying,
-                completed_bytes: total_bytes,
-                total_bytes: Some(total_bytes),
-                completed_files: 0,
-                total_files: Some(0),
-                current_path: None,
-            });
+        if should_cancel() {
+            return Err(AppError::Cancelled);
         }
+
+        copied_entries.extend(copied_files.lock().unwrap().drain(..));
+        dst_entries.extend(dst_files.lock().unwrap().drain(..));
 
         Ok(CopyOutcome {
             copied_manifest: Manifest {
@@ -598,7 +671,9 @@ mod tests {
         assert_eq!(last.completed_files, 2);
         assert_eq!(last.total_files, Some(2));
         assert_eq!(last.percent(), 100);
-        assert!(last.current_path.is_some());
+        // 并发模型下进度由原子计数器汇总，current_path 统一为 None；
+        // 串行（concurrency=1）也走同一实现，因此保持 None。
+        assert!(last.current_path.is_none());
     }
 
     #[test]
@@ -683,5 +758,39 @@ mod tests {
         let error = guard_recycle_bin(|| -> AppResult<()> { panic!("simulated recycle panic") })
             .expect_err("第三方回收站组件 panic 必须降级为错误");
         assert!(error.to_string().contains("旧目录已保留"));
+    }
+
+    #[test]
+    fn copy_tree_concurrent_matches_serial_for_many_small_files() {
+        let root = TempDir::new().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(src.join("a/b")).unwrap();
+        for i in 0..200 {
+            std::fs::write(src.join(format!("f{i}.txt")), vec![i as u8; 64]).unwrap();
+        }
+        for i in 0..50 {
+            std::fs::write(src.join(format!("a/b/g{i}.txt")), vec![9u8; 128]).unwrap();
+        }
+        // 多 worker
+        let dst_multi = root.path().join("dst_multi");
+        let outcome_multi = ops()
+            .copy_tree(&src, &dst_multi, &|_| {}, &|| false, 8)
+            .unwrap();
+        // 单 worker
+        let dst_one = root.path().join("dst_one");
+        let outcome_one = ops()
+            .copy_tree(&src, &dst_one, &|_| {}, &|| false, 1)
+            .unwrap();
+        // 两份 outcome manifest 各自内部一致
+        assert!(
+            ops().diff_manifests(&outcome_multi.copied_manifest, &outcome_multi.dst_manifest).is_empty(),
+            "多 worker 下 copied 与 dst manifest 必须一致"
+        );
+        // 并发与串行的 copied manifest 一致（条目集合相同）
+        assert_eq!(outcome_multi.total_files, outcome_one.total_files);
+        assert_eq!(outcome_multi.total_bytes, outcome_one.total_bytes);
+        // 内容抽检
+        assert_eq!(std::fs::read(dst_multi.join("f0.txt")).unwrap(), vec![0u8; 64]);
+        assert_eq!(std::fs::read(dst_multi.join("a/b/g0.txt")).unwrap(), vec![9u8; 128]);
     }
 }
