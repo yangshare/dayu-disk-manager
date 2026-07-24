@@ -1,16 +1,24 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { getVersion } from '@tauri-apps/api/app'
+import { isTauri } from '@tauri-apps/api/core'
 import { ipc } from '../ipc/invoke'
 import type { Config } from '../ipc/types'
-import { Download, Folder, Plus, Save, Settings, Trash2, SlidersHorizontal } from '@lucide/vue'
+import { checkForUpdates } from '../composables/useUpdater'
+import { Download, Folder, Plus, Save, Settings, Trash2, SlidersHorizontal, RefreshCw } from '@lucide/vue'
 
 const config = ref<Config | null>(null)
 const saved = ref(false)
 const exported = ref('')
 const loading = ref(true)
 const error = ref<string | null>(null)
+const checking = ref(false)
+const version = ref('')
 
 onMounted(async () => {
+  if (isTauri()) {
+    try { version.value = await getVersion() } catch { /* 版本号仅用于展示，失败可忽略 */ }
+  }
   try { config.value = await ipc.getConfig() }
   catch (e) { error.value = String(e) }
   finally { loading.value = false }
@@ -32,6 +40,13 @@ async function exportLog() {
 
 function addExclude() { config.value?.scan.excludePaths.push('') }
 function removeExclude(i: number) { config.value?.scan.excludePaths.splice(i, 1) }
+
+async function checkUpdate() {
+  checking.value = true
+  try { await checkForUpdates(false) }
+  catch (e) { error.value = String(e) }
+  finally { checking.value = false }
+}
 </script>
 
 <template>
@@ -60,6 +75,10 @@ function removeExclude(i: number) { config.value?.scan.excludePaths.splice(i, 1)
         <div class="settings-label"><div class="settings-icon"><Download :size="17" /></div><div><strong>操作日志</strong><span>导出本机保存的完整记录</span></div></div>
         <div class="settings-control export-control"><button class="button button-secondary" @click="exportLog"><Download :size="14" /> 导出日志</button><details v-if="exported"><summary>查看日志内容</summary><pre>{{ exported }}</pre></details></div>
       </section>
+      <section class="settings-section">
+        <div class="settings-label"><div class="settings-icon"><RefreshCw :size="17" /></div><div><strong>检查更新</strong><span>获取最新版本并引导安装</span></div></div>
+        <div class="settings-control export-control"><span v-if="version" class="version-text">v{{ version }}</span><button class="button button-secondary" :disabled="checking" data-test="check-update" @click="checkUpdate"><RefreshCw :size="14" /> {{ checking ? '检查中…' : '检查更新' }}</button></div>
+      </section>
     </template>
   </div>
 </template>
@@ -81,6 +100,7 @@ function removeExclude(i: number) { config.value?.scan.excludePaths.splice(i, 1)
 .settings-actions { display: flex; align-items: center; gap: 12px; padding: 7px 0 22px; }
 .saved { color: #18794e; font-size: 12px; }
 .export-control { text-align: right; }
+.version-text { margin-right: 12px; color: var(--text-tertiary); font-size: 11px; }
 details { margin-top: 10px; text-align: left; color: var(--text-secondary); font-size: 11px; }
 pre { max-height: 200px; overflow: auto; padding: 12px; border-radius: 7px; background: #f0f0f3; white-space: pre-wrap; }
 .section-empty { padding: 40px; color: var(--text-tertiary); text-align: center; }

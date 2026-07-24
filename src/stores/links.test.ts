@@ -48,7 +48,7 @@ describe('links store', () => {
 
     expect(store.running).toBe(true)
     expect(store.activeRestoreId).toBe('migration-1')
-    expect(mocks.startRestore).toHaveBeenCalledWith('migration-1')
+    expect(mocks.startRestore).toHaveBeenCalledWith('migration-1', false)
     expect(progressHandler).not.toBeNull()
 
     progressHandler?.({

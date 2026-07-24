@@ -30,6 +30,9 @@ pub enum AppError {
     #[error("Win32 错误: {0}")]
     Win32(String),
 
+    #[error("VSS 错误: {0}")]
+    Vss(String),
+
     #[error("stale_scan")]
     StaleScan,
 }

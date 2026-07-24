@@ -31,7 +31,7 @@ function onBreak(id: string) {
         <table><thead><tr><th>源目录</th><th>目标目录</th><th>状态</th><th>操作</th></tr></thead><tbody>
           <tr v-for="l in store.items" :key="l.id">
             <td><strong>{{ l.source }}</strong><div class="path">{{ l.createdAt }}</div></td><td>{{ l.target }}</td>
-            <td><span v-if="l.broken" class="tag err">目标缺失</span><span v-else-if="!l.valid" class="tag warn">链接无效</span><span v-else class="tag ok">正常</span></td>
+            <td><span v-if="l.broken" class="tag err">目标缺失</span><span v-else-if="!l.valid" class="tag warn">链接无效</span><span v-else-if="l.status === 'old_pending_delete'" class="tag warn">旧目录待清理</span><span v-else class="tag ok">正常</span></td>
             <td class="actions">
               <button class="button button-quiet" :disabled="l.broken || store.running" @click="store.restore(l.id)">
                 <LoaderCircle v-if="store.running && store.activeRestoreId === l.id" class="spinning" :size="14" />

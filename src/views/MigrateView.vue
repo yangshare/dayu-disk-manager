@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMigrateStore } from '../stores/migrate'
+import { ipc } from '../ipc/invoke'
 import ProgressStage from '../components/ProgressStage.vue'
 import SizeCell from '../components/SizeCell.vue'
 import { ArrowLeft, ArrowRight, CheckCircle2, CircleAlert, FolderKanban, LoaderCircle, X } from '@lucide/vue'
@@ -18,6 +19,14 @@ onUnmounted(() => store.cleanup())
 async function confirm() {
   await store.run(migrationId, src, presetId)
   if (store.result?.ok) router.push({ name: 'links' })
+}
+
+const elevating = ref(false)
+async function restartElevated() {
+  elevating.value = true
+  try { await ipc.restartElevated() }
+  catch (e) { store.error = String(e) }
+  finally { elevating.value = false }
 }
 </script>
 
@@ -55,6 +64,20 @@ async function confirm() {
         <div class="metrics">
           <div><span>源目录大小</span><strong><SizeCell :bytes="store.report.sourceSizeBytes" /></strong></div>
           <div><span>目标可用空间</span><strong><SizeCell :bytes="store.report.targetFreeBytes" /></strong></div>
+        </div>
+        <div class="vss-option">
+          <label class="vss-check" :class="{ disabled: !store.report.vssAvailable }">
+            <input type="checkbox" v-model="store.enableVss" :disabled="!store.report.vssAvailable" />
+            <span>启用 VSS 卷影快照（绕过被占用文件）</span>
+          </label>
+          <p v-if="store.enableVss" class="vss-warn">⚠ 迁移期间请勿修改源目录：快照创建后、改名前的改动不会进入迁移结果。</p>
+          <div v-if="!store.report.vssAvailable" class="vss-unavailable">
+            <span>VSS 需要管理员权限</span>
+            <button class="button button-secondary" :disabled="elevating" @click="restartElevated">
+              <LoaderCircle v-if="elevating" class="spinning" :size="15" />
+              以管理员重启
+            </button>
+          </div>
         </div>
         <ul v-if="store.report.blockers.length || store.report.warnings.length" class="check-list">
           <li v-for="b in store.report.blockers" :key="b" class="check-block"><CircleAlert :size="16" /> {{ b }}</li>
@@ -94,6 +117,12 @@ async function confirm() {
 .check-list li, .check-ok { display: flex; align-items: center; gap: 7px; }
 .check-block { color: #b42318; } .check-warning { color: #a96800; }
 .check-ok { margin-bottom: 17px; color: #18794e; font-size: 12px; }
+.vss-option { margin-bottom: 17px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+.vss-check { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-primary); cursor: pointer; }
+.vss-check.disabled { color: var(--text-tertiary); cursor: not-allowed; }
+.vss-check input { accent-color: var(--accent); }
+.vss-warn { margin: 9px 0 0; color: #a96800; font-size: 11px; line-height: 1.5; }
+.vss-unavailable { display: flex; align-items: center; gap: 10px; margin-top: 9px; color: var(--text-tertiary); font-size: 11px; }
 .action-row { display: flex; gap: 8px; }
 .section-empty { display: flex; flex-direction: column; align-items: center; gap: 11px; padding: 64px 20px; color: var(--text-tertiary); text-align: center; }
 .section-empty strong { color: var(--text-secondary); font-size: 14px; }

@@ -154,3 +154,6 @@ src-tauri/gen/
 
 # pnpm 运行时产物
 pnpm-workspace.yaml
+
+# 七牛本地配置（含密钥，勿提交）
+.qiniu.local.json

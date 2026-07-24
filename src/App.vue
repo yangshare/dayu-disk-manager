@@ -9,6 +9,7 @@ import {
 } from '@lucide/vue'
 import { ipc } from './ipc/invoke'
 import { useScanStore } from './stores/scan'
+import { checkForUpdates } from './composables/useUpdater'
 
 const appWindow = isTauri() ? getCurrentWindow() : null
 const scanStore = useScanStore()
@@ -20,6 +21,8 @@ onMounted(async () => {
   } catch (startupError) {
     scanStore.error = String(startupError)
   }
+  // 启动静默检查更新；失败由 composable 内部吞掉，绝不阻塞主界面
+  checkForUpdates(true).catch(() => {})
 })
 
 function isInteractiveTarget(target: EventTarget | null) {

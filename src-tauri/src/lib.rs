@@ -12,6 +12,7 @@ pub mod process_probe;
 pub mod safety;
 pub mod scanner;
 pub mod store;
+pub mod vss;
 
 #[cfg(windows)]
 pub mod win32;
@@ -81,6 +82,9 @@ pub fn run() {
             commands::restart_elevated,
             commands::take_startup_scan_intent,
         ])
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

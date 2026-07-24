@@ -39,7 +39,7 @@ export const useLinksStore = defineStore('links', () => {
     result.value = null
     try {
       await initListener(`restore-${id}`)
-      await ipc.startRestore(id)
+      await ipc.startRestore(id, false)
       result.value = { ok: true, message: '还原完成，源目录已恢复为普通目录。' }
       await refresh()
     } catch (e) {

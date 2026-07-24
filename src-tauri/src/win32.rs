@@ -87,7 +87,7 @@ pub fn volume_info(_path: &Path) -> AppResult<(String, bool)> {
 }
 
 /// 取路径所在盘根，如 C:\Users\xxx -> C:\
-fn volume_root(path: &Path) -> AppResult<String> {
+pub(crate) fn volume_root(path: &Path) -> AppResult<String> {
     let s = path_to_str(path);
     let s = s.trim_start_matches(r"\\?\").trim_start_matches(r"\\.\");
     if let Some(drive) = s.get(0..2) {
@@ -96,6 +96,41 @@ fn volume_root(path: &Path) -> AppResult<String> {
         }
     }
     Err(AppError::Win32(format!("无法解析盘根: {s}")))
+}
+
+/// 当前进程是否以管理员（已提升）身份运行。
+///
+/// 用于判断能否创建 VSS 卷影快照（CoCreateInstance(VSSCoordinator) 需要
+/// 管理员权限）。走 OpenProcessToken + GetTokenInformation(TokenElevation)。
+#[cfg(windows)]
+pub fn is_elevated_current() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut 0u32,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_elevated_current() -> bool {
+    false
 }
 
 /// Restart Manager 检测哪些进程锁定了某路径。无占用返回 None。
@@ -161,12 +196,12 @@ pub fn locked_processes(_path: &Path) -> AppResult<Option<Vec<String>>> {
 
 // ===== 辅助：宽字符转换 =====
 #[cfg(windows)]
-fn to_wide(s: &str) -> Vec<u16> {
+pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(windows)]
-fn from_wide(buf: &[u16]) -> String {
+pub(crate) fn from_wide(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
 }

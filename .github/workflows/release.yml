@@ -1,14 +1,17 @@
 name: Release (Windows)
 
-# 推送 tag 时自动构建 Windows 安装包并发布到 GitHub Releases；
-# 也可在 Actions 页面手动触发。
-# 思路参考 new-api/scripts/release.bat + release.yml：
-# 本地打 tag 并 push -> GitHub Actions 自动构建 -> 产物挂到对应 Release。
+# 推送 tag 时自动构建 Windows 安装包并发布到 GitHub Releases。
+# 在 Actions 页面手动重发时，必须输入一个已存在的 tag。
 permissions:
   contents: write
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: '要重新发布的既有 tag（例如 v0.1.2）'
+        required: true
+        type: string
   push:
     tags:
       - 'v*'
@@ -22,21 +25,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Determine Version
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          # tag 触发时直接用 ref_name（如 v0.1.0）；手动触发时回退到 tauri.conf.json 的 version
-          if [ -n "${{ github.ref_name }}" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            VERSION="${{ github.ref_name }}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$RELEASE_TAG"
           else
-            VERSION="v$(grep -o '"version": *"[^"]*"' src-tauri/tauri.conf.json | head -1 | sed -E 's/.*"version": *"([^"]*)".*/\1/')"
+            VERSION="$GITHUB_REF_NAME"
           fi
-          APP_VERSION="${VERSION#v}"
-          if ! [[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::版本必须是语义化版本（例如 v0.1.2），实际为: $VERSION"
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag 必须是 v 前缀的语义化版本（例如 v0.1.2），实际为: $VERSION"
             exit 1
           fi
+          if ! git rev-parse -q --verify "refs/tags/$VERSION" > /dev/null; then
+            echo "::error::tag 不存在: $VERSION"
+            exit 1
+          fi
+          APP_VERSION="${VERSION#v}"
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
           echo "Resolved release version: $VERSION (app version: $APP_VERSION)"
@@ -75,10 +84,24 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ env.VERSION }}
           releaseName: '大禹磁盘管理器 ${{ env.VERSION }}'
           releaseBody: '请下载对应的 .msi 或 .exe 安装包。'
           releaseDraft: false
           prerelease: false
+          updaterJsonPreferNsis: true
           args: --target x86_64-pc-windows-msvc --config src-tauri/tauri.release.conf.json
+
+      - name: Upload update files to Qiniu
+        shell: bash
+        run: node scripts/upload-qiniu.js "$APP_VERSION" src-tauri/target/x86_64-pc-windows-msvc/release/bundle
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+          QINIU_BUCKET: ${{ secrets.QINIU_BUCKET }}
+          QINIU_BUCKET_DOMAIN: ${{ secrets.QINIU_BUCKET_DOMAIN }}
+          QINIU_ZONE: ${{ secrets.QINIU_ZONE }}
+          QINIU_ACCELERATE_UPLOADING: ${{ secrets.QINIU_ACCELERATE_UPLOADING }}
