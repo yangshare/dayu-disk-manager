@@ -75,10 +75,23 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ env.VERSION }}
           releaseName: '大禹磁盘管理器 ${{ env.VERSION }}'
           releaseBody: '请下载对应的 .msi 或 .exe 安装包。'
           releaseDraft: false
           prerelease: false
+          updaterJsonPreferNsis: true
           args: --target x86_64-pc-windows-msvc --config src-tauri/tauri.release.conf.json
+
+      - name: Upload update files to Qiniu
+        shell: bash
+        run: node scripts/upload-qiniu.js "$APP_VERSION" src-tauri/target/x86_64-pc-windows-msvc/release/bundle
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+          QINIU_BUCKET: ${{ secrets.QINIU_BUCKET }}
+          QINIU_BUCKET_DOMAIN: ${{ secrets.QINIU_BUCKET_DOMAIN }}
+          QINIU_ZONE: ${{ secrets.QINIU_ZONE }}
