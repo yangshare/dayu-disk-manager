@@ -694,12 +694,12 @@ pub fn open_volume(drive_letter: char) -> Result<VolumeHandle, VolumeError> {
     // 通过现有 volume_info 路径（同盘符）取得实际文件系统名称，避免对非 NTFS 卷
     // 调用 NTFS 专属 IOCTL（简报 0.1 要求）。
     let fs_root = PathBuf::from(format!(r"{}:\", drive));
-    // volume_info 失败的真实原因（卷不存在 / 权限 / 其它）写到 stderr，避免上层把
+    // volume_info 失败的真实原因（卷不存在 / 权限 / 其它）写到日志，避免上层把
     // code=0（ERROR_SUCCESS）误读为成功（简报审查发现）。VolumeError::Io 的
-    // `code` / `operation` 字段不承载动态 error message，因此原始原因用 eprintln
-    // 落日志；u32::MAX 作为占位 code 让失败仍可被上层按 code 区分。
+    // `code` / `operation` 字段不承载动态 error message，因此原始原因用 log
+    // 落盘；u32::MAX 作为占位 code 让失败仍可被上层按 code 区分。
     let (_, is_ntfs) = volume_info(&fs_root).map_err(|e| {
-        eprintln!("[dayu] open_volume/volume_info 失败: {}", e);
+        log::warn!("open_volume: volume_info 失败 drive={drive}: {e}");
         VolumeError::Io {
             code: u32::MAX,
             operation: "open_volume/volume_info",

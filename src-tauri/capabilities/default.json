@@ -12,6 +12,7 @@
     "updater:default",
     "dialog:default",
     "dialog:allow-ask",
-    "process:allow-restart"
+    "process:allow-restart",
+    "log:default"
   ]
 }

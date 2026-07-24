@@ -1944,11 +1944,13 @@ impl RealScanEngine {
         cancel: Arc<AtomicBool>,
         on_progress: Arc<dyn Fn(ScanProgressEvent) + Send + Sync>,
     ) -> Result<ScanOutcome, ScanDriveError> {
+        log::info!("mft_scan 开始: drive={root_drive}:");
         let vol = open_volume(root_drive).map_err(map_volume_error)?;
         let volume_data = read_volume_data(&vol).map_err(map_volume_error)?;
         let reader = MftFileReader::open(&vol, volume_data).map_err(map_mft_error)?;
         let record_count =
             volume_data.mft_valid_data_length / volume_data.bytes_per_file_record_segment as u64;
+        log::debug!("mft_scan: 卷已打开，record_count={record_count}");
 
         let index = enumerate_mft(
             &reader,
@@ -1965,6 +1967,12 @@ impl RealScanEngine {
             },
         )
         .map_err(map_mft_error)?;
+        log::info!(
+            "mft_scan: 枚举完成 records={} files={} skipped={}",
+            index.scanned_records,
+            index.scanned_files,
+            index.skipped_records
+        );
 
         on_progress(ScanProgressEvent {
             scanned_records: index.scanned_records,
@@ -1975,8 +1983,10 @@ impl RealScanEngine {
         });
 
         let mut graph = build_graph(&index, excluded_paths, root_drive);
+        log::debug!("mft_scan: 图构建完成 nodes={}", graph.nodes.len());
 
         if cancel.load(Ordering::Relaxed) {
+            log::info!("mft_scan: 用户取消（图构建后）");
             return Err(ScanDriveError::Cancelled);
         }
 
@@ -1997,13 +2007,16 @@ impl RealScanEngine {
             &dir_size,
             index.skipped_records,
         );
+        log::debug!("mft_scan: 标注完成");
 
         if cancel.load(Ordering::Relaxed) {
+            log::info!("mft_scan: 用户取消（标注后）");
             return Err(ScanDriveError::Cancelled);
         }
 
         let scan_id = generate_scan_id();
-        let store = materialize(&graph, root_summary, ScanSource::Mft, scan_id);
+        log::info!("mft_scan: 物化 scan_id={scan_id}");
+        let store = materialize(&graph, root_summary, ScanSource::Mft, scan_id.clone());
 
         let diagnostics = ScanDiagnostics {
             scanned_records: index.scanned_records,
@@ -2014,6 +2027,12 @@ impl RealScanEngine {
             hard_link_entries: index.hard_link_entries,
             unresolved_extensions: index.unresolved_extensions,
         };
+
+        log::info!("mft_scan 完成 scan_id={scan_id} orphan={} hardlink={} unresolved_ext={}",
+            diagnostics.orphan_entries,
+            diagnostics.hard_link_entries,
+            diagnostics.unresolved_extensions
+        );
 
         Ok(ScanOutcome {
             store: Arc::new(store),
@@ -2078,6 +2097,7 @@ impl RealScanEngine {
         });
 
         let worker_count = concurrency_for(drive_type_fn, root_drive);
+        log::info!("fs_scan: drive={root_drive}: workers={worker_count}");
         let (mut graph, scanned_files, entry_errors) = coordinator_run(
             reader,
             root_drive,
@@ -2086,6 +2106,10 @@ impl RealScanEngine {
             cancel.clone(),
             on_progress.clone(),
         )?;
+        log::info!(
+            "fs_scan: 遍历完成 files={scanned_files} entry_errors={entry_errors} nodes={}",
+            graph.nodes.len()
+        );
 
         if cancel.load(Ordering::Relaxed) {
             return Err(ScanDriveError::Cancelled);

@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { ipc } from '../ipc/invoke'
 import { onProgress } from '../ipc/events'
 import type { LinkItem, ProgressEvent } from '../ipc/types'
+import { logger } from '../ipc/log'
 
 export const useLinksStore = defineStore('links', () => {
   const items = ref<LinkItem[]>([])
@@ -18,7 +19,10 @@ export const useLinksStore = defineStore('links', () => {
   async function refresh() {
     loading.value = true; error.value = null
     try { items.value = await ipc.listLinks() }
-    catch (e) { error.value = String(e) }
+    catch (e) {
+      logger.error(`加载链接列表失败: ${String(e)}`)
+      error.value = String(e)
+    }
     finally { loading.value = false }
   }
 
@@ -43,6 +47,7 @@ export const useLinksStore = defineStore('links', () => {
       result.value = { ok: true, message: '还原完成，源目录已恢复为普通目录。' }
       await refresh()
     } catch (e) {
+      logger.error(`还原失败: ${String(e)}`)
       result.value = { ok: false, message: `还原失败：${String(e)}` }
     } finally {
       running.value = false
@@ -54,7 +59,10 @@ export const useLinksStore = defineStore('links', () => {
     if (running.value) return
     error.value = null
     try { await ipc.breakLink(id); await refresh() }
-    catch (e) { result.value = { ok: false, message: `断开失败：${String(e)}` } }
+    catch (e) {
+      logger.warn(`断开链接失败: ${String(e)}`)
+      result.value = { ok: false, message: `断开失败：${String(e)}` }
+    }
   }
 
   function cleanup() {

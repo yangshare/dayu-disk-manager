@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { ipc } from '../ipc/invoke'
 import { onProgress } from '../ipc/events'
 import type { PrecheckReport, ProgressEvent } from '../ipc/types'
+import { logger } from '../ipc/log'
 
 export const useMigrateStore = defineStore('migrate', () => {
   const report = ref<PrecheckReport | null>(null)
@@ -29,7 +30,10 @@ export const useMigrateStore = defineStore('migrate', () => {
       report.value = await ipc.precheckMigrate(src)
       enableVss.value = report.value.vssAvailable
     }
-    catch (e) { error.value = String(e) }
+    catch (e) {
+      logger.error(`迁移预检失败: ${String(e)}`)
+      error.value = String(e)
+    }
     finally { prechecking.value = false }
   }
 
@@ -54,6 +58,7 @@ export const useMigrateStore = defineStore('migrate', () => {
         ? { ok: true, message: '迁移完成；旧目录未移入回收站，已保留等待清理。' }
         : { ok: true, message: '迁移完成' }
     } catch (e) {
+      logger.error(`迁移失败: ${String(e)}`)
       result.value = { ok: false, message: String(e) }
     } finally {
       running.value = false
@@ -66,6 +71,7 @@ export const useMigrateStore = defineStore('migrate', () => {
     cancelling.value = true
     try { await ipc.cancelMigrate() }
     catch (e) {
+      logger.warn(`取消迁移失败: ${String(e)}`)
       result.value = { ok: false, message: String(e) }
       cancelling.value = false
     }

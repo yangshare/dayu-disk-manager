@@ -10,6 +10,7 @@ import type {
   ScanProgressEvent, ScanSnapshot, ScanSource, TreeNode, ChildPage,
 } from '../ipc/types'
 import { isStaleScanError } from '../ipc/types'
+import { logger } from '../ipc/log'
 
 const PAGE_SIZE = 200
 const appWindow = isTauri() ? getCurrentWindow() : null
@@ -114,6 +115,7 @@ export const useScanStore = defineStore('scan', () => {
       clearSnapshot()
       return true
     }
+    logger.error(`scan 操作失败: ${errorMessage(operationError)}`)
     error.value = errorMessage(operationError)
     return false
   }
@@ -209,6 +211,7 @@ export const useScanStore = defineStore('scan', () => {
       if (isStaleScanError(scanError)) {
         clearSnapshot()
       } else if (!errorMessage(scanError).includes('用户取消')) {
+        logger.error(`扫描失败: ${errorMessage(scanError)}`)
         error.value = errorMessage(scanError)
       }
     } finally {
@@ -224,6 +227,7 @@ export const useScanStore = defineStore('scan', () => {
     try {
       await ipc.cancelScan()
     } catch (cancelError) {
+      logger.warn(`取消扫描失败: ${errorMessage(cancelError)}`)
       error.value = errorMessage(cancelError)
       cancelling.value = false
     }

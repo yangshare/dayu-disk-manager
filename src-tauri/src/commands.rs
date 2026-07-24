@@ -173,7 +173,10 @@ async fn scan_drive_impl(
         )
     })
     .await
-    .map_err(|e| AppError::Store(format!("扫描任务失败: {e}")));
+    .map_err(|e| {
+        log::error!("扫描 spawn_blocking 失败: {e}");
+        AppError::Store(format!("扫描任务失败: {e}"))
+    });
 
     {
         let mut active = scan_slot.lock().unwrap();
@@ -186,8 +189,19 @@ async fn scan_drive_impl(
     }
 
     match task_result {
-        Ok(Ok(_)) if cancel.load(Ordering::Relaxed) => Err(AppError::Cancelled),
+        Ok(Ok(_)) if cancel.load(Ordering::Relaxed) => {
+            log::info!("扫描: 引擎返回成功但已取消");
+            Err(AppError::Cancelled)
+        }
         Ok(Ok(outcome)) => {
+            let scan_id = outcome.store.scan_id().to_string();
+            log::info!(
+                "扫描完成: scan_id={scan_id} source={:?} records={} dirs={} files={}",
+                outcome.store.source(),
+                outcome.diagnostics.scanned_records,
+                outcome.diagnostics.scanned_dirs,
+                outcome.diagnostics.scanned_files
+            );
             // 先发布 store，再从同一 store 构造 snapshot。
             {
                 let mut current = state.current_scan.write().unwrap();
@@ -203,11 +217,18 @@ async fn scan_drive_impl(
             };
             Ok(ScanDriveResult::Complete { snapshot })
         }
-        Ok(Err(ScanDriveError::NeedsElevation)) => Ok(ScanDriveResult::NeedsElevation),
+        Ok(Err(ScanDriveError::NeedsElevation)) => {
+            log::warn!("扫描: 需要提权（MFT 路径）");
+            Ok(ScanDriveResult::NeedsElevation)
+        }
         Ok(Err(ScanDriveError::FastScanFailure(f))) => {
+            log::warn!("扫描: 快速扫描不可用 {f:?}");
             Ok(ScanDriveResult::FastScanUnavailable { reason: f })
         }
-        Ok(Err(ScanDriveError::Cancelled)) => Err(AppError::Cancelled),
+        Ok(Err(ScanDriveError::Cancelled)) => {
+            log::info!("扫描: 用户取消");
+            Err(AppError::Cancelled)
+        }
         Err(e) => Err(e),
     }
 }
@@ -291,6 +312,7 @@ pub async fn precheck_migrate(
 ) -> AppResult<PrecheckReport> {
     let cfg = state.store.load_config()?;
     let existing = state.store.load_migrations()?;
+    let src_label = src.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let src_size = scanner::dir_size(std::path::Path::new(&src));
         Ok(precheck(
@@ -302,7 +324,10 @@ pub async fn precheck_migrate(
         ))
     })
     .await
-    .map_err(|e| AppError::Store(format!("预检任务失败: {e}")))?
+    .map_err(|e| {
+        log::error!("预检失败: src={src_label} {e}");
+        AppError::Store(format!("预检任务失败: {e}"))
+    })?
 }
 
 #[tauri::command]
@@ -391,7 +416,10 @@ pub async fn start_migrate(
         )
     })
     .await
-    .map_err(|e| AppError::Store(format!("迁移任务失败: {e}")));
+    .map_err(|e| {
+        log::error!("迁移任务失败: {e}");
+        AppError::Store(format!("迁移任务失败: {e}"))
+    });
 
     {
         let mut active = cancel_slot.lock().unwrap();
@@ -526,7 +554,10 @@ pub async fn start_restore(
         )
     })
     .await
-    .map_err(|e| AppError::Store(format!("还原任务失败: {e}")));
+    .map_err(|e| {
+        log::error!("还原任务失败: {e}");
+        AppError::Store(format!("还原任务失败: {e}"))
+    });
 
     {
         let mut active = cancel_slot.lock().unwrap();
@@ -643,7 +674,10 @@ async fn restart_elevated_impl(
 ) -> AppResult<bool> {
     let outcome = tauri::async_runtime::spawn_blocking(move || elevation_fn("--elevated-scan"))
         .await
-        .map_err(|e| AppError::Store(format!("提权任务失败: {e}")))?
+        .map_err(|e| {
+            log::error!("提权任务失败: {e}");
+            AppError::Store(format!("提权任务失败: {e}"))
+        })?
         .map_err(|e| AppError::Win32(e.to_string()))?;
 
     match outcome {
