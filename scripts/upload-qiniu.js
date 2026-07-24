@@ -48,6 +48,10 @@ export function matchNsisArtifacts(fileNames) {
   return { exe, sig }
 }
 
+export function isAccelerateUploadingEnabled(value) {
+  return value === true || String(value).toLowerCase() === 'true'
+}
+
 // ── 配置加载 ────────────────────────────────────────
 function loadQiniuConfig() {
   let cfg = null
@@ -60,9 +64,11 @@ function loadQiniuConfig() {
       bucket: process.env.QINIU_BUCKET,
       bucketDomain: process.env.QINIU_BUCKET_DOMAIN,
       zone: process.env.QINIU_ZONE,
+      accelerateUploading: process.env.QINIU_ACCELERATE_UPLOADING,
     }
   }
-  const missing = Object.entries(cfg).filter(([, v]) => !v).map(([k]) => k)
+  const required = ['accessKey', 'secretKey', 'bucket', 'bucketDomain', 'zone']
+  const missing = required.filter((key) => !cfg[key])
   if (missing.length) {
     console.error(`缺少七牛配置项: ${missing.join(', ')}（本地 .qiniu.local.json 或 QINIU_* 环境变量）`)
     process.exit(1)
@@ -107,6 +113,19 @@ function uploadFile(mac, uploader, bucket, bucketDomain, localPath, remoteName) 
   })
 }
 
+export function refreshCdnUrl(cdnManager, url) {
+  return new Promise((resolve, reject) => {
+    cdnManager.refreshUrls([url], (err, body, info) => {
+      if (err) return reject(err)
+      if (!info || info.statusCode !== 200) {
+        return reject(new Error(`刷新 CDN 缓存失败(${info ? info.statusCode : '?'}): ${JSON.stringify(body)}`))
+      }
+      console.log(`已刷新 CDN 缓存: ${url}`)
+      resolve()
+    })
+  })
+}
+
 // ── 主流程 ──────────────────────────────────────────
 async function main() {
   const version = process.argv[2]
@@ -128,7 +147,10 @@ async function main() {
     process.exit(1)
   }
 
-  const config = new qiniu.conf.Config({ useHttpsDomain: true, accelerateUploading: true })
+  const config = new qiniu.conf.Config({
+    useHttpsDomain: true,
+    accelerateUploading: isAccelerateUploadingEnabled(cfg.accelerateUploading),
+  })
   config.zone = resolveZone(cfg.zone)
   if (!config.zone) {
     console.error(`无效 zone: ${cfg.zone}（可选 z0/z1/z2/na0/as0）`)
@@ -155,6 +177,10 @@ async function main() {
   const latestTmp = path.join(nsisDir, 'latest.json')
   fs.writeFileSync(latestTmp, latestJson, 'utf8')
   await uploadFile(mac, uploader, cfg.bucket, cfg.bucketDomain, latestTmp, 'latest.json')
+  await refreshCdnUrl(
+    new qiniu.cdn.CdnManager(mac),
+    buildQiniuUrl(cfg.bucketDomain, REMOTE_PREFIX, 'latest.json'),
+  )
 
   console.log('全部上传完成')
 }

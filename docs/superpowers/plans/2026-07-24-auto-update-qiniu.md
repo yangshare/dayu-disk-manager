@@ -122,7 +122,7 @@ tauri-plugin-updater = "2"
 
 运行（在项目根目录）：
 ```
-pnpm tauri build --debug -- --no-bundle
+pnpm tauri build --debug --no-bundle
 ```
 预期：Rust 编译通过（首次会拉取 `tauri-plugin-updater` crate）。`--no-bundle` 跳过打包，只验证配置与编译。若报权限/pubkey 相关错误， pubkey 占位符不影响编译（仅在真正构建签名产物时校验）。
 

@@ -3,5 +3,6 @@
   "secretKey": "你的七牛 SecretKey",
   "bucket": "你的七牛空间名",
   "bucketDomain": "你的七牛域名（如 qiniu.example.com，不带 https://）",
-  "zone": "z2"
+  "zone": "z2",
+  "accelerateUploading": false
 }

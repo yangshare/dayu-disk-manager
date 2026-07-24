@@ -31,6 +31,9 @@ pnpm tauri signer generate -w ~/.tauri/dayu-disk-manager.key
 | `QINIU_BUCKET` | 七牛空间名 |
 | `QINIU_BUCKET_DOMAIN` | 七牛域名（不带 `https://`） |
 | `QINIU_ZONE` | 存储区域，如 `z2`（华南）、`z0`（华东）、`z1`（华北） |
+| `QINIU_ACCELERATE_UPLOADING` | 可选；仅已开通七牛传输加速时设为 `true`，默认关闭 |
+
+用于上传的七牛密钥还必须具备该域名的 CDN URL 刷新权限。每次发布完成清单上传后，脚本会刷新 `latest.json`，避免 CDN 的长缓存把旧版本清单返回给客户端。
 
 ## 发布流程
 
@@ -40,7 +43,7 @@ pnpm tauri signer generate -w ~/.tauri/dayu-disk-manager.key
    git tag vX.Y.Z
    git push origin vX.Y.Z
    ```
-   （或直接运行 `scripts/release.bat` 走交互式发布）
+   如需在 Actions 页面重新发布，必须填写一个已存在的同名 tag。
 3. GitHub Actions 自动执行：
    - `tauri-action` 用 `TAURI_SIGNING_PRIVATE_KEY` 构建 NSIS 包并生成 `.sig`
    - 上传 `.msi` / `.exe` / `.sig` 到 GitHub Release（手动下载备用）
@@ -62,7 +65,7 @@ pnpm tauri signer generate -w ~/.tauri/dayu-disk-manager.key
    ```bash
    node scripts/upload-qiniu.js <版本> src-tauri/target/release/bundle
    ```
-   预期输出三次「完成」并打印七牛直链，七牛空间出现 exe / sig / latest.json。
+   预期上传 exe / sig / latest.json 后输出「已刷新 CDN 缓存」，七牛空间出现对应文件。
 
 3. **清单可达**
    浏览器打开 `tauri.conf.json` 中配置的 endpoint URL，应返回 200，JSON 含 `platforms.windows-x86_64.signature` 与 `.url`。
@@ -78,3 +81,4 @@ pnpm tauri signer generate -w ~/.tauri/dayu-disk-manager.key
 - **CI 未生成 `.sig`**：检查 `TAURI_SIGNING_PRIVATE_KEY` Secret 是否设置、密码是否匹配；`tauri.conf.json` 的 `bundle.createUpdaterArtifacts` 是否为 `true`。
 - **App 检查不到更新**：确认 endpoint 域名已替换占位符、`latest.json` 的 `version` 高于当前版本、`pubkey` 与签名私钥是同一密钥对。
 - **七牛上传报 zone 错误**：核对 `QINIU_ZONE` / `.qiniu.local.json` 的 zone 值在 `z0/z1/z2/na0/as0` 之内。
+- **CDN 刷新失败**：确认七牛密钥有该域名的 URL 刷新权限；此错误会中止发布，避免客户端持续读取旧清单。

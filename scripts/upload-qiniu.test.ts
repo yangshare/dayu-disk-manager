@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   assembleLatestJson,
   buildQiniuUrl,
+  isAccelerateUploadingEnabled,
   matchNsisArtifacts,
+  refreshCdnUrl,
 } from './upload-qiniu.js'
 
 describe('assembleLatestJson', () => {
@@ -54,5 +56,29 @@ describe('matchNsisArtifacts', () => {
   })
   it('无 setup.exe 时返回 null', () => {
     expect(matchNsisArtifacts(['foo.msi'])).toBeNull()
+  })
+})
+
+describe('isAccelerateUploadingEnabled', () => {
+  it.each([true, 'true', 'TRUE'])('仅显式 true 时启用传输加速：%j', (value) => {
+    expect(isAccelerateUploadingEnabled(value)).toBe(true)
+  })
+
+  it.each([undefined, false, 'false', '1', ''])('其他值保持关闭：%j', (value) => {
+    expect(isAccelerateUploadingEnabled(value)).toBe(false)
+  })
+})
+
+describe('refreshCdnUrl', () => {
+  it('刷新 latest.json 的 CDN 缓存', async () => {
+    const refreshUrls = vi.fn((urls, callback) => callback(null, { code: 200 }, { statusCode: 200 }))
+    await refreshCdnUrl({ refreshUrls }, 'https://qiniu.example.com/latest.json')
+    expect(refreshUrls).toHaveBeenCalledWith(['https://qiniu.example.com/latest.json'], expect.any(Function))
+  })
+
+  it('缓存刷新失败时拒绝，避免把陈旧清单当成成功发布', async () => {
+    const refreshUrls = vi.fn((urls, callback) => callback(new Error('permission denied')))
+    await expect(refreshCdnUrl({ refreshUrls }, 'https://qiniu.example.com/latest.json'))
+      .rejects.toThrow('permission denied')
   })
 })
