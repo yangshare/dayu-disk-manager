@@ -27,6 +27,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["msi", "nsis"],
     "icon": [
       "icons/32x32.png",
@@ -38,6 +39,17 @@
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "<替换为 tauri signer generate 生成的 .key.pub 内容>",
+      "endpoints": [
+        "https://<替换为你的七牛域名>/dayu-disk-manager/win/x64/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }
