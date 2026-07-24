@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { getVersion } from '@tauri-apps/api/app'
+import { isTauri } from '@tauri-apps/api/core'
 import { ipc } from '../ipc/invoke'
 import type { Config } from '../ipc/types'
 import { checkForUpdates } from '../composables/useUpdater'
@@ -11,8 +13,12 @@ const exported = ref('')
 const loading = ref(true)
 const error = ref<string | null>(null)
 const checking = ref(false)
+const version = ref('')
 
 onMounted(async () => {
+  if (isTauri()) {
+    try { version.value = await getVersion() } catch { /* 版本号仅用于展示，失败可忽略 */ }
+  }
   try { config.value = await ipc.getConfig() }
   catch (e) { error.value = String(e) }
   finally { loading.value = false }
@@ -71,7 +77,7 @@ async function checkUpdate() {
       </section>
       <section class="settings-section">
         <div class="settings-label"><div class="settings-icon"><RefreshCw :size="17" /></div><div><strong>检查更新</strong><span>获取最新版本并引导安装</span></div></div>
-        <div class="settings-control export-control"><button class="button button-secondary" :disabled="checking" data-test="check-update" @click="checkUpdate"><RefreshCw :size="14" /> {{ checking ? '检查中…' : '检查更新' }}</button></div>
+        <div class="settings-control export-control"><span v-if="version" class="version-text">v{{ version }}</span><button class="button button-secondary" :disabled="checking" data-test="check-update" @click="checkUpdate"><RefreshCw :size="14" /> {{ checking ? '检查中…' : '检查更新' }}</button></div>
       </section>
     </template>
   </div>
@@ -94,6 +100,7 @@ async function checkUpdate() {
 .settings-actions { display: flex; align-items: center; gap: 12px; padding: 7px 0 22px; }
 .saved { color: #18794e; font-size: 12px; }
 .export-control { text-align: right; }
+.version-text { margin-right: 12px; color: var(--text-tertiary); font-size: 11px; }
 details { margin-top: 10px; text-align: left; color: var(--text-secondary); font-size: 11px; }
 pre { max-height: 200px; overflow: auto; padding: 12px; border-radius: 7px; background: #f0f0f3; white-space: pre-wrap; }
 .section-empty { padding: 40px; color: var(--text-tertiary); text-align: center; }
